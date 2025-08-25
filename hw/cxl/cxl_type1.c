@@ -33,7 +33,7 @@
 #include "qemu/units.h"
 #include "system/memory.h"
 
-#define TYPE_CXL_TYPE1_DEV "cxl-type1-accel"
+#define TYPE_CXL_TYPE1_DEV "cxl-type1"
 #define CXL_T1_VENDOR_ID 0x8086
 #define CXL_T1_DEVICE_ID 0x0d90
 
@@ -159,12 +159,15 @@ static void build_dvsecs(CXLType1StateImpl *ct1d)
                               PCIE_CXL3_FLEXBUS_PORT_DVSEC_REVID, dvsec);
 }
 
-static void cxl_type1_reset(Object *obj, ResetType type)
+static void cxl_type1_reset(DeviceState *dev)
 {
-    CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(obj);
-    uint32_t *reg_state = ct1d->cxl_cstate.crb.cache_mem_registers;
-    uint32_t *write_msk = ct1d->cxl_cstate.crb.cache_mem_regs_write_mask;
+    /* Reset function for CXL Type 1 device */
+    CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(dev);
+    CXLComponentState *cxl_cstate = &ct1d->cxl_cstate;
+    uint32_t *reg_state = cxl_cstate->crb.cache_mem_registers;
+    uint32_t *write_msk = cxl_cstate->crb.cache_mem_regs_write_mask;
     
+    /* Initialize component registers */
     cxl_component_register_init_common(reg_state, write_msk, CXL2_TYPE3_DEVICE);
 }
 
@@ -293,6 +296,24 @@ static const MemoryRegionOps ct1_reg_ops = {
     },
 };
 
+/* Forward declarations for cache ops */
+static uint64_t cxl_type1_cache_read(void *opaque, hwaddr addr, unsigned size);
+static void cxl_type1_cache_write(void *opaque, hwaddr addr, uint64_t value, unsigned size);
+
+static const MemoryRegionOps cxl_type1_cache_ops = {
+    .read = cxl_type1_cache_read,
+    .write = cxl_type1_cache_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
 static void cxl_type1_realize(PCIDevice *pci_dev, Error **errp)
 {
     CXLType1StateImpl *ct1d = CXL_TYPE1_DEV(pci_dev);
@@ -394,19 +415,17 @@ static void cxl_type1_exit(PCIDevice *pci_dev)
     qemu_mutex_destroy(&ct1d->cxlmemsim.lock);
 }
 
-static Property cxl_type1_props[] = {
+static const Property cxl_type1_props[] = {
     DEFINE_PROP_SIZE("size", CXLType1StateImpl, device_size, 256 * MiB),
     DEFINE_PROP_SIZE("cache-size", CXLType1StateImpl, cache_size, 64 * MiB),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType1StateImpl, cxlmemsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType1StateImpl, cxlmemsim.server_port, 9999),
-    {},
 };
 
 static void cxl_type1_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
-    ResettableClass *rc = RESETTABLE_CLASS(oc);
     
     pc->realize = cxl_type1_realize;
     pc->exit = cxl_type1_exit;
@@ -416,7 +435,7 @@ static void cxl_type1_class_init(ObjectClass *oc, const void *data)
     pc->class_id = PCI_CLASS_MEMORY_CXL;
     
     dc->desc = "CXL Type 1 Accelerator Device";
-    rc->phases.hold = cxl_type1_reset;
+    device_class_set_legacy_reset(dc, cxl_type1_reset);
     device_class_set_props(dc, cxl_type1_props);
 }
 
@@ -444,6 +463,7 @@ static uint64_t cxl_type1_cache_read(void *opaque, hwaddr addr, unsigned size)
 {
     CXLType1StateImpl *ct1d = opaque;
     uint64_t value = 0;
+    uint8_t *cache_ptr;
     
     if (addr + size > ct1d->cache_size) {
         qemu_log_mask(LOG_GUEST_ERROR, "CXL Type1: Cache read out of bounds at 0x%lx\n", addr);
@@ -451,17 +471,22 @@ static uint64_t cxl_type1_cache_read(void *opaque, hwaddr addr, unsigned size)
     }
     
     /* Read from cache memory - this would be coherent with CPU caches via CXL.cache */
-    if (ct1d->cache_mem.ram_ptr) {
-        memcpy(&value, ct1d->cache_mem.ram_ptr + addr, size);
+    cache_ptr = memory_region_get_ram_ptr(&ct1d->cache_mem);
+    if (cache_ptr) {
+        memcpy(&value, cache_ptr + addr, size);
     }
     
     /* Track cache hits for statistics */
     if (ct1d->cxlmemsim.connected) {
         /* Send cache hit notification to CXLMemSim */
-        CXLMemSimMessage msg = {
+        struct {
+            uint32_t type;
+            uint32_t size;
+            uint64_t addr_data;
+        } msg = {
             .type = 0x10, /* CACHE_HIT */
             .size = sizeof(uint64_t),
-            .data = {addr}
+            .addr_data = addr
         };
         qio_channel_write_all(QIO_CHANNEL(ct1d->cxlmemsim.socket),
                              (char *)&msg, sizeof(msg), NULL);
@@ -475,6 +500,7 @@ static uint64_t cxl_type1_cache_read(void *opaque, hwaddr addr, unsigned size)
 static void cxl_type1_cache_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     CXLType1StateImpl *ct1d = opaque;
+    uint8_t *cache_ptr;
     
     if (addr + size > ct1d->cache_size) {
         qemu_log_mask(LOG_GUEST_ERROR, "CXL Type1: Cache write out of bounds at 0x%lx\n", addr);
@@ -482,18 +508,24 @@ static void cxl_type1_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
     }
     
     /* Write to cache memory - maintains coherency via CXL.cache protocol */
-    if (ct1d->cache_mem.ram_ptr) {
-        memcpy(ct1d->cache_mem.ram_ptr + addr, &value, size);
+    cache_ptr = memory_region_get_ram_ptr(&ct1d->cache_mem);
+    if (cache_ptr) {
+        memcpy(cache_ptr + addr, &value, size);
     }
     
     /* Send cache line update to CXLMemSim for coherency tracking */
     if (ct1d->cxlmemsim.connected) {
-        CXLMemSimMessage msg = {
+        struct {
+            uint32_t type;
+            uint32_t size;
+            uint64_t addr;
+            uint64_t data;
+        } msg = {
             .type = 0x11, /* CACHE_UPDATE */
             .size = sizeof(uint64_t) * 2,
+            .addr = addr,
+            .data = value
         };
-        memcpy(msg.data, &addr, sizeof(uint64_t));
-        memcpy(msg.data + sizeof(uint64_t), &value, sizeof(uint64_t));
         
         qio_channel_write_all(QIO_CHANNEL(ct1d->cxlmemsim.socket),
                              (char *)&msg, sizeof(msg), NULL);
@@ -502,17 +534,3 @@ static void cxl_type1_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
     qemu_log_mask(LOG_TRACE, "CXL Type1: Cache write at 0x%lx = 0x%lx (size %u)\n",
                  addr, value, size);
 }
-
-static const MemoryRegionOps cxl_type1_cache_ops = {
-    .read = cxl_type1_cache_read,
-    .write = cxl_type1_cache_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 8,
-    },
-};

@@ -28,6 +28,10 @@
 #include "qemu/guest-random.h"
 #include "system/hostmem.h"
 #include "system/numa.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
 #include "hw/cxl/cxl.h"
 #include "hw/pci/msix.h"
 
@@ -1196,6 +1200,112 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
     return 0;
 }
 
+/* CXLMemSim Integration */
+typedef struct {
+    uint8_t op_type;
+    uint64_t addr;
+    uint64_t size;
+    uint64_t timestamp;
+    uint8_t data[64];
+} CXLMemSimRequest;
+
+typedef struct {
+    uint8_t status;
+    uint64_t latency_ns;
+    uint8_t data[64];
+} CXLMemSimResponse;
+
+static struct {
+    bool enabled;
+    char host[256];
+    int port;
+    int socket_fd;
+    bool connected;
+    pthread_mutex_t lock;
+    uint64_t stats_reads;
+    uint64_t stats_writes;
+} g_memsim = {
+    .enabled = false,
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .socket_fd = -1,
+};
+
+static void cxl_memsim_init(void) {
+    const char *host = getenv("CXL_MEMSIM_HOST");
+    const char *port_str = getenv("CXL_MEMSIM_PORT");
+    
+    if (host && port_str) {
+        strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
+        g_memsim.port = atoi(port_str);
+        g_memsim.enabled = true;
+        info_report("CXL Type3: CXLMemSim enabled - %s:%d", host, g_memsim.port);
+    }
+}
+
+static int cxl_memsim_connect(void) {
+    struct sockaddr_in server_addr = {0};
+    
+    if (g_memsim.connected) return 0;
+    
+    g_memsim.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_memsim.socket_fd < 0) return -1;
+    
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(g_memsim.port);
+    inet_pton(AF_INET, g_memsim.host, &server_addr.sin_addr);
+    
+    if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr, 
+                sizeof(server_addr)) < 0) {
+        close(g_memsim.socket_fd);
+        return -1;
+    }
+    
+    g_memsim.connected = true;
+    info_report("CXL Type3: Connected to CXLMemSim");
+    return 0;
+}
+
+static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
+                              void *data, CXLMemSimResponse *resp) {
+    CXLMemSimRequest req = {
+        .op_type = op,
+        .addr = addr,
+        .size = size,
+        .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)
+    };
+    
+    pthread_mutex_lock(&g_memsim.lock);
+    
+    if (!g_memsim.connected && cxl_memsim_connect() < 0) {
+        pthread_mutex_unlock(&g_memsim.lock);
+        return -1;
+    }
+    
+    if (op == 1 && data) {
+        memcpy(req.data, data, MIN(size, 64));
+    }
+    
+    if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+        g_memsim.connected = false;
+        close(g_memsim.socket_fd);
+        pthread_mutex_unlock(&g_memsim.lock);
+        return -1;
+    }
+    
+    if (recv(g_memsim.socket_fd, resp, sizeof(*resp), MSG_WAITALL) != sizeof(*resp)) {
+        g_memsim.connected = false;
+        close(g_memsim.socket_fd);
+        pthread_mutex_unlock(&g_memsim.lock);
+        return -1;
+    }
+    
+    if (op == 0) g_memsim.stats_reads++;
+    else g_memsim.stats_writes++;
+    
+    pthread_mutex_unlock(&g_memsim.lock);
+    return 0;
+}
+
 MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                            unsigned size, MemTxAttrs attrs)
 {
@@ -1203,6 +1313,17 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     uint64_t dpa_offset = 0;
     AddressSpace *as = NULL;
     int res;
+    
+    /* Initialize CXLMemSim on first use */
+    static bool memsim_initialized = false;
+    if (!memsim_initialized) {
+        cxl_memsim_init();
+        memsim_initialized = true;
+    }
+    
+    /* Log all CXL Type3 reads */
+    //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
+    //           (unsigned long)host_addr, size);
 
     res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size,
                                       &as, &dpa_offset);
@@ -1215,6 +1336,22 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         return MEMTX_OK;
     }
 
+    /* Forward to CXLMemSim if enabled */
+    if (g_memsim.enabled) {
+        CXLMemSimResponse resp = {0};
+        
+        // info_report("CXL_TYPE3_READ: Forwarding to CXLMemSim - dpa=0x%lx size=%u",
+                //    (unsigned long)dpa_offset, size);
+        
+        if (cxl_memsim_request(0, dpa_offset, size, NULL, &resp) == 0) {
+            if (resp.status == 0 && size <= 64) {
+                memcpy(data, resp.data, size);
+            }
+            // info_report("CXL_TYPE3_READ_COMPLETE: latency=%lu ns", 
+                    //    (unsigned long)resp.latency_ns);
+        }
+    }
+
     return address_space_read(as, dpa_offset, attrs, data, size);
 }
 
@@ -1225,6 +1362,17 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     uint64_t dpa_offset = 0;
     AddressSpace *as = NULL;
     int res;
+    
+    /* Initialize CXLMemSim on first use */
+    static bool memsim_initialized = false;
+    if (!memsim_initialized) {
+        cxl_memsim_init();
+        memsim_initialized = true;
+    }
+    
+    /* Log all CXL Type3 writes */
+    // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
+    //            (unsigned long)host_addr, size, (unsigned long)data);
 
     res = cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, size,
                                       &as, &dpa_offset);
@@ -1234,6 +1382,19 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
 
     if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
         return MEMTX_OK;
+    }
+
+    /* Forward to CXLMemSim if enabled */
+    if (g_memsim.enabled) {
+        CXLMemSimResponse resp = {0};
+        
+        // info_report("CXL_TYPE3_WRITE: Forwarding to CXLMemSim - dpa=0x%lx size=%u",
+        //            (unsigned long)dpa_offset, size);
+        
+        if (cxl_memsim_request(1, dpa_offset, size, &data, &resp) == 0) {
+            // info_report("CXL_TYPE3_WRITE_COMPLETE: latency=%lu ns",
+            //            (unsigned long)resp.latency_ns);
+        }
     }
 
     return address_space_write(as, dpa_offset, attrs, &data, size);
