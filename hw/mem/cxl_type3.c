@@ -777,6 +777,8 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         address_space_init(&ct3d->hostvmem_as, vmr, v_name);
         ct3d->cxl_dstate.vmem_size = memory_region_size(vmr);
         ct3d->cxl_dstate.static_mem_size += memory_region_size(vmr);
+        info_report("CXL Type3: Volatile memory initialized - size=%lu MB", 
+                   memory_region_size(vmr) / (1024*1024));
         g_free(v_name);
     }
 
@@ -805,6 +807,8 @@ static bool cxl_setup_memory(CXLType3Dev *ct3d, Error **errp)
         address_space_init(&ct3d->hostpmem_as, pmr, p_name);
         ct3d->cxl_dstate.pmem_size = memory_region_size(pmr);
         ct3d->cxl_dstate.static_mem_size += memory_region_size(pmr);
+        info_report("CXL Type3: Persistent memory initialized - size=%lu MB",
+                   memory_region_size(pmr) / (1024*1024));
         g_free(p_name);
     }
 
@@ -1217,6 +1221,7 @@ typedef struct {
 
 static struct {
     bool enabled;
+    bool initialized;
     char host[256];
     int port;
     int socket_fd;
@@ -1226,11 +1231,27 @@ static struct {
     uint64_t stats_writes;
 } g_memsim = {
     .enabled = false,
+    .initialized = false,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .socket_fd = -1,
 };
 
 static void cxl_memsim_init(void) {
+    /* Use double-checked locking for thread safety */
+    if (g_memsim.initialized) {
+        return;
+    }
+    
+    pthread_mutex_lock(&g_memsim.lock);
+    
+    /* Check again under lock */
+    if (g_memsim.initialized) {
+        pthread_mutex_unlock(&g_memsim.lock);
+        return;
+    }
+    
+    info_report("CXL Type3: Initializing CXLMemSim integration");
+    
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     
@@ -1238,17 +1259,33 @@ static void cxl_memsim_init(void) {
         strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
         g_memsim.port = atoi(port_str);
         g_memsim.enabled = true;
+        g_memsim.initialized = true;
         info_report("CXL Type3: CXLMemSim enabled - %s:%d", host, g_memsim.port);
+    } else {
+        g_memsim.initialized = true;  /* Mark as initialized even if disabled */
     }
+    
+    pthread_mutex_unlock(&g_memsim.lock);
 }
 
-static int cxl_memsim_connect(void) {
+/* Connect function - assumes lock is already held */
+static int cxl_memsim_connect_locked(void) {
     struct sockaddr_in server_addr = {0};
     
-    if (g_memsim.connected) return 0;
+    if (g_memsim.connected) {
+        return 0;
+    }
+    
+    /* Add debugging to track connection source with backtrace */
+    static int connection_count = 0;
+    connection_count++;
+    info_report("CXL Type3: Connection attempt #%d to CXLMemSim server at %s:%d",
+                connection_count, g_memsim.host, g_memsim.port);
     
     g_memsim.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_memsim.socket_fd < 0) return -1;
+    if (g_memsim.socket_fd < 0) {
+        return -1;
+    }
     
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(g_memsim.port);
@@ -1257,16 +1294,23 @@ static int cxl_memsim_connect(void) {
     if (connect(g_memsim.socket_fd, (struct sockaddr *)&server_addr, 
                 sizeof(server_addr)) < 0) {
         close(g_memsim.socket_fd);
+        g_memsim.socket_fd = -1;
+        error_report("CXL Type3: Failed to connect to CXLMemSim");
         return -1;
     }
     
     g_memsim.connected = true;
-    info_report("CXL Type3: Connected to CXLMemSim");
+    info_report("CXL Type3: Successfully connected to CXLMemSim (fd=%d)", 
+                g_memsim.socket_fd);
+    
     return 0;
 }
 
 static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
                               void *data, CXLMemSimResponse *resp) {
+    static int request_count = 0;
+    request_count++;
+    
     CXLMemSimRequest req = {
         .op_type = op,
         .addr = addr,
@@ -1276,7 +1320,13 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
     
     pthread_mutex_lock(&g_memsim.lock);
     
-    if (!g_memsim.connected && cxl_memsim_connect() < 0) {
+    /* Debug logging */
+    if (request_count <= 10) {  /* Only log first 10 requests to avoid spam */
+        info_report("CXL Type3: Request #%d (op=%s, connected=%d)", 
+                    request_count, op == 0 ? "READ" : "WRITE", g_memsim.connected);
+    }
+    
+    if (!g_memsim.connected && cxl_memsim_connect_locked() < 0) {
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
     }
@@ -1286,15 +1336,19 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
     }
     
     if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
+        error_report("CXL Type3: Failed to send request to CXLMemSim");
         g_memsim.connected = false;
         close(g_memsim.socket_fd);
+        g_memsim.socket_fd = -1;
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
     }
     
     if (recv(g_memsim.socket_fd, resp, sizeof(*resp), MSG_WAITALL) != sizeof(*resp)) {
+        error_report("CXL Type3: Failed to receive response from CXLMemSim");
         g_memsim.connected = false;
         close(g_memsim.socket_fd);
+        g_memsim.socket_fd = -1;
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
     }
@@ -1315,11 +1369,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    static bool memsim_initialized = false;
-    if (!memsim_initialized) {
-        cxl_memsim_init();
-        memsim_initialized = true;
-    }
+    cxl_memsim_init();
     
     /* Log all CXL Type3 reads */
     //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
@@ -1364,11 +1414,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    static bool memsim_initialized = false;
-    if (!memsim_initialized) {
-        cxl_memsim_init();
-        memsim_initialized = true;
-    }
+    cxl_memsim_init();
     
     /* Log all CXL Type3 writes */
     // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
@@ -1397,7 +1443,16 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         }
     }
 
-    return address_space_write(as, dpa_offset, attrs, &data, size);
+    /* Perform the write */
+    MemTxResult result = address_space_write(as, dpa_offset, attrs, &data, size);
+    
+    /* Log successful writes */
+    if (result == MEMTX_OK) {
+        // info_report("CXL_TYPE3_WRITE_SUCCESS: dpa=0x%lx size=%u", 
+        //            (unsigned long)dpa_offset, size);
+    }
+    
+    return result;
 }
 
 static void ct3d_reset(DeviceState *dev)
