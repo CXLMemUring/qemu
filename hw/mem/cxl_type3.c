@@ -1219,11 +1219,22 @@ typedef struct {
     uint8_t data[64];
 } CXLMemSimResponse;
 
+/* Transport mode enum */
+enum CXLTransportMode {
+    CXL_TRANSPORT_TCP = 0,
+    CXL_TRANSPORT_RDMA = 1,
+    CXL_TRANSPORT_SHM = 2
+};
+
+/* Include RDMA support header */
+#include "cxl_type3_rdma.h"
+
 static struct {
     bool enabled;
     bool initialized;
     char host[256];
     int port;
+    enum CXLTransportMode transport_mode;
     int socket_fd;
     bool connected;
     pthread_mutex_t lock;
@@ -1232,6 +1243,7 @@ static struct {
 } g_memsim = {
     .enabled = false,
     .initialized = false,
+    .transport_mode = CXL_TRANSPORT_TCP,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .socket_fd = -1,
 };
@@ -1254,13 +1266,50 @@ static void cxl_memsim_init(void) {
     
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
+    const char *transport = getenv("CXL_TRANSPORT_MODE");
+    const char *rdma_server = getenv("CXL_MEMSIM_RDMA_SERVER");
+    const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
     
-    if (host && port_str) {
+    /* Determine transport mode */
+    if (transport) {
+        if (strcmp(transport, "rdma") == 0) {
+            g_memsim.transport_mode = CXL_TRANSPORT_RDMA;
+            /* Use RDMA-specific server and port if available */
+            if (rdma_server) {
+                strncpy(g_memsim.host, rdma_server, sizeof(g_memsim.host) - 1);
+            } else if (host) {
+                strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
+            }
+            if (rdma_port) {
+                g_memsim.port = atoi(rdma_port);
+            } else if (port_str) {
+                g_memsim.port = atoi(port_str);
+            }
+            g_memsim.enabled = true;
+            g_memsim.initialized = true;
+            info_report("CXL Type3: CXLMemSim RDMA mode - %s:%d", g_memsim.host, g_memsim.port);
+        } else if (strcmp(transport, "shm") == 0) {
+            g_memsim.transport_mode = CXL_TRANSPORT_SHM;
+            g_memsim.enabled = true;
+            g_memsim.initialized = true;
+            info_report("CXL Type3: CXLMemSim SHM mode");
+        } else {
+            /* TCP mode */
+            if (host && port_str) {
+                strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
+                g_memsim.port = atoi(port_str);
+                g_memsim.enabled = true;
+                g_memsim.initialized = true;
+                info_report("CXL Type3: CXLMemSim TCP mode - %s:%d", g_memsim.host, g_memsim.port);
+            }
+        }
+    } else if (host && port_str) {
+        /* Default TCP mode */
         strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
         g_memsim.port = atoi(port_str);
         g_memsim.enabled = true;
         g_memsim.initialized = true;
-        info_report("CXL Type3: CXLMemSim enabled - %s:%d", host, g_memsim.port);
+        info_report("CXL Type3: CXLMemSim enabled - %s:%d", g_memsim.host, g_memsim.port);
     } else {
         g_memsim.initialized = true;  /* Mark as initialized even if disabled */
     }
@@ -1274,6 +1323,26 @@ static int cxl_memsim_connect_locked(void) {
     
     if (g_memsim.connected) {
         return 0;
+    }
+    
+    /* Try RDMA connection if configured */
+    if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+        if (cxl_memsim_rdma_available()) {
+            /* Use TCP port 9999 for RDMA-aware connections */
+            int connection_port = 9999;
+            info_report("CXL Type3: Attempting RDMA connection to %s:%d", 
+                       g_memsim.host, connection_port);
+            int ret = cxl_memsim_rdma_connect(g_memsim.host, connection_port);
+            if (ret == 0) {
+                g_memsim.connected = true;
+                info_report("CXL Type3: RDMA-mode connection successful");
+                return 0;
+            }
+            error_report("CXL Type3: RDMA-mode connection failed, falling back to TCP");
+        } else {
+            error_report("CXL Type3: RDMA not available, falling back to TCP");
+        }
+        g_memsim.transport_mode = CXL_TRANSPORT_TCP;
     }
     
     /* Add debugging to track connection source with backtrace */
@@ -1322,10 +1391,38 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
     
     /* Debug logging */
     if (request_count <= 10) {  /* Only log first 10 requests to avoid spam */
-        info_report("CXL Type3: Request #%d (op=%s, connected=%d)", 
-                    request_count, op == 0 ? "READ" : "WRITE", g_memsim.connected);
+        info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)", 
+                    request_count, op == 0 ? "READ" : "WRITE", g_memsim.connected,
+                    g_memsim.transport_mode == CXL_TRANSPORT_RDMA ? "RDMA" : "TCP");
     }
     
+    /* Use RDMA if in RDMA mode */
+    if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+        /* Ensure we're connected */
+        if (!g_memsim.connected) {
+            if (cxl_memsim_connect_locked() < 0) {
+                pthread_mutex_unlock(&g_memsim.lock);
+                return -1;
+            }
+        }
+        
+        int ret = cxl_memsim_rdma_request(op, addr, size, data, resp);
+        if (ret < 0) {
+            /* Connection failed, mark as disconnected for retry */
+            g_memsim.connected = false;
+        } else {
+            /* Update stats on success */
+            if (op == 0) {
+                g_memsim.stats_reads++;
+            } else {
+                g_memsim.stats_writes++;
+            }
+        }
+        pthread_mutex_unlock(&g_memsim.lock);
+        return ret;
+    }
+    
+    /* TCP path */
     if (!g_memsim.connected && cxl_memsim_connect_locked() < 0) {
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
