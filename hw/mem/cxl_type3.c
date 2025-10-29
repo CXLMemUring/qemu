@@ -1205,6 +1205,9 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 }
 
 /* CXLMemSim Integration */
+#define CXL_MEMSIM_DEFAULT_HOST "127.0.0.1"
+#define CXL_MEMSIM_DEFAULT_PORT 9999
+
 typedef struct {
     uint8_t op_type;
     uint64_t addr;
@@ -1267,53 +1270,65 @@ static void cxl_memsim_init(void) {
     const char *host = getenv("CXL_MEMSIM_HOST");
     const char *port_str = getenv("CXL_MEMSIM_PORT");
     const char *transport = getenv("CXL_TRANSPORT_MODE");
+    if (!transport || !transport[0]) {
+        transport = getenv("CXL_MEMSIM_TRANSPORT");
+    }
     const char *rdma_server = getenv("CXL_MEMSIM_RDMA_SERVER");
     const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
-    
+
+    if (!host || !host[0]) {
+        host = CXL_MEMSIM_DEFAULT_HOST;
+    }
+
+    int port = CXL_MEMSIM_DEFAULT_PORT;
+    if (port_str && port_str[0]) {
+        port = atoi(port_str);
+    }
+
+    /* Default to SHM transport when unspecified */
+    if (!transport || !transport[0]) {
+        transport = "shm";
+    }
+
     /* Determine transport mode */
     if (transport) {
         if (strcmp(transport, "rdma") == 0) {
             g_memsim.transport_mode = CXL_TRANSPORT_RDMA;
             /* Use RDMA-specific server and port if available */
-            if (rdma_server) {
-                strncpy(g_memsim.host, rdma_server, sizeof(g_memsim.host) - 1);
-            } else if (host) {
-                strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
+            if (rdma_server && rdma_server[0]) {
+                g_strlcpy(g_memsim.host, rdma_server, sizeof(g_memsim.host));
+            } else {
+                g_strlcpy(g_memsim.host, host, sizeof(g_memsim.host));
             }
             if (rdma_port) {
                 g_memsim.port = atoi(rdma_port);
-            } else if (port_str) {
-                g_memsim.port = atoi(port_str);
+            } else {
+                g_memsim.port = port;
             }
             g_memsim.enabled = true;
             g_memsim.initialized = true;
             info_report("CXL Type3: CXLMemSim RDMA mode - %s:%d", g_memsim.host, g_memsim.port);
         } else if (strcmp(transport, "shm") == 0) {
             g_memsim.transport_mode = CXL_TRANSPORT_SHM;
-            g_memsim.enabled = true;
+            g_memsim.enabled = false;
             g_memsim.initialized = true;
-            info_report("CXL Type3: CXLMemSim SHM mode");
+            info_report("CXL Type3: CXLMemSim SHM mode (no network connection)");
         } else {
             /* TCP mode */
-            if (host && port_str) {
-                strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
-                g_memsim.port = atoi(port_str);
-                g_memsim.enabled = true;
-                g_memsim.initialized = true;
-                info_report("CXL Type3: CXLMemSim TCP mode - %s:%d", g_memsim.host, g_memsim.port);
-            }
+            g_strlcpy(g_memsim.host, host, sizeof(g_memsim.host));
+            g_memsim.port = port;
+            g_memsim.enabled = true;
+            g_memsim.initialized = true;
+            info_report("CXL Type3: CXLMemSim TCP mode - %s:%d", g_memsim.host, g_memsim.port);
         }
-    } else if (host && port_str) {
-        /* Default TCP mode */
-        strncpy(g_memsim.host, host, sizeof(g_memsim.host) - 1);
-        g_memsim.port = atoi(port_str);
-        g_memsim.enabled = true;
-        g_memsim.initialized = true;
-        info_report("CXL Type3: CXLMemSim enabled - %s:%d", g_memsim.host, g_memsim.port);
     } else {
-        g_memsim.initialized = true;  /* Mark as initialized even if disabled */
+        /* Should not reach here; default to SHM semantics */
+        g_memsim.transport_mode = CXL_TRANSPORT_SHM;
+        g_memsim.enabled = false;
+        g_memsim.initialized = true;
+        info_report("CXL Type3: CXLMemSim SHM mode (no network connection)");
     }
-    
+
     pthread_mutex_unlock(&g_memsim.lock);
 }
 
@@ -1324,7 +1339,13 @@ static int cxl_memsim_connect_locked(void) {
     if (g_memsim.connected) {
         return 0;
     }
-    
+
+    if (g_memsim.transport_mode == CXL_TRANSPORT_SHM) {
+        /* No socket connection required for SHM mode */
+        g_memsim.connected = true;
+        return 0;
+    }
+
     /* Try RDMA connection if configured */
     if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
         if (cxl_memsim_rdma_available()) {
