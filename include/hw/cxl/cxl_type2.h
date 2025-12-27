@@ -2,6 +2,10 @@
  * CXL Type 2 Device (Accelerator with Coherent Memory) Header
  * Designed for GPU passthrough with CPU-GPU coherency
  *
+ * Supports two GPU backends:
+ * 1. VFIO passthrough - Direct hardware access
+ * 2. hetGPU - Software CUDA translation layer for any GPU
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -11,6 +15,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
+#include "hw/cxl/cxl_hetgpu.h"
 #include "qemu/thread.h"
 #include "io/channel-socket.h"
 
@@ -39,6 +44,14 @@ typedef struct CXLCacheLine {
     uint64_t timestamp;
 } CXLCacheLine;
 
+/* GPU backend mode */
+typedef enum {
+    CXL_TYPE2_GPU_MODE_NONE = 0,    /* No GPU backend */
+    CXL_TYPE2_GPU_MODE_VFIO = 1,    /* VFIO passthrough */
+    CXL_TYPE2_GPU_MODE_HETGPU = 2,  /* hetGPU software translation */
+    CXL_TYPE2_GPU_MODE_AUTO = 3,    /* Auto-detect best backend */
+} CXLType2GPUMode;
+
 /* GPU passthrough information */
 typedef struct CXLType2GPUInfo {
     char *vfio_device;      /* VFIO device path (e.g., "0000:01:00.0") */
@@ -50,6 +63,13 @@ typedef struct CXLType2GPUInfo {
     int vfio_device_fd;
     QemuThread irq_thread;  /* IRQ forwarding thread */
     bool irq_thread_running;
+
+    /* hetGPU backend support */
+    uint32_t mode;                  /* GPU backend mode (CXLType2GPUMode) */
+    char *hetgpu_lib_path;          /* Path to hetGPU library */
+    HetGPUState hetgpu_state;       /* hetGPU backend state */
+    int32_t hetgpu_device_index;    /* hetGPU device index */
+    uint32_t hetgpu_backend;        /* hetGPU backend type (HetGPUBackendType) */
 } CXLType2GPUInfo;
 
 /* Coherency protocol state */
@@ -94,6 +114,21 @@ typedef struct CXLType2State {
     MemoryRegion cache_io;             /* Cache access interceptor */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
     MemoryRegion device_mem_io;        /* Device memory interceptor */
+    MemoryRegion gpu_cmd_region;       /* GPU command registers */
+
+    /* GPU command state */
+    struct {
+        uint32_t status;
+        uint32_t cmd_status;
+        uint32_t cmd_result;
+        uint64_t params[8];
+        uint64_t results[4];
+        uint8_t  data[0x10000];        /* 64KB data buffer */
+        void    *modules[64];          /* Loaded PTX modules */
+        void    *functions[256];       /* Kernel function handles */
+        uint32_t num_modules;
+        uint32_t num_functions;
+    } gpu_cmd;
 
     /* Device configuration */
     uint64_t cache_size;
@@ -171,5 +206,20 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp);
 void cxl_type2_gpu_cleanup(CXLType2State *ct2d);
 int cxl_type2_gpu_read(CXLType2State *ct2d, uint64_t offset, void *buf, size_t size);
 int cxl_type2_gpu_write(CXLType2State *ct2d, uint64_t offset, const void *buf, size_t size);
+
+/* hetGPU backend functions */
+int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp);
+void cxl_type2_hetgpu_cleanup(CXLType2State *ct2d);
+int cxl_type2_hetgpu_load_ptx(CXLType2State *ct2d, const char *ptx_source,
+                               void **module);
+int cxl_type2_hetgpu_launch_kernel(CXLType2State *ct2d, void *function,
+                                    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+                                    uint32_t block_x, uint32_t block_y, uint32_t block_z,
+                                    uint32_t shared_mem, void **args, size_t num_args);
+int cxl_type2_hetgpu_malloc(CXLType2State *ct2d, size_t size, uint64_t *dev_ptr);
+int cxl_type2_hetgpu_free(CXLType2State *ct2d, uint64_t dev_ptr);
+int cxl_type2_hetgpu_memcpy_htod(CXLType2State *ct2d, uint64_t dst, const void *src, size_t size);
+int cxl_type2_hetgpu_memcpy_dtoh(CXLType2State *ct2d, void *dst, uint64_t src, size_t size);
+int cxl_type2_hetgpu_sync(CXLType2State *ct2d);
 
 #endif /* CXL_TYPE2_H */

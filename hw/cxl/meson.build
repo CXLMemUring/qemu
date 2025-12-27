@@ -9,6 +9,7 @@ system_ss.add(when: 'CONFIG_CXL',
                    'switch-mailbox-cci.c',
                    'cxl_type1.c',
                    'cxl_type2.c',
+                   'cxl_hetgpu.c',
                ),
                if_false: files(
                    'cxl-host-stubs.c',

@@ -26,6 +26,8 @@
 #include "hw/cxl/cxl_cdat.h"
 #include "hw/cxl/cxl_pci.h"
 #include "hw/cxl/cxl_type2.h"
+#include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/msix.h"
@@ -40,6 +42,10 @@
 #include <sys/eventfd.h>
 #include <linux/vfio.h>
 #include <unistd.h>
+
+/* Forward declarations for hetGPU coherency integration */
+static void cxl_type2_hetgpu_coherency_callback(void *opaque, uint64_t addr,
+                                                 uint64_t size, bool invalidate);
 
 /* ========================================================================
  * Coherency Protocol Implementation
@@ -539,6 +545,270 @@ cleanup:
 }
 
 /* ========================================================================
+ * hetGPU Backend Implementation
+ * ======================================================================== */
+
+/* Coherency callback for hetGPU operations */
+static void cxl_type2_hetgpu_coherency_callback(void *opaque, uint64_t addr,
+                                                 uint64_t size, bool invalidate)
+{
+    CXLType2State *ct2d = opaque;
+
+    if (!ct2d || !ct2d->coherency.coherency_enabled) {
+        return;
+    }
+
+    if (invalidate) {
+        /* GPU is writing - invalidate CPU cache lines */
+        if (addr && size) {
+            uint64_t aligned_addr = addr & ~0x3F;
+            uint64_t end_addr = (addr + size + 63) & ~0x3F;
+            for (uint64_t a = aligned_addr; a < end_addr; a += 64) {
+                cxl_type2_cache_invalidate(ct2d, a);
+            }
+        }
+    } else {
+        /* GPU is reading - write back CPU cache lines */
+        if (addr && size) {
+            uint64_t aligned_addr = addr & ~0x3F;
+            uint64_t end_addr = (addr + size + 63) & ~0x3F;
+            for (uint64_t a = aligned_addr; a < end_addr; a += 64) {
+                cxl_type2_cache_writeback(ct2d, a);
+            }
+        }
+    }
+
+    ct2d->coherency.coherency_ops++;
+}
+
+int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+    const char *lib_path;
+
+    /* Determine library path */
+    lib_path = ct2d->gpu_info.hetgpu_lib_path;
+    if (!lib_path) {
+        lib_path = getenv("HETGPU_LIB_PATH");
+    }
+    if (!lib_path) {
+        lib_path = "/home/victoryang00/hetGPU/target/release/libnvcuda.so";
+    }
+
+    qemu_log("CXL Type2: Initializing hetGPU backend from %s\n", lib_path);
+
+    /* Initialize hetGPU */
+    err = hetgpu_init(hetgpu,
+                      ct2d->gpu_info.hetgpu_backend,
+                      ct2d->gpu_info.hetgpu_device_index,
+                      lib_path);
+    if (err != HETGPU_SUCCESS) {
+        error_setg(errp, "hetGPU initialization failed: %s",
+                   hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    /* Create context */
+    err = hetgpu_create_context(hetgpu);
+    if (err != HETGPU_SUCCESS) {
+        error_setg(errp, "hetGPU context creation failed: %s",
+                   hetgpu_get_error_string(err));
+        hetgpu_cleanup(hetgpu);
+        return -1;
+    }
+
+    /* Set up coherency callback */
+    hetgpu_set_coherency_callback(hetgpu,
+                                   cxl_type2_hetgpu_coherency_callback,
+                                   ct2d);
+
+    ct2d->gpu_info.passthrough_enabled = true;
+    ct2d->gpu_info.gpu_mem_size = hetgpu->props.total_memory;
+
+    qemu_log("CXL Type2: hetGPU initialized - Backend: %s, Device: %s\n",
+             hetgpu_get_backend_name(hetgpu->backend),
+             hetgpu->props.name);
+    qemu_log("CXL Type2: GPU Memory: %lu MB, Compute: %d.%d\n",
+             hetgpu->props.total_memory / (1024 * 1024),
+             hetgpu->props.compute_capability_major,
+             hetgpu->props.compute_capability_minor);
+
+    return 0;
+}
+
+void cxl_type2_hetgpu_cleanup(CXLType2State *ct2d)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+
+    if (!hetgpu->initialized) {
+        return;
+    }
+
+    qemu_log("CXL Type2: Cleaning up hetGPU backend\n");
+    hetgpu_cleanup(hetgpu);
+}
+
+int cxl_type2_hetgpu_load_ptx(CXLType2State *ct2d, const char *ptx_source,
+                               void **module)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    err = hetgpu_load_ptx(hetgpu, ptx_source, (HetGPUModule *)module);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Failed to load PTX: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+int cxl_type2_hetgpu_launch_kernel(CXLType2State *ct2d, void *function,
+                                    uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
+                                    uint32_t block_x, uint32_t block_y, uint32_t block_z,
+                                    uint32_t shared_mem, void **args, size_t num_args)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPULaunchConfig config;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    config.grid_dim[0] = grid_x;
+    config.grid_dim[1] = grid_y;
+    config.grid_dim[2] = grid_z;
+    config.block_dim[0] = block_x;
+    config.block_dim[1] = block_y;
+    config.block_dim[2] = block_z;
+    config.shared_mem_bytes = shared_mem;
+    config.stream = NULL;
+
+    err = hetgpu_launch_kernel(hetgpu, function, &config, args, num_args);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Kernel launch failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    ct2d->stats.gpu_accesses++;
+    return 0;
+}
+
+int cxl_type2_hetgpu_malloc(CXLType2State *ct2d, size_t size, uint64_t *dev_ptr)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized || !dev_ptr) {
+        return -1;
+    }
+
+    err = hetgpu_malloc(hetgpu, size, HETGPU_MEM_HOST_MAPPED,
+                        (HetGPUDevicePtr *)dev_ptr);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Memory allocation failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+int cxl_type2_hetgpu_free(CXLType2State *ct2d, uint64_t dev_ptr)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    err = hetgpu_free(hetgpu, dev_ptr);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Memory free failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+int cxl_type2_hetgpu_memcpy_htod(CXLType2State *ct2d, uint64_t dst,
+                                  const void *src, size_t size)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    /* Invalidate cache before GPU write */
+    cxl_type2_cache_invalidate(ct2d, dst);
+
+    err = hetgpu_memcpy_htod(hetgpu, dst, src, size);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: HtoD memcpy failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    ct2d->stats.gpu_accesses++;
+    return 0;
+}
+
+int cxl_type2_hetgpu_memcpy_dtoh(CXLType2State *ct2d, void *dst,
+                                  uint64_t src, size_t size)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    /* Writeback cache before GPU read */
+    cxl_type2_cache_writeback(ct2d, src);
+
+    err = hetgpu_memcpy_dtoh(hetgpu, dst, src, size);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: DtoH memcpy failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    ct2d->stats.gpu_accesses++;
+    return 0;
+}
+
+int cxl_type2_hetgpu_sync(CXLType2State *ct2d)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+
+    if (!hetgpu->initialized) {
+        return -1;
+    }
+
+    err = hetgpu_synchronize(hetgpu);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Sync failed: %s\n",
+                 hetgpu_get_error_string(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ========================================================================
  * GPU Passthrough Implementation - Main Functions
  * ======================================================================== */
 
@@ -547,7 +817,45 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp)
     Error *local_err = NULL;
     int ret;
 
-    if (!ct2d->gpu_info.vfio_device) {
+    /* Determine GPU mode if auto */
+    if (ct2d->gpu_info.mode == CXL_TYPE2_GPU_MODE_AUTO) {
+        if (ct2d->gpu_info.vfio_device && ct2d->gpu_info.vfio_device[0]) {
+            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_VFIO;
+        } else if (ct2d->gpu_info.hetgpu_lib_path ||
+                   getenv("HETGPU_LIB_PATH")) {
+            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_HETGPU;
+        } else {
+            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_NONE;
+        }
+    }
+
+    /* Initialize based on mode */
+    switch (ct2d->gpu_info.mode) {
+    case CXL_TYPE2_GPU_MODE_HETGPU:
+        qemu_log("CXL Type2: Initializing hetGPU backend\n");
+        ret = cxl_type2_hetgpu_init(ct2d, errp);
+        if (ret == 0) {
+            qemu_log("CXL Type2: hetGPU backend initialized successfully\n");
+            return 0;
+        }
+        /* Fall through to VFIO or simulation if hetGPU fails */
+        qemu_log("CXL Type2: hetGPU init failed, trying fallback\n");
+        /* fall through */
+
+    case CXL_TYPE2_GPU_MODE_VFIO:
+        if (!ct2d->gpu_info.vfio_device || !ct2d->gpu_info.vfio_device[0]) {
+            qemu_log("CXL Type2: No VFIO device specified\n");
+            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_NONE;
+            /* fall through */
+        } else {
+            qemu_log("CXL Type2: Initializing GPU passthrough for device %s\n",
+                     ct2d->gpu_info.vfio_device);
+            break; /* Continue with VFIO init below */
+        }
+        /* fall through */
+
+    case CXL_TYPE2_GPU_MODE_NONE:
+    default:
         qemu_log("CXL Type2: GPU passthrough not configured (simulation mode)\n");
         ct2d->gpu_info.gpu_mem_base = 0;
         ct2d->gpu_info.gpu_mem_size = ct2d->device_mem_size;
@@ -555,7 +863,8 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp)
         return 0;
     }
 
-    qemu_log("CXL Type2: Initializing GPU passthrough for device %s\n",
+    /* VFIO passthrough initialization continues here */
+    qemu_log("CXL Type2: Initializing VFIO passthrough for device %s\n",
              ct2d->gpu_info.vfio_device);
 
     /* Step 1: Open VFIO container */
@@ -628,6 +937,14 @@ void cxl_type2_gpu_cleanup(CXLType2State *ct2d)
         return;
     }
 
+    /* Handle hetGPU cleanup */
+    if (ct2d->gpu_info.mode == CXL_TYPE2_GPU_MODE_HETGPU) {
+        cxl_type2_hetgpu_cleanup(ct2d);
+        ct2d->gpu_info.passthrough_enabled = false;
+        return;
+    }
+
+    /* VFIO cleanup */
     /* Stop IRQ forwarding thread */
     if (ct2d->gpu_info.irq_thread_running) {
         ct2d->gpu_info.irq_thread_running = false;
@@ -908,6 +1225,10 @@ static void *cxlmemsim_recv_thread(void *opaque)
  * Memory Access Handlers with Coherency
  * ======================================================================== */
 
+/* Forward declaration for GPU command handler */
+static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size);
+static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr, uint64_t value, unsigned size);
+
 static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
 {
     CXLType2State *ct2d = opaque;
@@ -915,6 +1236,11 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
     uint64_t value = 0;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
+
+    /* Check if this is a GPU command register access */
+    if (addr < CXL_GPU_CMD_REG_SIZE) {
+        return cxl_type2_gpu_cmd_read(opaque, addr, size);
+    }
 
     ct2d->stats.cpu_accesses++;
 
@@ -968,6 +1294,12 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
     CXLCacheLine *line;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
+
+    /* Check if this is a GPU command register access */
+    if (addr < CXL_GPU_CMD_REG_SIZE) {
+        cxl_type2_gpu_cmd_write(opaque, addr, value, size);
+        return;
+    }
 
     ct2d->stats.cpu_accesses++;
     ct2d->stats.write_ops++;
@@ -1034,6 +1366,50 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value
     cxl_type2_cache_write(opaque, addr, value, size);
 }
 
+/* Component register operations - for BAR0 CXL component registers */
+static uint64_t cxl_type2_component_reg_read(void *opaque, hwaddr offset, unsigned size)
+{
+    CXLComponentState *cxl_cstate = opaque;
+
+    if (offset >= CXL2_COMPONENT_CM_REGION_SIZE) {
+        qemu_log_mask(LOG_UNIMP,
+                     "CXL Type2: Unimplemented component register read at 0x%lx\n",
+                     offset);
+        return 0;
+    }
+
+    return ldl_le_p((uint8_t *)cxl_cstate->crb.cache_mem_registers + offset);
+}
+
+static void cxl_type2_component_reg_write(void *opaque, hwaddr offset,
+                                          uint64_t value, unsigned size)
+{
+    CXLComponentState *cxl_cstate = opaque;
+
+    if (offset >= CXL2_COMPONENT_CM_REGION_SIZE) {
+        qemu_log_mask(LOG_UNIMP,
+                     "CXL Type2: Unimplemented component register write at 0x%lx\n",
+                     offset);
+        return;
+    }
+
+    stl_le_p((uint8_t *)cxl_cstate->crb.cache_mem_registers + offset, value);
+}
+
+static const MemoryRegionOps cxl_type2_component_reg_ops = {
+    .read = cxl_type2_component_reg_read,
+    .write = cxl_type2_component_reg_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+};
+
 static const MemoryRegionOps cxl_type2_cache_ops = {
     .read = cxl_type2_cache_read,
     .write = cxl_type2_cache_write,
@@ -1061,6 +1437,420 @@ static const MemoryRegionOps cxl_type2_device_mem_ops = {
         .max_access_size = 8,
     },
 };
+
+/* ========================================================================
+ * GPU Command Interface
+ * ======================================================================== */
+
+static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
+    uint64_t dev_ptr;
+    size_t size;
+
+    fprintf(stderr, "CXL GPU: execute cmd 0x%x, hetgpu_init=%d\n", cmd, hetgpu->initialized);
+
+    ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
+    ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+
+    switch (cmd) {
+    case CXL_GPU_CMD_NOP:
+        break;
+
+    case CXL_GPU_CMD_INIT:
+        if (!hetgpu->initialized) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_DEVICE_COUNT:
+        ct2d->gpu_cmd.results[0] = hetgpu->initialized ? 1 : 0;
+        break;
+
+    case CXL_GPU_CMD_GET_DEVICE:
+        if (ct2d->gpu_cmd.params[0] == 0 && hetgpu->initialized) {
+            ct2d->gpu_cmd.results[0] = 0; /* Device handle */
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_DEVICE;
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_DEVICE_PROPS:
+        if (hetgpu->initialized) {
+            HetGPUDeviceProps props;
+            err = hetgpu_get_device_props(hetgpu, &props);
+            if (err == HETGPU_SUCCESS) {
+                /* Copy device name to data buffer */
+                memcpy(ct2d->gpu_cmd.data, props.name, sizeof(props.name));
+                ct2d->gpu_cmd.results[0] = props.total_memory;
+                ct2d->gpu_cmd.results[1] = (props.compute_capability_major << 16) |
+                                           props.compute_capability_minor;
+                ct2d->gpu_cmd.results[2] = props.multiprocessor_count;
+                ct2d->gpu_cmd.results[3] = props.max_threads_per_block;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_DEVICE;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_TOTAL_MEM:
+        if (hetgpu->initialized) {
+            ct2d->gpu_cmd.results[0] = hetgpu->props.total_memory;
+        } else {
+            ct2d->gpu_cmd.results[0] = ct2d->device_mem_size;
+        }
+        break;
+
+    case CXL_GPU_CMD_CTX_CREATE:
+        if (hetgpu->initialized) {
+            err = hetgpu_create_context(hetgpu);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = (uint64_t)(uintptr_t)hetgpu->context;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_CONTEXT;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_CTX_DESTROY:
+        /* Context destroyed on device cleanup */
+        break;
+
+    case CXL_GPU_CMD_CTX_SYNC:
+        if (hetgpu->initialized) {
+            err = hetgpu_synchronize(hetgpu);
+            if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_MEM_ALLOC:
+        size = ct2d->gpu_cmd.params[0];
+        if (hetgpu->initialized) {
+            err = hetgpu_malloc(hetgpu, size, HETGPU_MEM_DEFAULT, &dev_ptr);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.results[0] = dev_ptr;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+            }
+        } else {
+            /* Fallback: allocate from device memory region */
+            /* Simple bump allocator - in real impl, use proper allocator */
+            static uint64_t next_alloc = 0;
+            if (next_alloc + size <= ct2d->device_mem_size) {
+                ct2d->gpu_cmd.results[0] = next_alloc;
+                next_alloc += (size + 0xFFF) & ~0xFFF; /* Page align */
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_MEM_FREE:
+        dev_ptr = ct2d->gpu_cmd.params[0];
+        if (hetgpu->initialized) {
+            err = hetgpu_free(hetgpu, dev_ptr);
+            if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        /* Fallback: no-op for simple allocator */
+        break;
+
+    case CXL_GPU_CMD_MEM_COPY_HTOD:
+        dev_ptr = ct2d->gpu_cmd.params[0];  /* dst device ptr */
+        size = ct2d->gpu_cmd.params[1];     /* size */
+        /* Data is in ct2d->gpu_cmd.data buffer */
+        if (size > sizeof(ct2d->gpu_cmd.data)) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        if (hetgpu->initialized) {
+            err = hetgpu_memcpy_htod(hetgpu, dev_ptr, ct2d->gpu_cmd.data, size);
+            if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        } else {
+            /* Fallback: copy to device memory region */
+            if (dev_ptr + size <= ct2d->device_mem_size) {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (mem) {
+                    memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                }
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_MEM_COPY_DTOH:
+        dev_ptr = ct2d->gpu_cmd.params[0];  /* src device ptr */
+        size = ct2d->gpu_cmd.params[1];     /* size */
+        if (size > sizeof(ct2d->gpu_cmd.data)) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        if (hetgpu->initialized) {
+            err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
+            if (err != HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        } else {
+            /* Fallback: copy from device memory region */
+            if (dev_ptr + size <= ct2d->device_mem_size) {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (mem) {
+                    memcpy(ct2d->gpu_cmd.data, mem + dev_ptr, size);
+                }
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_MODULE_LOAD_PTX:
+        if (hetgpu->initialized && ct2d->gpu_cmd.num_modules < 64) {
+            /* PTX source is in data buffer */
+            void *module = NULL;
+            err = hetgpu_load_ptx(hetgpu, (const char *)ct2d->gpu_cmd.data,
+                                  (HetGPUModule *)&module);
+            if (err == HETGPU_SUCCESS) {
+                ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
+                ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
+                ct2d->gpu_cmd.num_modules++;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_FUNC_GET:
+        if (hetgpu->initialized && ct2d->gpu_cmd.num_functions < 256) {
+            uint32_t module_id = ct2d->gpu_cmd.params[0];
+            /* Function name is in data buffer */
+            if (module_id < ct2d->gpu_cmd.num_modules) {
+                void *func = NULL;
+                err = hetgpu_get_function(hetgpu,
+                                          ct2d->gpu_cmd.modules[module_id],
+                                          (const char *)ct2d->gpu_cmd.data,
+                                          (HetGPUFunction *)&func);
+                if (err == HETGPU_SUCCESS) {
+                    ct2d->gpu_cmd.functions[ct2d->gpu_cmd.num_functions] = func;
+                    ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions;
+                    ct2d->gpu_cmd.num_functions++;
+                } else {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_FOUND;
+                }
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    case CXL_GPU_CMD_LAUNCH_KERNEL:
+        if (hetgpu->initialized) {
+            uint32_t func_id = ct2d->gpu_cmd.params[0];
+            if (func_id < ct2d->gpu_cmd.num_functions) {
+                HetGPULaunchConfig config;
+                config.grid_dim[0] = ct2d->gpu_cmd.params[1] & 0xFFFFFFFF;
+                config.grid_dim[1] = (ct2d->gpu_cmd.params[1] >> 32) & 0xFFFFFFFF;
+                config.grid_dim[2] = ct2d->gpu_cmd.params[2] & 0xFFFFFFFF;
+                config.block_dim[0] = (ct2d->gpu_cmd.params[2] >> 32) & 0xFFFFFFFF;
+                config.block_dim[1] = ct2d->gpu_cmd.params[3] & 0xFFFFFFFF;
+                config.block_dim[2] = (ct2d->gpu_cmd.params[3] >> 32) & 0xFFFFFFFF;
+                config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
+                config.stream = NULL;
+
+                /* Kernel args are in data buffer as array of pointers */
+                uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
+                void **args = (void **)ct2d->gpu_cmd.data;
+
+                err = hetgpu_launch_kernel(hetgpu,
+                                           ct2d->gpu_cmd.functions[func_id],
+                                           &config, args, num_args);
+                if (err != HETGPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_LAUNCH_FAILED;
+                }
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
+            }
+        } else {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+        }
+        break;
+
+    default:
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        break;
+    }
+
+    ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
+    fprintf(stderr, "CXL GPU: cmd done, status=%u result=%u results[0]=0x%lx\n",
+            ct2d->gpu_cmd.cmd_status, ct2d->gpu_cmd.cmd_result,
+            (unsigned long)ct2d->gpu_cmd.results[0]);
+}
+
+static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    uint64_t value = 0;
+
+    /* Debug: trace important register reads */
+    if (addr < 0x100) {
+        fprintf(stderr, "CXL GPU: read reg 0x%lx size=%u\n", (unsigned long)addr, size);
+    }
+
+    switch (addr) {
+    case CXL_GPU_REG_MAGIC:
+        value = CXL_GPU_MAGIC;
+        break;
+    case CXL_GPU_REG_VERSION:
+        value = CXL_GPU_VERSION;
+        break;
+    case CXL_GPU_REG_STATUS:
+        value = ct2d->gpu_cmd.status;
+        if (hetgpu->initialized) {
+            value |= CXL_GPU_STATUS_READY;
+        }
+        if (hetgpu->context) {
+            value |= CXL_GPU_STATUS_CTX_ACTIVE;
+        }
+        break;
+    case CXL_GPU_REG_CAPS:
+        value = 0x1; /* Basic capability */
+        break;
+    case CXL_GPU_REG_CMD_STATUS:
+        value = ct2d->gpu_cmd.cmd_status;
+        fprintf(stderr, "CXL GPU: read CMD_STATUS = %lu\n", (unsigned long)value);
+        break;
+    case CXL_GPU_REG_CMD_RESULT:
+        value = ct2d->gpu_cmd.cmd_result;
+        break;
+    case CXL_GPU_REG_RESULT0:
+        value = ct2d->gpu_cmd.results[0];
+        fprintf(stderr, "CXL GPU: read RESULT0 = 0x%lx\n", (unsigned long)value);
+        break;
+    case CXL_GPU_REG_RESULT1:
+        value = ct2d->gpu_cmd.results[1];
+        break;
+    case CXL_GPU_REG_RESULT2:
+        value = ct2d->gpu_cmd.results[2];
+        break;
+    case CXL_GPU_REG_RESULT3:
+        value = ct2d->gpu_cmd.results[3];
+        break;
+    case CXL_GPU_REG_TOTAL_MEM:
+        if (hetgpu->initialized && hetgpu->props.total_memory > 0) {
+            value = hetgpu->props.total_memory;
+        } else {
+            value = ct2d->device_mem_size;
+        }
+        fprintf(stderr, "CXL GPU: read TOTAL_MEM = 0x%lx (%lu MB)\n",
+                (unsigned long)value, (unsigned long)(value / (1024*1024)));
+        break;
+    case CXL_GPU_REG_FREE_MEM:
+        /* Report device memory as free memory */
+        value = ct2d->device_mem_size;
+        break;
+    case CXL_GPU_REG_CC_MAJOR:
+        value = hetgpu->initialized ? hetgpu->props.compute_capability_major : 8;
+        break;
+    case CXL_GPU_REG_CC_MINOR:
+        value = hetgpu->initialized ? hetgpu->props.compute_capability_minor : 0;
+        break;
+    case CXL_GPU_REG_MP_COUNT:
+        value = hetgpu->initialized ? hetgpu->props.multiprocessor_count : 80;
+        break;
+    case CXL_GPU_REG_MAX_THREADS:
+        value = hetgpu->initialized ? hetgpu->props.max_threads_per_block : 1024;
+        break;
+    case CXL_GPU_REG_WARP_SIZE:
+        value = hetgpu->initialized ? hetgpu->props.warp_size : 32;
+        break;
+    case CXL_GPU_REG_BACKEND:
+        value = hetgpu->backend;
+        break;
+    default:
+        /* Data region */
+        if (addr >= CXL_GPU_DATA_OFFSET &&
+            addr < CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE) {
+            size_t offset = addr - CXL_GPU_DATA_OFFSET;
+            if (offset + size <= sizeof(ct2d->gpu_cmd.data)) {
+                memcpy(&value, &ct2d->gpu_cmd.data[offset], MIN(size, 8));
+            }
+        } else if (addr >= CXL_GPU_REG_DEV_NAME &&
+                   addr < CXL_GPU_REG_DEV_NAME + 64) {
+            /* Device name */
+            size_t offset = addr - CXL_GPU_REG_DEV_NAME;
+            if (hetgpu->initialized) {
+                memcpy(&value, &hetgpu->props.name[offset], MIN(size, 8));
+            }
+        }
+        break;
+    }
+
+    return value;
+}
+
+static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
+                                     uint64_t value, unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+
+    switch (addr) {
+    case CXL_GPU_REG_CMD:
+        /* Execute command */
+        cxl_type2_gpu_execute_cmd(ct2d, value);
+        break;
+    case CXL_GPU_REG_PARAM0:
+        ct2d->gpu_cmd.params[0] = value;
+        break;
+    case CXL_GPU_REG_PARAM1:
+        ct2d->gpu_cmd.params[1] = value;
+        break;
+    case CXL_GPU_REG_PARAM2:
+        ct2d->gpu_cmd.params[2] = value;
+        break;
+    case CXL_GPU_REG_PARAM3:
+        ct2d->gpu_cmd.params[3] = value;
+        break;
+    case CXL_GPU_REG_PARAM4:
+        ct2d->gpu_cmd.params[4] = value;
+        break;
+    case CXL_GPU_REG_PARAM5:
+        ct2d->gpu_cmd.params[5] = value;
+        break;
+    case CXL_GPU_REG_PARAM6:
+        ct2d->gpu_cmd.params[6] = value;
+        break;
+    case CXL_GPU_REG_PARAM7:
+        ct2d->gpu_cmd.params[7] = value;
+        break;
+    default:
+        /* Data region */
+        if (addr >= CXL_GPU_DATA_OFFSET &&
+            addr < CXL_GPU_DATA_OFFSET + CXL_GPU_DATA_SIZE) {
+            size_t offset = addr - CXL_GPU_DATA_OFFSET;
+            if (offset + size <= sizeof(ct2d->gpu_cmd.data)) {
+                memcpy(&ct2d->gpu_cmd.data[offset], &value, MIN(size, 8));
+            }
+        }
+        break;
+    }
+}
+
+/* GPU command ops handled directly in cache_read/cache_write */
 
 /* ========================================================================
  * DVSEC Configuration
@@ -1096,12 +1886,15 @@ static void build_dvsecs(CXLType2State *ct2d)
                               PCIE_CXL31_DEVICE_DVSEC_REVID,
                               dvsec);
 
-    /* Register Locator DVSEC */
+    /* Register Locator DVSEC
+     * Type 2 devices only have component registers in BAR0
+     * BAR2 is used for cache memory, not CXL device registers
+     */
     dvsec = (uint8_t *)&(CXLDVSECRegisterLocator){
         .rsvd = 0,
         .reg0_base_lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
         .reg0_base_hi = 0,
-        .reg1_base_lo = RBI_CXL_DEVICE_REG | CXL_DEVICE_REG_BAR_IDX,
+        .reg1_base_lo = RBI_EMPTY,  /* No device registers - Type 2 uses cache memory at BAR2 */
         .reg1_base_hi = 0,
     };
 
@@ -1190,7 +1983,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                       CXL2_COMPONENT_BLOCK_SIZE);
 
     memory_region_init_io(&ct2d->component_registers, OBJECT(ct2d),
-                         &cxl_type2_cache_ops, cxl_cstate,
+                         &cxl_type2_component_reg_ops, cxl_cstate,
                          "cxl-type2-component",
                          CXL2_COMPONENT_CM_REGION_SIZE);
     memory_region_add_subregion(&ct2d->bar0, 0, &ct2d->component_registers);
@@ -1239,6 +2032,13 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                     PCI_BASE_ADDRESS_MEM_TYPE_64 |
                     PCI_BASE_ADDRESS_MEM_PREFETCH,
                     &ct2d->device_mem);
+
+    /* Initialize GPU command state (handled directly in cache_read/write) */
+    memset(&ct2d->gpu_cmd, 0, sizeof(ct2d->gpu_cmd));
+    ct2d->gpu_cmd.status = CXL_GPU_STATUS_READY;
+    ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_IDLE;
+
+    qemu_log("CXL Type2: GPU command interface enabled at BAR2 offset 0\n");
 
     /* Initialize MSI-X */
     if (msix_init_exclusive_bar(pci_dev, 16, 6, NULL)) {
@@ -1296,6 +2096,13 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_STRING("gpu-device", CXLType2State, gpu_info.vfio_device),
     DEFINE_PROP_BOOL("coherency-enabled", CXLType2State,
                      coherency.coherency_enabled, true),
+    /* hetGPU backend configuration */
+    DEFINE_PROP_UINT32("gpu-mode", CXLType2State, gpu_info.mode,
+                       CXL_TYPE2_GPU_MODE_AUTO),
+    DEFINE_PROP_STRING("hetgpu-lib", CXLType2State, gpu_info.hetgpu_lib_path),
+    DEFINE_PROP_INT32("hetgpu-device", CXLType2State, gpu_info.hetgpu_device_index, 0),
+    DEFINE_PROP_UINT32("hetgpu-backend", CXLType2State, gpu_info.hetgpu_backend,
+                       HETGPU_BACKEND_AUTO),
 };
 
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)
