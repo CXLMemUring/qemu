@@ -36,6 +36,10 @@ static const HetGPUDeviceProps default_props = {
 /* Function pointer types for dynamic loading */
 typedef int (*cuInit_fn)(unsigned int);
 typedef int (*cuDeviceGetCount_fn)(int *);
+typedef int (*cuDeviceGet_fn)(int *, int);
+typedef int (*cuDeviceGetName_fn)(char *, int, int);
+typedef int (*cuDeviceTotalMem_fn)(size_t *, int);
+typedef int (*cuDeviceGetAttribute_fn)(int *, int, int);
 typedef int (*cuCtxCreate_fn)(void **, unsigned int, int);
 typedef int (*cuCtxDestroy_fn)(void *);
 typedef int (*cuCtxSynchronize_fn)(void);
@@ -49,10 +53,25 @@ typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned in
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
 
+/* CUDA device attribute constants */
+#define CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK 1
+#define CU_DEVICE_ATTRIBUTE_WARP_SIZE 10
+#define CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT 16
+#define CU_DEVICE_ATTRIBUTE_CLOCK_RATE 13
+#define CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE 36
+#define CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH 37
+#define CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE 38
+#define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
+#define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
+
 /* Loaded function pointers */
 static struct {
     cuInit_fn cuInit;
     cuDeviceGetCount_fn cuDeviceGetCount;
+    cuDeviceGet_fn cuDeviceGet;
+    cuDeviceGetName_fn cuDeviceGetName;
+    cuDeviceTotalMem_fn cuDeviceTotalMem;
+    cuDeviceGetAttribute_fn cuDeviceGetAttribute;
     cuCtxCreate_fn cuCtxCreate;
     cuCtxDestroy_fn cuCtxDestroy;
     cuCtxSynchronize_fn cuCtxSynchronize;
@@ -78,13 +97,18 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
 
     /* Try to load hetGPU library */
     if (hetgpu_lib_path && hetgpu_lib_path[0] != '\0') {
-        state->hetgpu_lib = dlopen(hetgpu_lib_path, RTLD_NOW | RTLD_LOCAL);
+        qemu_log("CXL hetGPU: Attempting to load CUDA library from %s\n", hetgpu_lib_path);
+        state->hetgpu_lib = dlopen(hetgpu_lib_path, RTLD_NOW | RTLD_GLOBAL);
         if (state->hetgpu_lib) {
-            qemu_log("CXL hetGPU: Loaded library from %s\n", hetgpu_lib_path);
+            qemu_log("CXL hetGPU: Successfully loaded library from %s\n", hetgpu_lib_path);
 
             /* Load function pointers */
             g_cuda_funcs.cuInit = dlsym(state->hetgpu_lib, "cuInit");
             g_cuda_funcs.cuDeviceGetCount = dlsym(state->hetgpu_lib, "cuDeviceGetCount");
+            g_cuda_funcs.cuDeviceGet = dlsym(state->hetgpu_lib, "cuDeviceGet");
+            g_cuda_funcs.cuDeviceGetName = dlsym(state->hetgpu_lib, "cuDeviceGetName");
+            g_cuda_funcs.cuDeviceTotalMem = dlsym(state->hetgpu_lib, "cuDeviceTotalMem_v2");
+            g_cuda_funcs.cuDeviceGetAttribute = dlsym(state->hetgpu_lib, "cuDeviceGetAttribute");
             g_cuda_funcs.cuCtxCreate = dlsym(state->hetgpu_lib, "cuCtxCreate_v2");
             g_cuda_funcs.cuCtxDestroy = dlsym(state->hetgpu_lib, "cuCtxDestroy_v2");
             g_cuda_funcs.cuCtxSynchronize = dlsym(state->hetgpu_lib, "cuCtxSynchronize");
@@ -99,10 +123,94 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
             if (g_cuda_funcs.cuInit) {
                 int err = g_cuda_funcs.cuInit(0);
                 if (err == 0) {
+                    int cuda_dev = 0;
+                    size_t total_mem = 0;
+                    int attr_val = 0;
+                    void *ctx = NULL;
+
+                    qemu_log("CXL hetGPU: cuInit succeeded\n");
+
+                    /* Get device handle */
+                    if (g_cuda_funcs.cuDeviceGet) {
+                        err = g_cuda_funcs.cuDeviceGet(&cuda_dev, device_index);
+                        if (err != 0) {
+                            qemu_log("CXL hetGPU: cuDeviceGet failed: %d\n", err);
+                            goto simulation_fallback;
+                        }
+                        qemu_log("CXL hetGPU: Got CUDA device %d\n", cuda_dev);
+                    }
+
+                    /* Create context immediately to verify GPU access */
+                    if (g_cuda_funcs.cuCtxCreate) {
+                        qemu_log("CXL hetGPU: Calling cuCtxCreate_v2 for device %d\n", cuda_dev);
+                        err = g_cuda_funcs.cuCtxCreate(&ctx, 0, cuda_dev);
+                        qemu_log("CXL hetGPU: cuCtxCreate_v2 returned %d, ctx=%p\n", err, ctx);
+                        if (err != 0) {
+                            qemu_log("CXL hetGPU: cuCtxCreate failed with CUDA error %d\n", err);
+                            /* Don't fall back - report the actual error */
+                        } else if (ctx == NULL) {
+                            qemu_log("CXL hetGPU: cuCtxCreate succeeded but returned NULL context\n");
+                        } else {
+                            qemu_log("CXL hetGPU: Successfully created CUDA context %p\n", ctx);
+                        }
+                    } else {
+                        qemu_log("CXL hetGPU: cuCtxCreate_v2 symbol not found in library\n");
+                    }
+
                     state->initialized = true;
-                    state->backend = backend != HETGPU_BACKEND_AUTO ? backend : HETGPU_BACKEND_SIMULATION;
-                    state->props = default_props;
-                    qemu_log("CXL hetGPU: Backend initialized successfully\n");
+                    state->backend = HETGPU_BACKEND_NVIDIA;
+                    state->cuda_device = cuda_dev;
+                    state->context = ctx;
+
+                    /* Query real GPU properties */
+                    state->props = default_props;  /* Start with defaults */
+
+                    if (g_cuda_funcs.cuDeviceGetName) {
+                        err = g_cuda_funcs.cuDeviceGetName(state->props.name,
+                                                     sizeof(state->props.name), cuda_dev);
+                        if (err != 0) {
+                            qemu_log("CXL hetGPU: cuDeviceGetName failed: %d\n", err);
+                        }
+                    }
+
+                    if (g_cuda_funcs.cuDeviceTotalMem) {
+                        if (g_cuda_funcs.cuDeviceTotalMem(&total_mem, cuda_dev) == 0) {
+                            state->props.total_memory = total_mem;
+                            qemu_log("CXL hetGPU: Real GPU total memory: %lu MB\n",
+                                     (unsigned long)(total_mem / (1024*1024)));
+                        }
+                    }
+
+                    if (g_cuda_funcs.cuDeviceGetAttribute) {
+                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuda_dev) == 0) {
+                            state->props.compute_capability_major = attr_val;
+                        }
+                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuda_dev) == 0) {
+                            state->props.compute_capability_minor = attr_val;
+                        }
+                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                                CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_dev) == 0) {
+                            state->props.multiprocessor_count = attr_val;
+                        }
+                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                                CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuda_dev) == 0) {
+                            state->props.max_threads_per_block = attr_val;
+                        }
+                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                                CU_DEVICE_ATTRIBUTE_WARP_SIZE, cuda_dev) == 0) {
+                            state->props.warp_size = attr_val;
+                        }
+                    }
+
+                    state->props.backend_type = HETGPU_BACKEND_NVIDIA;
+
+                    qemu_log("CXL hetGPU: Real GPU initialized: %s, %lu MB, CC %d.%d\n",
+                             state->props.name,
+                             (unsigned long)(state->props.total_memory / (1024*1024)),
+                             state->props.compute_capability_major,
+                             state->props.compute_capability_minor);
                     return HETGPU_SUCCESS;
                 }
                 qemu_log("CXL hetGPU: cuInit failed with error %d\n", err);
@@ -112,12 +220,14 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
         }
     }
 
+simulation_fallback:
     /* Fall back to simulation mode */
     qemu_log("CXL hetGPU: Using simulation mode\n");
     state->initialized = true;
     state->backend = HETGPU_BACKEND_SIMULATION;
     state->props = default_props;
-    state->context = (void *)1;  /* Dummy context for simulation */
+    state->context = (void *)0xDEADBEEF;  /* Dummy context for simulation */
+    state->cuda_device = 0;
 
     return HETGPU_SUCCESS;
 }
@@ -173,16 +283,23 @@ HetGPUError hetgpu_create_context(HetGPUState *state)
         return HETGPU_ERROR_NOT_INITIALIZED;
     }
 
+    /* Context was already created during initialization */
+    if (state->context != NULL) {
+        qemu_log("CXL hetGPU: Using existing context %p\n", state->context);
+        return HETGPU_SUCCESS;
+    }
+
     if (state->backend == HETGPU_BACKEND_SIMULATION) {
-        state->context = (void *)1;  /* Dummy context */
+        state->context = (void *)0xDEADBEEF;  /* Dummy context */
         return HETGPU_SUCCESS;
     }
 
     if (g_cuda_funcs.cuCtxCreate) {
         void *ctx = NULL;
-        int err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->device_index);
-        if (err == 0) {
+        int err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+        if (err == 0 && ctx != NULL) {
             state->context = ctx;
+            qemu_log("CXL hetGPU: Created new CUDA context %p\n", ctx);
             return HETGPU_SUCCESS;
         }
         qemu_log("CXL hetGPU: cuCtxCreate failed with error %d\n", err);

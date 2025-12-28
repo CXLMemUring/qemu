@@ -587,16 +587,17 @@ int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp)
     HetGPUError err;
     const char *lib_path;
 
-    /* Determine library path */
+    /* Determine library path - try multiple locations */
     lib_path = ct2d->gpu_info.hetgpu_lib_path;
-    if (!lib_path) {
+    if (!lib_path || lib_path[0] == '\0') {
         lib_path = getenv("HETGPU_LIB_PATH");
     }
-    if (!lib_path) {
-        lib_path = "/home/victoryang00/hetGPU/target/release/libnvcuda.so";
+    if (!lib_path || lib_path[0] == '\0') {
+        /* Try system CUDA library first for real GPU passthrough */
+        lib_path = "/usr/lib/x86_64-linux-gnu/libcuda.so";
     }
 
-    qemu_log("CXL Type2: Initializing hetGPU backend from %s\n", lib_path);
+    qemu_log("CXL Type2: Initializing GPU backend from %s\n", lib_path);
 
     /* Initialize hetGPU */
     err = hetgpu_init(hetgpu,
@@ -821,11 +822,9 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp)
     if (ct2d->gpu_info.mode == CXL_TYPE2_GPU_MODE_AUTO) {
         if (ct2d->gpu_info.vfio_device && ct2d->gpu_info.vfio_device[0]) {
             ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_VFIO;
-        } else if (ct2d->gpu_info.hetgpu_lib_path ||
-                   getenv("HETGPU_LIB_PATH")) {
-            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_HETGPU;
         } else {
-            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_NONE;
+            /* Default to hetGPU mode - will use system libcuda.so for real GPU */
+            ct2d->gpu_info.mode = CXL_TYPE2_GPU_MODE_HETGPU;
         }
     }
 
