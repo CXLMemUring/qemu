@@ -116,6 +116,14 @@ typedef void (*HetGPUCoherencyCallback)(
     bool invalidate
 );
 
+/* Simulation memory allocation tracking */
+typedef struct HetGPUSimAlloc {
+    HetGPUDevicePtr dev_ptr;
+    void *host_buffer;
+    size_t size;
+    struct HetGPUSimAlloc *next;
+} HetGPUSimAlloc;
+
 /* hetGPU State for CXL Type 2 integration */
 typedef struct HetGPUState {
     bool initialized;
@@ -132,6 +140,10 @@ typedef struct HetGPUState {
     /* Memory management */
     uint64_t allocated_memory;
     uint64_t max_memory;
+
+    /* Simulation memory tracking */
+    HetGPUSimAlloc *sim_allocs;
+    uint64_t sim_next_ptr;
 
     /* Loaded modules */
     HetGPUModule *modules;
