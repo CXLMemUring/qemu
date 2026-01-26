@@ -1208,19 +1208,120 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 #define CXL_MEMSIM_DEFAULT_HOST "127.0.0.1"
 #define CXL_MEMSIM_DEFAULT_PORT 9999
 
+/* Operation type constants - matching server */
+#define CXL_OP_READ         0
+#define CXL_OP_WRITE        1
+#define CXL_OP_GET_SHM_INFO 2
+#define CXL_OP_ATOMIC_FAA   3   /* Fetch-and-Add */
+#define CXL_OP_ATOMIC_CAS   4   /* Compare-and-Swap */
+#define CXL_OP_FENCE        5   /* Memory fence */
+
+/* Request structure - matching server's ServerRequest */
 typedef struct {
-    uint8_t op_type;
+    uint8_t op_type;       /* 0=READ, 1=WRITE, 2=GET_SHM_INFO, 3=FAA, 4=CAS, 5=FENCE */
     uint64_t addr;
     uint64_t size;
     uint64_t timestamp;
+    uint64_t value;        /* Value for FAA (add value) or CAS (desired value) */
+    uint64_t expected;     /* Expected value for CAS operation */
     uint8_t data[64];
 } CXLMemSimRequest;
 
+/* Response structure - matching server's ServerResponse */
 typedef struct {
     uint8_t status;
     uint64_t latency_ns;
+    uint64_t old_value;    /* Previous value returned by atomic operations */
     uint8_t data[64];
 } CXLMemSimResponse;
+
+/* ============================================================================
+ * PGAS Shared Memory Protocol (matches cxl_backend.h exactly)
+ * ============================================================================ */
+#define CXL_SHM_DEFAULT_NAME "/cxlmemsim_pgas"
+#define CXL_SHM_MAGIC        0x43584C53484D454DULL  /* "CXLSHMEM" */
+#define CXL_SHM_VERSION      1
+#define CXL_SHM_MAX_SLOTS    64
+#define CXL_SHM_CACHELINE_SIZE 64
+
+/* Request types */
+#define CXL_SHM_REQ_NONE          0
+#define CXL_SHM_REQ_READ          1
+#define CXL_SHM_REQ_WRITE         2
+#define CXL_SHM_REQ_ATOMIC_FAA    3
+#define CXL_SHM_REQ_ATOMIC_CAS    4
+#define CXL_SHM_REQ_FENCE         5
+#define CXL_SHM_REQ_READ_META     6   /* Read with metadata */
+#define CXL_SHM_REQ_WRITE_META    7   /* Write with metadata */
+#define CXL_SHM_REQ_GET_META      8   /* Get metadata only */
+#define CXL_SHM_REQ_SET_META      9   /* Set metadata only */
+
+/* Response status */
+#define CXL_SHM_RESP_NONE     0
+#define CXL_SHM_RESP_OK       1
+#define CXL_SHM_RESP_ERROR    2
+
+/* MESI Cache States */
+#define CXL_CACHE_INVALID     0
+#define CXL_CACHE_SHARED      1
+#define CXL_CACHE_EXCLUSIVE   2
+#define CXL_CACHE_MODIFIED    3
+
+/* Metadata flags */
+#define CXL_META_FLAG_DIRTY   0x01
+#define CXL_META_FLAG_LOCKED  0x02
+#define CXL_META_FLAG_PINNED  0x04
+
+/* Header flags */
+#define CXL_SHM_FLAG_METADATA_ENABLED  0x01
+
+/* Cacheline metadata structure (64 bytes) - compatible with cxl_backend.h */
+typedef struct __attribute__((packed)) {
+    uint8_t cache_state;        /* MESI state */
+    uint8_t owner_id;           /* Current owner host/thread ID */
+    uint16_t sharers_bitmap;    /* Bitmap of hosts/threads sharing this line */
+    uint32_t access_count;      /* Number of accesses */
+    uint64_t last_access_time;  /* Timestamp of last access */
+    uint64_t virtual_addr;      /* Virtual address mapping */
+    uint64_t physical_addr;     /* Physical address */
+    uint32_t version;           /* Version number for coherency */
+    uint8_t flags;              /* Various flags (dirty, locked, etc.) */
+    uint8_t reserved[23];       /* Reserved for future use */
+} CXLCachelineMetadata;
+
+/* Shared memory slot for request/response (256-byte aligned, matches cxl_shm_slot_t) */
+typedef struct __attribute__((aligned(256))) {
+    volatile uint32_t req_type;      /* Request type */
+    volatile uint32_t resp_status;   /* Response status */
+    volatile uint64_t addr;          /* Address for operation */
+    volatile uint64_t size;          /* Size of operation */
+    volatile uint64_t value;         /* Value for atomics */
+    volatile uint64_t expected;      /* Expected value for CAS */
+    volatile uint64_t latency_ns;    /* Simulated latency */
+    volatile uint64_t timestamp;     /* Request timestamp */
+    uint8_t data[CXL_SHM_CACHELINE_SIZE];  /* Data buffer (64 bytes) */
+    CXLCachelineMetadata metadata;         /* Metadata buffer (64 bytes) */
+} CXLShmSlot;
+
+/* Shared memory header (matches cxl_shm_header_t) */
+typedef struct __attribute__((aligned(64))) {
+    uint64_t magic;                  /* Magic number for validation */
+    uint32_t version;                /* Protocol version */
+    uint32_t num_slots;              /* Number of request slots */
+    volatile uint32_t server_ready;  /* Server is ready flag */
+    uint32_t flags;                  /* Header flags */
+    uint64_t memory_base;            /* Base address of simulated memory */
+    uint64_t memory_size;            /* Size of simulated memory */
+    uint64_t num_cachelines;         /* Number of cachelines (memory_size/64) */
+    uint32_t metadata_enabled;       /* 1 if metadata transfer is enabled */
+    uint32_t entry_size;             /* Size of each entry (64 or 128 bytes) */
+    uint8_t padding[64 - 56];        /* Pad header to 64 bytes */
+    CXLShmSlot slots[];              /* Request/response slots */
+} CXLShmHeader;
+
+/* Size calculation macro */
+#define CXL_SHM_HEADER_SIZE(nslots) \
+    (sizeof(CXLShmHeader) + (nslots) * sizeof(CXLShmSlot))
 
 /* Transport mode enum */
 enum CXLTransportMode {
@@ -1243,12 +1344,24 @@ static struct {
     pthread_mutex_t lock;
     uint64_t stats_reads;
     uint64_t stats_writes;
+    uint64_t stats_atomics;
+    uint64_t stats_fences;
+    /* PGAS shared memory fields */
+    char shm_name[256];
+    int shm_fd;
+    CXLShmHeader *shm_header;
+    void *shm_memory;
+    size_t shm_memory_size;
+    int shm_slot_id;
 } g_memsim = {
     .enabled = false,
     .initialized = false,
     .transport_mode = CXL_TRANSPORT_TCP,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .socket_fd = -1,
+    .shm_fd = -1,
+    .shm_header = NULL,
+    .shm_slot_id = 0,
 };
 
 static void cxl_memsim_init(void) {
@@ -1308,11 +1421,18 @@ static void cxl_memsim_init(void) {
             g_memsim.enabled = true;
             g_memsim.initialized = true;
             info_report("CXL Type3: CXLMemSim RDMA mode - %s:%d", g_memsim.host, g_memsim.port);
-        } else if (strcmp(transport, "shm") == 0) {
+        } else if (strcmp(transport, "shm") == 0 || strcmp(transport, "pgas") == 0) {
             g_memsim.transport_mode = CXL_TRANSPORT_SHM;
-            g_memsim.enabled = false;
+            /* Get shared memory name from environment */
+            const char *shm_name = getenv("CXL_PGAS_SHM");
+            if (shm_name && shm_name[0]) {
+                g_strlcpy(g_memsim.shm_name, shm_name, sizeof(g_memsim.shm_name));
+            } else {
+                g_strlcpy(g_memsim.shm_name, CXL_SHM_DEFAULT_NAME, sizeof(g_memsim.shm_name));
+            }
+            g_memsim.enabled = true;  /* Enable for SHM mode */
             g_memsim.initialized = true;
-            info_report("CXL Type3: CXLMemSim SHM mode (no network connection)");
+            info_report("CXL Type3: CXLMemSim SHM mode - %s", g_memsim.shm_name);
         } else {
             /* TCP mode */
             g_strlcpy(g_memsim.host, host, sizeof(g_memsim.host));
@@ -1341,8 +1461,81 @@ static int cxl_memsim_connect_locked(void) {
     }
 
     if (g_memsim.transport_mode == CXL_TRANSPORT_SHM) {
-        /* No socket connection required for SHM mode */
+        /* Connect to shared memory */
+        g_memsim.shm_fd = shm_open(g_memsim.shm_name, O_RDWR, 0666);
+        if (g_memsim.shm_fd < 0) {
+            error_report("CXL Type3: Failed to open shared memory %s: %s",
+                        g_memsim.shm_name, strerror(errno));
+            return -1;
+        }
+
+        /* Get size from stat */
+        struct stat sb;
+        if (fstat(g_memsim.shm_fd, &sb) < 0) {
+            error_report("CXL Type3: fstat failed on shm: %s", strerror(errno));
+            close(g_memsim.shm_fd);
+            g_memsim.shm_fd = -1;
+            return -1;
+        }
+
+        size_t shm_size = sb.st_size;
+
+        /* Map shared memory */
+        void *mapped = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           g_memsim.shm_fd, 0);
+        if (mapped == MAP_FAILED) {
+            error_report("CXL Type3: mmap failed on shm: %s", strerror(errno));
+            close(g_memsim.shm_fd);
+            g_memsim.shm_fd = -1;
+            return -1;
+        }
+
+        g_memsim.shm_header = (CXLShmHeader *)mapped;
+
+        /* Validate magic number */
+        if (g_memsim.shm_header->magic != CXL_SHM_MAGIC) {
+            error_report("CXL Type3: SHM invalid magic (got 0x%lx, expected 0x%lx)",
+                        (unsigned long)g_memsim.shm_header->magic,
+                        (unsigned long)CXL_SHM_MAGIC);
+            munmap(mapped, shm_size);
+            close(g_memsim.shm_fd);
+            g_memsim.shm_fd = -1;
+            g_memsim.shm_header = NULL;
+            return -1;
+        }
+
+        /* Wait for server ready */
+        int retries = 100;
+        while (!__atomic_load_n(&g_memsim.shm_header->server_ready, __ATOMIC_ACQUIRE) && retries > 0) {
+            usleep(10000);  /* 10ms */
+            retries--;
+        }
+
+        if (retries == 0) {
+            error_report("CXL Type3: SHM server not ready after timeout");
+            munmap(mapped, shm_size);
+            close(g_memsim.shm_fd);
+            g_memsim.shm_fd = -1;
+            g_memsim.shm_header = NULL;
+            return -1;
+        }
+
+        /* Calculate memory area pointer (after header + slots) */
+        size_t header_size = CXL_SHM_HEADER_SIZE(g_memsim.shm_header->num_slots);
+        g_memsim.shm_memory = (uint8_t *)mapped + header_size;
+        g_memsim.shm_memory_size = g_memsim.shm_header->memory_size;
+
+        /* Assign slot based on process/thread ID */
+        g_memsim.shm_slot_id = getpid() % g_memsim.shm_header->num_slots;
+
         g_memsim.connected = true;
+        info_report("CXL Type3: SHM connected to %s (mem_size=%lu, slot=%d, "
+                   "num_cachelines=%lu, metadata=%s)",
+                   g_memsim.shm_name,
+                   (unsigned long)g_memsim.shm_memory_size,
+                   g_memsim.shm_slot_id,
+                   (unsigned long)g_memsim.shm_header->num_cachelines,
+                   g_memsim.shm_header->metadata_enabled ? "enabled" : "disabled");
         return 0;
     }
 
@@ -1396,63 +1589,167 @@ static int cxl_memsim_connect_locked(void) {
     return 0;
 }
 
-static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
-                              void *data, CXLMemSimResponse *resp) {
+/* SHM request function - assumes lock is held */
+static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
+                                  void *data, uint64_t value, uint64_t expected,
+                                  CXLMemSimResponse *resp) {
+    if (!g_memsim.shm_header || !g_memsim.connected) {
+        return -1;
+    }
+
+    CXLShmSlot *slot = &g_memsim.shm_header->slots[g_memsim.shm_slot_id];
+
+    /* Wait for slot to be free */
+    int retries = 1000;
+    while (__atomic_load_n(&slot->req_type, __ATOMIC_ACQUIRE) != CXL_SHM_REQ_NONE && retries > 0) {
+        usleep(100);
+        retries--;
+    }
+
+    if (retries == 0) {
+        error_report("CXL Type3: SHM slot busy timeout");
+        return -1;
+    }
+
+    /* Fill request */
+    slot->addr = addr;
+    slot->size = size;
+    slot->timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    slot->value = value;
+    slot->expected = expected;
+
+    if (op == CXL_OP_WRITE && data) {
+        memcpy((void *)slot->data, data, MIN(size, CXL_SHM_CACHELINE_SIZE));
+    }
+
+    /* Memory barrier before setting request type */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    /* Set request type (triggers server processing) */
+    uint32_t shm_req_type;
+    switch (op) {
+        case CXL_OP_READ:       shm_req_type = CXL_SHM_REQ_READ; break;
+        case CXL_OP_WRITE:      shm_req_type = CXL_SHM_REQ_WRITE; break;
+        case CXL_OP_ATOMIC_FAA: shm_req_type = CXL_SHM_REQ_ATOMIC_FAA; break;
+        case CXL_OP_ATOMIC_CAS: shm_req_type = CXL_SHM_REQ_ATOMIC_CAS; break;
+        case CXL_OP_FENCE:      shm_req_type = CXL_SHM_REQ_FENCE; break;
+        default:                shm_req_type = CXL_SHM_REQ_NONE; break;
+    }
+    __atomic_store_n(&slot->req_type, shm_req_type, __ATOMIC_RELEASE);
+
+    /* Wait for response */
+    retries = 10000;
+    while (__atomic_load_n(&slot->resp_status, __ATOMIC_ACQUIRE) == CXL_SHM_RESP_NONE && retries > 0) {
+        usleep(10);
+        retries--;
+    }
+
+    if (retries == 0) {
+        error_report("CXL Type3: SHM response timeout");
+        return -1;
+    }
+
+    /* Memory barrier before reading response */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+
+    /* Read response */
+    resp->status = (slot->resp_status == CXL_SHM_RESP_OK) ? 0 : 1;
+    resp->latency_ns = slot->latency_ns;
+
+    if (op == CXL_OP_READ) {
+        memcpy(resp->data, (void *)slot->data, MIN(size, CXL_SHM_CACHELINE_SIZE));
+    } else if (op == CXL_OP_ATOMIC_FAA || op == CXL_OP_ATOMIC_CAS) {
+        /* For atomic ops, old_value is stored in slot->value after server processes */
+        resp->old_value = slot->value;
+    }
+
+    /* Clear response status for next request */
+    __atomic_store_n(&slot->resp_status, CXL_SHM_RESP_NONE, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->req_type, CXL_SHM_REQ_NONE, __ATOMIC_RELEASE);
+
+    return 0;
+}
+
+/* Extended request function with atomic operation support */
+static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
+                                  void *data, uint64_t value, uint64_t expected,
+                                  CXLMemSimResponse *resp) {
     static int request_count = 0;
     request_count++;
-    
-    CXLMemSimRequest req = {
-        .op_type = op,
-        .addr = addr,
-        .size = size,
-        .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)
-    };
-    
+
     pthread_mutex_lock(&g_memsim.lock);
-    
+
     /* Debug logging */
-    if (request_count <= 10) {  /* Only log first 10 requests to avoid spam */
-        info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)", 
-                    request_count, op == 0 ? "READ" : "WRITE", g_memsim.connected,
+    if (request_count <= 10) {
+        const char *op_name;
+        switch (op) {
+            case CXL_OP_READ:       op_name = "READ"; break;
+            case CXL_OP_WRITE:      op_name = "WRITE"; break;
+            case CXL_OP_ATOMIC_FAA: op_name = "FAA"; break;
+            case CXL_OP_ATOMIC_CAS: op_name = "CAS"; break;
+            case CXL_OP_FENCE:      op_name = "FENCE"; break;
+            default:                op_name = "UNKNOWN"; break;
+        }
+        info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)",
+                    request_count, op_name, g_memsim.connected,
+                    g_memsim.transport_mode == CXL_TRANSPORT_SHM ? "PGAS" :
                     g_memsim.transport_mode == CXL_TRANSPORT_RDMA ? "RDMA" : "TCP");
     }
-    
-    /* Use RDMA if in RDMA mode */
-    if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
-        /* Ensure we're connected */
-        if (!g_memsim.connected) {
-            if (cxl_memsim_connect_locked() < 0) {
-                pthread_mutex_unlock(&g_memsim.lock);
-                return -1;
-            }
+
+    /* Ensure connected */
+    if (!g_memsim.connected) {
+        if (cxl_memsim_connect_locked() < 0) {
+            pthread_mutex_unlock(&g_memsim.lock);
+            return -1;
         }
-        
-        int ret = cxl_memsim_rdma_request(op, addr, size, data, resp);
-        if (ret < 0) {
-            /* Connection failed, mark as disconnected for retry */
-            g_memsim.connected = false;
-        } else {
-            /* Update stats on success */
-            if (op == 0) {
-                g_memsim.stats_reads++;
-            } else {
-                g_memsim.stats_writes++;
+    }
+
+    int ret = -1;
+
+    /* SHM mode */
+    if (g_memsim.transport_mode == CXL_TRANSPORT_SHM) {
+        ret = cxl_memsim_shm_request(op, addr, size, data, value, expected, resp);
+        if (ret == 0) {
+            switch (op) {
+                case CXL_OP_READ:       g_memsim.stats_reads++; break;
+                case CXL_OP_WRITE:      g_memsim.stats_writes++; break;
+                case CXL_OP_ATOMIC_FAA:
+                case CXL_OP_ATOMIC_CAS: g_memsim.stats_atomics++; break;
+                case CXL_OP_FENCE:      g_memsim.stats_fences++; break;
             }
         }
         pthread_mutex_unlock(&g_memsim.lock);
         return ret;
     }
-    
-    /* TCP path */
-    if (!g_memsim.connected && cxl_memsim_connect_locked() < 0) {
+
+    /* RDMA mode */
+    if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+        ret = cxl_memsim_rdma_request(op, addr, size, data, resp);
+        if (ret < 0) {
+            g_memsim.connected = false;
+        } else {
+            if (op == CXL_OP_READ) g_memsim.stats_reads++;
+            else if (op == CXL_OP_WRITE) g_memsim.stats_writes++;
+            else g_memsim.stats_atomics++;
+        }
         pthread_mutex_unlock(&g_memsim.lock);
-        return -1;
+        return ret;
     }
-    
-    if (op == 1 && data) {
+
+    /* TCP mode */
+    CXLMemSimRequest req = {
+        .op_type = op,
+        .addr = addr,
+        .size = size,
+        .timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
+        .value = value,
+        .expected = expected
+    };
+
+    if (op == CXL_OP_WRITE && data) {
         memcpy(req.data, data, MIN(size, 64));
     }
-    
+
     if (send(g_memsim.socket_fd, &req, sizeof(req), MSG_NOSIGNAL) != sizeof(req)) {
         error_report("CXL Type3: Failed to send request to CXLMemSim");
         g_memsim.connected = false;
@@ -1461,7 +1758,7 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
     }
-    
+
     if (recv(g_memsim.socket_fd, resp, sizeof(*resp), MSG_WAITALL) != sizeof(*resp)) {
         error_report("CXL Type3: Failed to receive response from CXLMemSim");
         g_memsim.connected = false;
@@ -1470,12 +1767,56 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
         pthread_mutex_unlock(&g_memsim.lock);
         return -1;
     }
-    
-    if (op == 0) g_memsim.stats_reads++;
-    else g_memsim.stats_writes++;
-    
+
+    switch (op) {
+        case CXL_OP_READ:       g_memsim.stats_reads++; break;
+        case CXL_OP_WRITE:      g_memsim.stats_writes++; break;
+        case CXL_OP_ATOMIC_FAA:
+        case CXL_OP_ATOMIC_CAS: g_memsim.stats_atomics++; break;
+        case CXL_OP_FENCE:      g_memsim.stats_fences++; break;
+    }
+
     pthread_mutex_unlock(&g_memsim.lock);
     return 0;
+}
+
+/* Simple request wrapper for backward compatibility */
+static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
+                              void *data, CXLMemSimResponse *resp) {
+    return cxl_memsim_request_ext(op, addr, size, data, 0, 0, resp);
+}
+
+/* Atomic Fetch-and-Add operation */
+static int __attribute__((unused))
+cxl_memsim_atomic_faa(uint64_t addr, uint64_t add_value, uint64_t *old_value) {
+    CXLMemSimResponse resp = {0};
+    int ret = cxl_memsim_request_ext(CXL_OP_ATOMIC_FAA, addr, sizeof(uint64_t),
+                                     NULL, add_value, 0, &resp);
+    if (ret == 0 && old_value) {
+        *old_value = resp.old_value;
+    }
+    return ret;
+}
+
+/* Atomic Compare-and-Swap operation */
+static int __attribute__((unused))
+cxl_memsim_atomic_cas(uint64_t addr, uint64_t expected, uint64_t desired,
+                      uint64_t *old_value) {
+    CXLMemSimResponse resp = {0};
+    int ret = cxl_memsim_request_ext(CXL_OP_ATOMIC_CAS, addr, sizeof(uint64_t),
+                                     NULL, desired, expected, &resp);
+    if (ret == 0 && old_value) {
+        *old_value = resp.old_value;
+    }
+    /* Return 0 if CAS succeeded (old_value == expected) */
+    return (ret == 0 && resp.old_value == expected) ? 0 : 1;
+}
+
+/* Memory fence operation */
+static void __attribute__((unused))
+cxl_memsim_fence(void) {
+    CXLMemSimResponse resp = {0};
+    cxl_memsim_request_ext(CXL_OP_FENCE, 0, 0, NULL, 0, 0, &resp);
 }
 
 MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,

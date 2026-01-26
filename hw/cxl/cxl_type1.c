@@ -175,18 +175,34 @@ static void cxlmemsim_connect(CXLType1StateImpl *ct1d)
 {
     Error *err = NULL;
     SocketAddress addr;
-    
+
     if (ct1d->cxlmemsim.connected) {
         return;
     }
-    
+
+    /* Check if SHM transport mode is configured - skip TCP connection */
+    const char *transport = getenv("CXL_TRANSPORT_MODE");
+    if (!transport || !transport[0]) {
+        transport = getenv("CXL_MEMSIM_TRANSPORT");
+    }
+
+    qemu_log("CXL Type1: Transport mode = %s\n", transport ? transport : "(not set)");
+
+    if (transport && (strcmp(transport, "shm") == 0 || strcmp(transport, "pgas") == 0)) {
+        /* SHM mode - Type3 device handles connection, Type1 doesn't need TCP */
+        qemu_log("CXL Type1: Using SHM transport mode - skipping TCP connection\n");
+        return;
+    }
+
+    qemu_log("CXL Type1: Using TCP transport mode\n");
+
     addr.type = SOCKET_ADDRESS_TYPE_INET;
     addr.u.inet.host = ct1d->cxlmemsim.server_addr;
     addr.u.inet.port = g_strdup_printf("%u", ct1d->cxlmemsim.server_port);
-    
+
     ct1d->cxlmemsim.socket = qio_channel_socket_new();
     if (qio_channel_socket_connect_sync(ct1d->cxlmemsim.socket, &addr, &err) < 0) {
-        qemu_log("Warning: Failed to connect to CXLMemSim server at %s:%s: %s\n", 
+        qemu_log("Warning: Failed to connect to CXLMemSim server at %s:%s: %s\n",
                 addr.u.inet.host, addr.u.inet.port, error_get_pretty(err));
         error_free(err);
         g_free(addr.u.inet.port);
@@ -194,10 +210,10 @@ static void cxlmemsim_connect(CXLType1StateImpl *ct1d)
         ct1d->cxlmemsim.socket = NULL;
         return;
     }
-    
+
     ct1d->cxlmemsim.connected = true;
     g_free(addr.u.inet.port);
-    qemu_log("Connected to CXLMemSim server at %s:%u\n", 
+    qemu_log("Connected to CXLMemSim server at %s:%u\n",
             ct1d->cxlmemsim.server_addr, ct1d->cxlmemsim.server_port);
 }
 

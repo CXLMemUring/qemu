@@ -96,29 +96,40 @@ static void virtio_cxl_accel_connect(VirtIOCXLAccel *vcxl)
 {
     Error *err = NULL;
     SocketAddress addr;
-    
+
     if (vcxl->connected) {
         return;
     }
-    
+
+    /* Check if SHM transport mode is configured - skip TCP connection */
+    const char *transport = getenv("CXL_TRANSPORT_MODE");
+    if (!transport || !transport[0]) {
+        transport = getenv("CXL_MEMSIM_TRANSPORT");
+    }
+    if (transport && (strcmp(transport, "shm") == 0 || strcmp(transport, "pgas") == 0)) {
+        /* SHM mode - Type3 device handles connection */
+        qemu_log("VirtIO CXL Accel: Using SHM transport mode - skipping TCP connection\n");
+        return;
+    }
+
     addr.type = SOCKET_ADDRESS_TYPE_INET;
     addr.u.inet.host = vcxl->conf.cxlmemsim_addr ?: g_strdup("127.0.0.1");
-    addr.u.inet.port = g_strdup_printf("%u", 
+    addr.u.inet.port = g_strdup_printf("%u",
                                        vcxl->conf.cxlmemsim_port ?: 9999);
-    
+
     vcxl->socket = qio_channel_socket_new();
     if (qio_channel_socket_connect_sync(vcxl->socket, &addr, &err) < 0) {
-        qemu_log("Warning: Failed to connect to CXLMemSim at %s:%s: %s\n", 
+        qemu_log("Warning: Failed to connect to CXLMemSim at %s:%s: %s\n",
                 addr.u.inet.host, addr.u.inet.port, error_get_pretty(err));
         error_free(err);
         object_unref(OBJECT(vcxl->socket));
         vcxl->socket = NULL;
     } else {
         vcxl->connected = true;
-        qemu_log("Connected to CXLMemSim at %s:%s\n", 
+        qemu_log("Connected to CXLMemSim at %s:%s\n",
                 addr.u.inet.host, addr.u.inet.port);
     }
-    
+
     g_free(addr.u.inet.port);
     if (addr.u.inet.host != vcxl->conf.cxlmemsim_addr) {
         g_free(addr.u.inet.host);

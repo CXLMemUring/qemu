@@ -47,6 +47,7 @@ typedef int (*cuMemAlloc_fn)(uint64_t *, size_t);
 typedef int (*cuMemFree_fn)(uint64_t);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
+typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
@@ -83,6 +84,7 @@ static struct {
     cuMemFree_fn cuMemFree;
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
+    cuMemcpyDtoD_fn cuMemcpyDtoD;
     cuModuleLoadData_fn cuModuleLoadData;
     cuModuleGetFunction_fn cuModuleGetFunction;
     cuLaunchKernel_fn cuLaunchKernel;
@@ -109,26 +111,30 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
         lib_path = "/usr/lib/x86_64-linux-gnu/libcuda.so";
     }
 
-    qemu_log("CXL hetGPU: ========================================\n");
-    qemu_log("CXL hetGPU: Initializing real GPU backend\n");
-    qemu_log("CXL hetGPU: Library path: %s\n", lib_path);
-    qemu_log("CXL hetGPU: Device index: %d\n", device_index);
-    qemu_log("CXL hetGPU: ========================================\n");
+    fprintf(stderr, "CXL hetGPU: ========================================\n");
+    fprintf(stderr, "CXL hetGPU: Initializing real GPU backend\n");
+    fprintf(stderr, "CXL hetGPU: Library path: %s\n", lib_path);
+    fprintf(stderr, "CXL hetGPU: Device index: %d\n", device_index);
+    fprintf(stderr, "CXL hetGPU: ========================================\n");
+    fflush(stderr);
 
     state->hetgpu_lib = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
     if (!state->hetgpu_lib) {
-        qemu_log("CXL hetGPU: FAILED to load library: %s\n", dlerror());
-        qemu_log("CXL hetGPU: Trying alternate path /usr/lib64/libcuda.so\n");
+        fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
+        fprintf(stderr, "CXL hetGPU: Trying alternate path /usr/lib64/libcuda.so\n");
+        fflush(stderr);
         state->hetgpu_lib = dlopen("/usr/lib64/libcuda.so", RTLD_NOW | RTLD_GLOBAL);
     }
     if (!state->hetgpu_lib) {
-        qemu_log("CXL hetGPU: FAILED to load library: %s\n", dlerror());
-        qemu_log("CXL hetGPU: Trying alternate path libcuda.so.1\n");
+        fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
+        fprintf(stderr, "CXL hetGPU: Trying alternate path libcuda.so.1\n");
+        fflush(stderr);
         state->hetgpu_lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
     }
 
     if (state->hetgpu_lib) {
-        qemu_log("CXL hetGPU: Successfully loaded CUDA library\n");
+        fprintf(stderr, "CXL hetGPU: Successfully loaded CUDA library\n");
+        fflush(stderr);
 
         /* Load function pointers */
         g_cuda_funcs.cuInit = dlsym(state->hetgpu_lib, "cuInit");
@@ -144,6 +150,7 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
         g_cuda_funcs.cuMemFree = dlsym(state->hetgpu_lib, "cuMemFree_v2");
         g_cuda_funcs.cuMemcpyHtoD = dlsym(state->hetgpu_lib, "cuMemcpyHtoD_v2");
         g_cuda_funcs.cuMemcpyDtoH = dlsym(state->hetgpu_lib, "cuMemcpyDtoH_v2");
+        g_cuda_funcs.cuMemcpyDtoD = dlsym(state->hetgpu_lib, "cuMemcpyDtoD_v2");
         g_cuda_funcs.cuModuleLoadData = dlsym(state->hetgpu_lib, "cuModuleLoadData");
         g_cuda_funcs.cuModuleGetFunction = dlsym(state->hetgpu_lib, "cuModuleGetFunction");
         g_cuda_funcs.cuLaunchKernel = dlsym(state->hetgpu_lib, "cuLaunchKernel");
@@ -152,18 +159,24 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
         g_cuda_funcs.cuGetErrorString = dlsym(state->hetgpu_lib, "cuGetErrorString");
         g_cuda_funcs.cuGetErrorName = dlsym(state->hetgpu_lib, "cuGetErrorName");
 
-        qemu_log("CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuCtxCreate=%p, cuMemAlloc=%p\n",
-                 g_cuda_funcs.cuInit, g_cuda_funcs.cuCtxCreate, g_cuda_funcs.cuMemAlloc);
+        fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuDeviceGetCount=%p, cuDeviceGet=%p\n",
+                 g_cuda_funcs.cuInit, g_cuda_funcs.cuDeviceGetCount, g_cuda_funcs.cuDeviceGet);
+        fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuCtxCreate=%p, cuMemAlloc=%p, cuMemcpyHtoD=%p\n",
+                 g_cuda_funcs.cuCtxCreate, g_cuda_funcs.cuMemAlloc, g_cuda_funcs.cuMemcpyHtoD);
+        fflush(stderr);
 
         if (g_cuda_funcs.cuInit) {
                 int err = g_cuda_funcs.cuInit(0);
+                fprintf(stderr, "CXL hetGPU: cuInit returned err=%d\n", err);
+                fflush(stderr);
                 if (err == 0) {
                     int cuda_dev = 0;
                     size_t total_mem = 0;
                     int attr_val = 0;
                     void *ctx = NULL;
 
-                    qemu_log("CXL hetGPU: cuInit succeeded\n");
+                    fprintf(stderr, "CXL hetGPU: cuInit succeeded\n");
+                    fflush(stderr);
 
                     /* Get device handle */
                     if (g_cuda_funcs.cuDeviceGet) {
@@ -375,15 +388,37 @@ void hetgpu_cleanup(HetGPUState *state)
 
 HetGPUError hetgpu_get_device_count(int *count)
 {
+    fprintf(stderr, "CXL hetGPU: hetgpu_get_device_count called\n");
+    fflush(stderr);
+
     if (!count) {
+        fprintf(stderr, "CXL hetGPU: hetgpu_get_device_count - NULL count pointer!\n");
+        fflush(stderr);
         return HETGPU_ERROR_INVALID_VALUE;
     }
 
+    fprintf(stderr, "CXL hetGPU: cuDeviceGetCount func ptr = %p\n", (void*)g_cuda_funcs.cuDeviceGetCount);
+    fflush(stderr);
+
     if (g_cuda_funcs.cuDeviceGetCount) {
+        *count = -999;  /* Sentinel value to detect if function updates it */
         int err = g_cuda_funcs.cuDeviceGetCount(count);
-        return err == 0 ? HETGPU_SUCCESS : HETGPU_ERROR_NO_DEVICE;
+        fprintf(stderr, "CXL hetGPU: cuDeviceGetCount returned err=%d, count=%d\n", err, *count);
+        fflush(stderr);
+        if (err != 0) {
+            fprintf(stderr, "CXL hetGPU: cuDeviceGetCount FAILED with error %d\n", err);
+            fflush(stderr);
+            return HETGPU_ERROR_NO_DEVICE;
+        }
+        if (*count <= 0) {
+            fprintf(stderr, "CXL hetGPU: WARNING - cuDeviceGetCount returned count=%d\n", *count);
+            fflush(stderr);
+        }
+        return HETGPU_SUCCESS;
     }
 
+    fprintf(stderr, "CXL hetGPU: No cuDeviceGetCount function, using simulation mode\n");
+    fflush(stderr);
     *count = 1;  /* Simulation mode: 1 virtual device */
     return HETGPU_SUCCESS;
 }
@@ -412,6 +447,17 @@ HetGPUError hetgpu_create_context(HetGPUState *state)
 
     if (state->backend == HETGPU_BACKEND_SIMULATION) {
         state->context = (void *)0xDEADBEEF;  /* Dummy context */
+        return HETGPU_SUCCESS;
+    }
+
+    /* hetGPU managed mode: NVIDIA/AMD/Intel backend with NULL context
+     * means hetGPU library manages the context internally */
+    if (state->backend == HETGPU_BACKEND_NVIDIA ||
+        state->backend == HETGPU_BACKEND_AMD ||
+        state->backend == HETGPU_BACKEND_INTEL ||
+        state->backend == HETGPU_BACKEND_TENSTORRENT) {
+        qemu_log("CXL hetGPU: Using hetGPU managed context (backend=%d)\n", state->backend);
+        /* Context remains NULL - hetGPU manages it internally */
         return HETGPU_SUCCESS;
     }
 
@@ -614,8 +660,8 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
             qemu_log("CXL hetGPU: cuMemcpyHtoD failed: %s (%d)\n", err_name, err);
             return HETGPU_ERROR_INVALID_VALUE;
         }
-        qemu_log("CXL hetGPU: memcpy HtoD 0x%lx <- %zu bytes\n",
-                 (unsigned long)dst, size);
+        // qemu_log("CXL hetGPU: memcpy HtoD 0x%lx <- %zu bytes\n",
+        //          (unsigned long)dst, size);
         return HETGPU_SUCCESS;
     }
 
@@ -681,6 +727,56 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
         qemu_log("CXL hetGPU: SIM memcpy DtoH failed - allocation not found for 0x%lx\n",
                  (unsigned long)src);
         memset(dst, 0, size);  /* Return zeros on error */
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
+                               HetGPUDevicePtr src, size_t size)
+{
+    if (!state || !state->initialized) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+
+    state->memory_ops++;
+
+    /* For hetGPU managed mode, use real GPU through hetGPU library */
+    if (g_cuda_funcs.cuMemcpyDtoD && state->backend != HETGPU_BACKEND_SIMULATION) {
+        ensure_cuda_context(state);
+
+        int err = g_cuda_funcs.cuMemcpyDtoD(dst, src, size);
+        if (err != 0) {
+            const char *err_name = "UNKNOWN";
+            if (g_cuda_funcs.cuGetErrorName) {
+                g_cuda_funcs.cuGetErrorName(err, &err_name);
+            }
+            qemu_log("CXL hetGPU: cuMemcpyDtoD failed: %s (%d)\n", err_name, err);
+            return HETGPU_ERROR_INVALID_VALUE;
+        }
+        qemu_log("CXL hetGPU: memcpy DtoD 0x%lx -> 0x%lx (%zu bytes)\n",
+                 (unsigned long)src, (unsigned long)dst, size);
+        return HETGPU_SUCCESS;
+    }
+
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        /* Find both allocations and copy between them */
+        HetGPUSimAlloc *src_alloc = find_sim_alloc(state, src);
+        HetGPUSimAlloc *dst_alloc = find_sim_alloc(state, dst);
+        if (src_alloc && dst_alloc) {
+            size_t src_offset = src - src_alloc->dev_ptr;
+            size_t dst_offset = dst - dst_alloc->dev_ptr;
+            if (src_offset + size <= src_alloc->size &&
+                dst_offset + size <= dst_alloc->size) {
+                memcpy((uint8_t *)dst_alloc->host_buffer + dst_offset,
+                       (uint8_t *)src_alloc->host_buffer + src_offset, size);
+                qemu_log("CXL hetGPU: SIM memcpy DtoD 0x%lx -> 0x%lx (%zu bytes)\n",
+                         (unsigned long)src, (unsigned long)dst, size);
+                return HETGPU_SUCCESS;
+            }
+        }
+        qemu_log("CXL hetGPU: SIM memcpy DtoD failed - allocation not found\n");
         return HETGPU_ERROR_INVALID_VALUE;
     }
 

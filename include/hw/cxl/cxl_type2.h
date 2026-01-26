@@ -16,6 +16,7 @@
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_type2_coherency.h"
 #include "qemu/thread.h"
 #include "io/channel-socket.h"
 
@@ -123,12 +124,19 @@ typedef struct CXLType2State {
         uint32_t cmd_result;
         uint64_t params[8];
         uint64_t results[4];
-        uint8_t  data[0x10000];        /* 64KB data buffer */
+        uint8_t  *data;                /* Data buffer - dynamically allocated (1MB) */
+        size_t   data_size;            /* Size of data buffer */
         void    *modules[64];          /* Loaded PTX modules */
         void    *functions[256];       /* Kernel function handles */
         uint32_t num_modules;
         uint32_t num_functions;
+        uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
     } gpu_cmd;
+
+    /* Bulk transfer region for large memory operations */
+    MemoryRegion bulk_transfer_region;
+    void *bulk_transfer_ptr;           /* Mapped pointer for bulk transfers */
+    size_t bulk_transfer_size;
 
     /* Device configuration */
     uint64_t cache_size;
@@ -140,6 +148,9 @@ typedef struct CXLType2State {
 
     /* Coherency protocol */
     CXLType2CoherencyState coherency;
+
+    /* Enhanced BAR coherency tracking */
+    CXLBARCoherencyState bar_coherency;
 
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;

@@ -274,6 +274,18 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
                                HetGPUDevicePtr src, size_t size);
 
 /**
+ * hetgpu_memcpy_dtod - Copy memory from device to device
+ * @state: Initialized HetGPUState
+ * @dst: Destination device pointer
+ * @src: Source device pointer
+ * @size: Size in bytes
+ *
+ * Returns: HETGPU_SUCCESS on success
+ */
+HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
+                               HetGPUDevicePtr src, size_t size);
+
+/**
  * hetgpu_memset - Set device memory
  * @state: Initialized HetGPUState
  * @dev_ptr: Device pointer
