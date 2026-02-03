@@ -17,6 +17,7 @@
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_coherency.h"
+#include "hw/cxl/cxl_p2p_dma.h"
 #include "qemu/thread.h"
 #include "io/channel-socket.h"
 
@@ -151,6 +152,9 @@ typedef struct CXLType2State {
 
     /* Enhanced BAR coherency tracking */
     CXLBARCoherencyState bar_coherency;
+
+    /* P2P DMA engine for Type2 <-> Type3 transfers */
+    CXLP2PDMAEngine p2p_engine;
 
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;

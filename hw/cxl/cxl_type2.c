@@ -1621,12 +1621,29 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
+            /* Also update shadow copy in device_mem for coherency tracking */
+            if (dev_ptr + size <= ct2d->device_mem_size) {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (mem) {
+                    memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                    /* Notify BAR coherency layer of GPU write */
+                    if (ct2d->bar_coherency.enabled) {
+                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                                   dev_ptr, size, true);
+                    }
+                }
+            }
         } else {
             /* Fallback: copy to device memory region */
             if (dev_ptr + size <= ct2d->device_mem_size) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                    /* Notify BAR coherency layer of GPU write */
+                    if (ct2d->bar_coherency.enabled) {
+                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                                   dev_ptr, size, true);
+                    }
                 }
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -1642,15 +1659,32 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             break;
         }
         if (hetgpu->initialized) {
+            /* Notify BAR coherency layer before GPU read */
+            if (ct2d->bar_coherency.enabled) {
+                cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                           dev_ptr, size, false);
+            }
             err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+            /* Update shadow copy from GPU for coherency */
+            if (dev_ptr + size <= ct2d->device_mem_size) {
+                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+                if (mem) {
+                    memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                }
             }
         } else {
             /* Fallback: copy from device memory region */
             if (dev_ptr + size <= ct2d->device_mem_size) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
+                    /* Notify BAR coherency layer before GPU read */
+                    if (ct2d->bar_coherency.enabled) {
+                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                                   dev_ptr, size, false);
+                    }
                     memcpy(ct2d->gpu_cmd.data, mem + dev_ptr, size);
                 }
             } else {
@@ -1908,6 +1942,101 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     qemu_mutex_unlock(&ct2d->memsim.lock);
                 }
             }
+        }
+        break;
+
+    /* P2P DMA commands */
+    case CXL_GPU_CMD_P2P_DISCOVER:
+        /* Discover P2P peer devices */
+        {
+            int num_peers = cxl_p2p_discover_peers(&ct2d->p2p_engine);
+            if (num_peers >= 0) {
+                ct2d->gpu_cmd.results[0] = num_peers;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_P2P_GET_PEER_INFO:
+        /* Get peer device info: params[0] = peer_id */
+        {
+            uint32_t peer_id = ct2d->gpu_cmd.params[0];
+            CXLP2PPeer *peer = cxl_p2p_get_peer(&ct2d->p2p_engine, peer_id);
+            if (peer && peer->active) {
+                ct2d->gpu_cmd.results[0] = peer->type;
+                ct2d->gpu_cmd.results[1] = peer->mem_size;
+                ct2d->gpu_cmd.results[2] = peer->coherent;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_P2P_GPU_TO_MEM:
+        /* GPU -> Type3 transfer: params[0]=peer_id, params[1]=gpu_off, params[2]=mem_off, params[3]=size */
+        {
+            uint32_t t3_peer_id = ct2d->gpu_cmd.params[0];
+            uint64_t gpu_offset = ct2d->gpu_cmd.params[1];
+            uint64_t mem_offset = ct2d->gpu_cmd.params[2];
+            uint64_t xfer_size = ct2d->gpu_cmd.params[3];
+            uint32_t flags = CXL_P2P_FLAG_COHERENT;
+
+            int ret = cxl_p2p_gpu_to_mem(&ct2d->p2p_engine, t3_peer_id,
+                                          gpu_offset, mem_offset, xfer_size, flags);
+            ct2d->gpu_cmd.cmd_result = (ret == 0) ? CXL_GPU_SUCCESS
+                                                   : CXL_GPU_ERROR_OUT_OF_MEMORY;
+        }
+        break;
+
+    case CXL_GPU_CMD_P2P_MEM_TO_GPU:
+        /* Type3 -> GPU transfer: params[0]=peer_id, params[1]=mem_off, params[2]=gpu_off, params[3]=size */
+        {
+            uint32_t t3_peer_id = ct2d->gpu_cmd.params[0];
+            uint64_t mem_offset = ct2d->gpu_cmd.params[1];
+            uint64_t gpu_offset = ct2d->gpu_cmd.params[2];
+            uint64_t xfer_size = ct2d->gpu_cmd.params[3];
+            uint32_t flags = CXL_P2P_FLAG_COHERENT;
+
+            int ret = cxl_p2p_mem_to_gpu(&ct2d->p2p_engine, t3_peer_id,
+                                          mem_offset, gpu_offset, xfer_size, flags);
+            ct2d->gpu_cmd.cmd_result = (ret == 0) ? CXL_GPU_SUCCESS
+                                                   : CXL_GPU_ERROR_OUT_OF_MEMORY;
+        }
+        break;
+
+    case CXL_GPU_CMD_P2P_MEM_TO_MEM:
+        /* Type3 -> Type3 transfer: params[0]=src_peer, params[1]=dst_peer, params[2]=src_off, params[3]=dst_off, params[4]=size */
+        {
+            uint32_t src_peer_id = ct2d->gpu_cmd.params[0];
+            uint32_t dst_peer_id = ct2d->gpu_cmd.params[1];
+            uint64_t src_offset = ct2d->gpu_cmd.params[2];
+            uint64_t dst_offset = ct2d->gpu_cmd.params[3];
+            uint64_t xfer_size = ct2d->gpu_cmd.params[4];
+            uint32_t flags = CXL_P2P_FLAG_COHERENT;
+
+            int ret = cxl_p2p_mem_to_mem(&ct2d->p2p_engine, src_peer_id, dst_peer_id,
+                                          src_offset, dst_offset, xfer_size, flags);
+            ct2d->gpu_cmd.cmd_result = (ret == 0) ? CXL_GPU_SUCCESS
+                                                   : CXL_GPU_ERROR_OUT_OF_MEMORY;
+        }
+        break;
+
+    case CXL_GPU_CMD_P2P_SYNC:
+        /* Wait for all pending P2P transfers */
+        /* Currently all transfers are synchronous, so this is a no-op */
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        break;
+
+    case CXL_GPU_CMD_P2P_GET_STATUS:
+        /* Get P2P engine status and stats */
+        {
+            ct2d->gpu_cmd.results[0] = ct2d->p2p_engine.num_peers;
+            ct2d->gpu_cmd.results[1] = ct2d->p2p_engine.stats.transfers_completed;
+            ct2d->gpu_cmd.results[2] = ct2d->p2p_engine.stats.bytes_transferred;
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         }
         break;
 
@@ -2180,6 +2309,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     /* Initialize enhanced BAR coherency tracking */
     cxl_bar_coherency_init(&ct2d->bar_coherency);
 
+    /* Initialize P2P DMA engine */
+    cxl_p2p_dma_init(&ct2d->p2p_engine, ct2d);
+
     /* Initialize CXLMemSim connection */
     qemu_mutex_init(&ct2d->memsim.lock);
 
@@ -2326,6 +2458,9 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 
     /* Cleanup enhanced BAR coherency tracking */
     cxl_bar_coherency_cleanup(&ct2d->bar_coherency);
+
+    /* Cleanup P2P DMA engine */
+    cxl_p2p_dma_cleanup(&ct2d->p2p_engine);
 
     /* Free GPU command data buffer */
     if (ct2d->gpu_cmd.data) {
