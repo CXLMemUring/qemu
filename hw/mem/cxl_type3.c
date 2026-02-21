@@ -1358,6 +1358,11 @@ static struct {
     void *shm_memory;
     size_t shm_memory_size;
     int shm_slot_id;
+    /* Active latency injection */
+    bool latency_inject;          /* Enable active latency enforcement */
+    uint64_t latency_inject_min;  /* Minimum latency to bother injecting (ns) */
+    uint64_t stats_injected_ns;   /* Total injected delay (ns) */
+    uint64_t stats_inject_count;  /* Number of times delay was injected */
 } g_memsim = {
     .enabled = false,
     .initialized = false,
@@ -1367,7 +1372,72 @@ static struct {
     .shm_fd = -1,
     .shm_header = NULL,
     .shm_slot_id = 0,
+    .latency_inject = false,
+    .latency_inject_min = 0,
+    .stats_injected_ns = 0,
+    .stats_inject_count = 0,
 };
+
+/*
+ * Active latency enforcement: spin-wait until the target latency has elapsed.
+ *
+ * call_start_ns: CLOCK_MONOTONIC timestamp taken BEFORE the IPC request.
+ * target_latency_ns: the simulated CXL latency returned by the server.
+ *
+ * If the IPC round-trip already consumed more time than target_latency_ns,
+ * no extra delay is added.  Otherwise we busy-wait for the remainder so
+ * that the total wall-clock time of the memory access is >= target_latency_ns.
+ *
+ * We use a spin loop rather than nanosleep() because:
+ *   1. CXL latencies are typically 80-300 ns — too short for the kernel
+ *      scheduler to handle accurately (nanosleep minimum ~50 us on Linux).
+ *   2. We WANT the vCPU thread to stall: this is the memory access path,
+ *      and stalling it is semantically correct for simulating slow memory.
+ */
+static void cxl_memsim_inject_latency(uint64_t call_start_ns,
+                                      uint64_t target_latency_ns)
+{
+    struct timespec now;
+
+    if (!g_memsim.latency_inject || target_latency_ns < g_memsim.latency_inject_min) {
+        return;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t elapsed_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec
+                        - call_start_ns;
+
+    if (elapsed_ns >= target_latency_ns) {
+        return;  /* IPC already took longer than the simulated latency */
+    }
+
+    uint64_t remaining_ns = target_latency_ns - elapsed_ns;
+
+    /*
+     * For long delays (>10 us) use nanosleep for the bulk, then spin
+     * for the last microsecond to get precise timing.
+     */
+    if (remaining_ns > 10000) {
+        struct timespec sleep_ts = {
+            .tv_sec  = 0,
+            .tv_nsec = (long)(remaining_ns - 1000)   /* leave 1 us for spin */
+        };
+        nanosleep(&sleep_ts, NULL);
+    }
+
+    /* Spin-wait for the final portion */
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t total_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec
+                          - call_start_ns;
+        if (total_ns >= target_latency_ns) {
+            break;
+        }
+    }
+
+    g_memsim.stats_injected_ns += remaining_ns;
+    g_memsim.stats_inject_count++;
+}
 
 static void cxl_memsim_init(void) {
     /* Use double-checked locking for thread safety */
@@ -1452,6 +1522,24 @@ static void cxl_memsim_init(void) {
         g_memsim.enabled = false;
         g_memsim.initialized = true;
         info_report("CXL Type3: CXLMemSim SHM mode (no network connection)");
+    }
+
+    /* Parse active latency injection settings.
+     *   CXL_LATENCY_INJECT=1          — enable active delay enforcement
+     *   CXL_LATENCY_INJECT_MIN_NS=80  — skip injection below this threshold (default 0)
+     */
+    const char *inject_env = getenv("CXL_LATENCY_INJECT");
+    if (inject_env && (strcmp(inject_env, "1") == 0 || strcmp(inject_env, "true") == 0)) {
+        g_memsim.latency_inject = true;
+        const char *min_ns_env = getenv("CXL_LATENCY_INJECT_MIN_NS");
+        if (min_ns_env && min_ns_env[0]) {
+            g_memsim.latency_inject_min = strtoull(min_ns_env, NULL, 10);
+        }
+        info_report("CXL Type3: Active latency injection ENABLED (min=%lu ns)",
+                    (unsigned long)g_memsim.latency_inject_min);
+    } else {
+        info_report("CXL Type3: Active latency injection disabled "
+                    "(set CXL_LATENCY_INJECT=1 to enable)");
     }
 
     pthread_mutex_unlock(&g_memsim.lock);
@@ -1703,6 +1791,19 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
                     g_memsim.transport_mode == CXL_TRANSPORT_RDMA ? "RDMA" : "TCP");
     }
 
+    /* Periodic latency injection stats (every 100k requests) */
+    if (g_memsim.latency_inject && (request_count % 100000) == 0) {
+        info_report("CXL Type3: Latency injection stats @ %d ops: "
+                    "injected=%lu times, total_delay=%lu us, "
+                    "avg=%.1f ns/injection",
+                    request_count,
+                    (unsigned long)g_memsim.stats_inject_count,
+                    (unsigned long)(g_memsim.stats_injected_ns / 1000),
+                    g_memsim.stats_inject_count > 0
+                        ? (double)g_memsim.stats_injected_ns / g_memsim.stats_inject_count
+                        : 0.0);
+    }
+
     /* Ensure connected */
     if (!g_memsim.connected) {
         if (cxl_memsim_connect_locked() < 0) {
@@ -1856,10 +1957,23 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     if (g_memsim.enabled && g_memsim.connected) {
         CXLMemSimResponse resp = {0};
 
+        /* Record wall-clock time before IPC for latency compensation */
+        struct timespec ts_before;
+        uint64_t start_ns = 0;
+        if (g_memsim.latency_inject) {
+            clock_gettime(CLOCK_MONOTONIC, &ts_before);
+            start_ns = (uint64_t)ts_before.tv_sec * 1000000000ULL
+                     + ts_before.tv_nsec;
+        }
+
         if (cxl_memsim_request(CXL_OP_READ, dpa_offset, size, NULL, &resp) == 0) {
             if (resp.status == 0 && size <= 64) {
                 memcpy(data, resp.data, size);
             }
+
+            /* Enforce simulated CXL latency */
+            cxl_memsim_inject_latency(start_ns, resp.latency_ns);
+
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local read */
             if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
                 g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
@@ -1900,7 +2014,19 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     if (g_memsim.enabled && g_memsim.connected) {
         CXLMemSimResponse resp = {0};
 
+        /* Record wall-clock time before IPC for latency compensation */
+        struct timespec ts_before;
+        uint64_t start_ns = 0;
+        if (g_memsim.latency_inject) {
+            clock_gettime(CLOCK_MONOTONIC, &ts_before);
+            start_ns = (uint64_t)ts_before.tv_sec * 1000000000ULL
+                     + ts_before.tv_nsec;
+        }
+
         if (cxl_memsim_request(CXL_OP_WRITE, dpa_offset, size, &data, &resp) == 0) {
+            /* Enforce simulated CXL latency */
+            cxl_memsim_inject_latency(start_ns, resp.latency_ns);
+
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local write */
             if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
                 g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
