@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/thread.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include <dlfcn.h>
 
@@ -55,6 +56,8 @@ typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned in
                                   unsigned int, void *, void **, void **);
 typedef int (*cuCtxPushCurrent_fn)(void *);
 typedef int (*cuCtxPopCurrent_fn)(void **);
+typedef int (*cuCtxSetCurrent_fn)(void *);
+typedef int (*cuCtxGetCurrent_fn)(void **);
 typedef int (*cuGetErrorString_fn)(int, const char **);
 typedef int (*cuGetErrorName_fn)(int, const char **);
 
@@ -90,9 +93,25 @@ static struct {
     cuLaunchKernel_fn cuLaunchKernel;
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
+    cuCtxSetCurrent_fn cuCtxSetCurrent;
+    cuCtxGetCurrent_fn cuCtxGetCurrent;
     cuGetErrorString_fn cuGetErrorString;
     cuGetErrorName_fn cuGetErrorName;
 } g_cuda_funcs = {0};
+
+/* Global mutex for multi-device context switching safety */
+static QemuMutex g_cuda_mutex;
+static bool g_cuda_mutex_initialized = false;
+static bool g_cuda_lib_initialized = false;
+static void *g_cuda_lib_handle = NULL;
+
+static void ensure_cuda_mutex_init(void)
+{
+    if (!g_cuda_mutex_initialized) {
+        qemu_mutex_init(&g_cuda_mutex);
+        g_cuda_mutex_initialized = true;
+    }
+}
 
 HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
                         int device_index, const char *hetgpu_lib_path)
@@ -101,225 +120,227 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
         return HETGPU_ERROR_INVALID_VALUE;
     }
 
+    ensure_cuda_mutex_init();
+
     memset(state, 0, sizeof(*state));
     state->backend = backend;
     state->device_index = device_index;
 
-    /* Try to load hetGPU library */
+    /* Try to load hetGPU library (only once for all devices) */
     const char *lib_path = hetgpu_lib_path;
     if (!lib_path || lib_path[0] == '\0') {
         lib_path = "/usr/lib/x86_64-linux-gnu/libcuda.so";
     }
 
     fprintf(stderr, "CXL hetGPU: ========================================\n");
-    fprintf(stderr, "CXL hetGPU: Initializing real GPU backend\n");
+    fprintf(stderr, "CXL hetGPU: Initializing GPU backend for device %d\n", device_index);
     fprintf(stderr, "CXL hetGPU: Library path: %s\n", lib_path);
-    fprintf(stderr, "CXL hetGPU: Device index: %d\n", device_index);
+    fprintf(stderr, "CXL hetGPU: Library already loaded: %s\n",
+            g_cuda_lib_initialized ? "yes" : "no");
     fprintf(stderr, "CXL hetGPU: ========================================\n");
     fflush(stderr);
 
-    state->hetgpu_lib = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
-    if (!state->hetgpu_lib) {
-        fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
-        fprintf(stderr, "CXL hetGPU: Trying alternate path /usr/lib64/libcuda.so\n");
-        fflush(stderr);
-        state->hetgpu_lib = dlopen("/usr/lib64/libcuda.so", RTLD_NOW | RTLD_GLOBAL);
-    }
-    if (!state->hetgpu_lib) {
-        fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
-        fprintf(stderr, "CXL hetGPU: Trying alternate path libcuda.so.1\n");
-        fflush(stderr);
-        state->hetgpu_lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
-    }
+    qemu_mutex_lock(&g_cuda_mutex);
 
-    if (state->hetgpu_lib) {
-        fprintf(stderr, "CXL hetGPU: Successfully loaded CUDA library\n");
-        fflush(stderr);
+    /* Only load library and call cuInit once across all devices */
+    if (!g_cuda_lib_initialized) {
+        g_cuda_lib_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
+        if (!g_cuda_lib_handle) {
+            fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
+            fprintf(stderr, "CXL hetGPU: Trying alternate path /usr/lib64/libcuda.so\n");
+            fflush(stderr);
+            g_cuda_lib_handle = dlopen("/usr/lib64/libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+        }
+        if (!g_cuda_lib_handle) {
+            fprintf(stderr, "CXL hetGPU: FAILED to load library: %s\n", dlerror());
+            fprintf(stderr, "CXL hetGPU: Trying alternate path libcuda.so.1\n");
+            fflush(stderr);
+            g_cuda_lib_handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+        }
 
-        /* Load function pointers */
-        g_cuda_funcs.cuInit = dlsym(state->hetgpu_lib, "cuInit");
-        g_cuda_funcs.cuDeviceGetCount = dlsym(state->hetgpu_lib, "cuDeviceGetCount");
-        g_cuda_funcs.cuDeviceGet = dlsym(state->hetgpu_lib, "cuDeviceGet");
-        g_cuda_funcs.cuDeviceGetName = dlsym(state->hetgpu_lib, "cuDeviceGetName");
-        g_cuda_funcs.cuDeviceTotalMem = dlsym(state->hetgpu_lib, "cuDeviceTotalMem_v2");
-        g_cuda_funcs.cuDeviceGetAttribute = dlsym(state->hetgpu_lib, "cuDeviceGetAttribute");
-        g_cuda_funcs.cuCtxCreate = dlsym(state->hetgpu_lib, "cuCtxCreate_v2");
-        g_cuda_funcs.cuCtxDestroy = dlsym(state->hetgpu_lib, "cuCtxDestroy_v2");
-        g_cuda_funcs.cuCtxSynchronize = dlsym(state->hetgpu_lib, "cuCtxSynchronize");
-        g_cuda_funcs.cuMemAlloc = dlsym(state->hetgpu_lib, "cuMemAlloc_v2");
-        g_cuda_funcs.cuMemFree = dlsym(state->hetgpu_lib, "cuMemFree_v2");
-        g_cuda_funcs.cuMemcpyHtoD = dlsym(state->hetgpu_lib, "cuMemcpyHtoD_v2");
-        g_cuda_funcs.cuMemcpyDtoH = dlsym(state->hetgpu_lib, "cuMemcpyDtoH_v2");
-        g_cuda_funcs.cuMemcpyDtoD = dlsym(state->hetgpu_lib, "cuMemcpyDtoD_v2");
-        g_cuda_funcs.cuModuleLoadData = dlsym(state->hetgpu_lib, "cuModuleLoadData");
-        g_cuda_funcs.cuModuleGetFunction = dlsym(state->hetgpu_lib, "cuModuleGetFunction");
-        g_cuda_funcs.cuLaunchKernel = dlsym(state->hetgpu_lib, "cuLaunchKernel");
-        g_cuda_funcs.cuCtxPushCurrent = dlsym(state->hetgpu_lib, "cuCtxPushCurrent_v2");
-        g_cuda_funcs.cuCtxPopCurrent = dlsym(state->hetgpu_lib, "cuCtxPopCurrent_v2");
-        g_cuda_funcs.cuGetErrorString = dlsym(state->hetgpu_lib, "cuGetErrorString");
-        g_cuda_funcs.cuGetErrorName = dlsym(state->hetgpu_lib, "cuGetErrorName");
+        if (g_cuda_lib_handle) {
+            fprintf(stderr, "CXL hetGPU: Successfully loaded CUDA library\n");
+            fflush(stderr);
 
-        fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuDeviceGetCount=%p, cuDeviceGet=%p\n",
-                 g_cuda_funcs.cuInit, g_cuda_funcs.cuDeviceGetCount, g_cuda_funcs.cuDeviceGet);
-        fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuCtxCreate=%p, cuMemAlloc=%p, cuMemcpyHtoD=%p\n",
-                 g_cuda_funcs.cuCtxCreate, g_cuda_funcs.cuMemAlloc, g_cuda_funcs.cuMemcpyHtoD);
-        fflush(stderr);
+            /* Load function pointers */
+            g_cuda_funcs.cuInit = dlsym(g_cuda_lib_handle, "cuInit");
+            g_cuda_funcs.cuDeviceGetCount = dlsym(g_cuda_lib_handle, "cuDeviceGetCount");
+            g_cuda_funcs.cuDeviceGet = dlsym(g_cuda_lib_handle, "cuDeviceGet");
+            g_cuda_funcs.cuDeviceGetName = dlsym(g_cuda_lib_handle, "cuDeviceGetName");
+            g_cuda_funcs.cuDeviceTotalMem = dlsym(g_cuda_lib_handle, "cuDeviceTotalMem_v2");
+            g_cuda_funcs.cuDeviceGetAttribute = dlsym(g_cuda_lib_handle, "cuDeviceGetAttribute");
+            g_cuda_funcs.cuCtxCreate = dlsym(g_cuda_lib_handle, "cuCtxCreate_v2");
+            g_cuda_funcs.cuCtxDestroy = dlsym(g_cuda_lib_handle, "cuCtxDestroy_v2");
+            g_cuda_funcs.cuCtxSynchronize = dlsym(g_cuda_lib_handle, "cuCtxSynchronize");
+            g_cuda_funcs.cuMemAlloc = dlsym(g_cuda_lib_handle, "cuMemAlloc_v2");
+            g_cuda_funcs.cuMemFree = dlsym(g_cuda_lib_handle, "cuMemFree_v2");
+            g_cuda_funcs.cuMemcpyHtoD = dlsym(g_cuda_lib_handle, "cuMemcpyHtoD_v2");
+            g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
+            g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
+            g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
+            g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
+            g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
+            g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
+            g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
+            g_cuda_funcs.cuCtxSetCurrent = dlsym(g_cuda_lib_handle, "cuCtxSetCurrent");
+            g_cuda_funcs.cuCtxGetCurrent = dlsym(g_cuda_lib_handle, "cuCtxGetCurrent");
+            g_cuda_funcs.cuGetErrorString = dlsym(g_cuda_lib_handle, "cuGetErrorString");
+            g_cuda_funcs.cuGetErrorName = dlsym(g_cuda_lib_handle, "cuGetErrorName");
 
-        if (g_cuda_funcs.cuInit) {
+            fprintf(stderr, "CXL hetGPU: Loaded CUDA functions - cuInit=%p, cuCtxSetCurrent=%p\n",
+                     g_cuda_funcs.cuInit, g_cuda_funcs.cuCtxSetCurrent);
+            fflush(stderr);
+
+            if (g_cuda_funcs.cuInit) {
                 int err = g_cuda_funcs.cuInit(0);
                 fprintf(stderr, "CXL hetGPU: cuInit returned err=%d\n", err);
                 fflush(stderr);
-                if (err == 0) {
-                    int cuda_dev = 0;
-                    size_t total_mem = 0;
-                    int attr_val = 0;
-                    void *ctx = NULL;
-
-                    fprintf(stderr, "CXL hetGPU: cuInit succeeded\n");
-                    fflush(stderr);
-
-                    /* Get device handle */
-                    if (g_cuda_funcs.cuDeviceGet) {
-                        err = g_cuda_funcs.cuDeviceGet(&cuda_dev, device_index);
-                        if (err != 0) {
-                            qemu_log("CXL hetGPU: cuDeviceGet failed: %d\n", err);
-                            goto simulation_fallback;
-                        }
-                        qemu_log("CXL hetGPU: Got CUDA device %d\n", cuda_dev);
-                    }
-
-                    /* Create context immediately to verify GPU access */
-                    if (g_cuda_funcs.cuCtxCreate) {
-                        qemu_log("CXL hetGPU: Calling cuCtxCreate_v2 for device %d\n", cuda_dev);
-                        err = g_cuda_funcs.cuCtxCreate(&ctx, 0, cuda_dev);
-
-                        if (err != 0) {
-                            const char *err_name = "UNKNOWN";
-                            const char *err_str = "Unknown error";
-                            if (g_cuda_funcs.cuGetErrorName) {
-                                g_cuda_funcs.cuGetErrorName(err, &err_name);
-                            }
-                            if (g_cuda_funcs.cuGetErrorString) {
-                                g_cuda_funcs.cuGetErrorString(err, &err_str);
-                            }
-                            qemu_log("CXL hetGPU: cuCtxCreate FAILED: %s (%d) - %s\n",
-                                     err_name, err, err_str);
-                            qemu_log("CXL hetGPU: Possible causes:\n");
-                            qemu_log("CXL hetGPU:   - QEMU not running with GPU access permissions\n");
-                            qemu_log("CXL hetGPU:   - Try running QEMU as root or add user to 'video' group\n");
-                            qemu_log("CXL hetGPU:   - Ensure /dev/nvidia* devices are accessible\n");
-                            qemu_log("CXL hetGPU:   - Check if nvidia-smi works on the host\n");
-                            goto simulation_fallback;
-                        } else if (ctx == NULL) {
-                            /* hetGPU returns NULL context - use hetGPU managed mode */
-                            qemu_log("CXL hetGPU: cuCtxCreate returned NULL context\n");
-                            qemu_log("CXL hetGPU: Using hetGPU managed mode (backend=%d)\n", backend);
-
-                            /* hetGPU manages context internally - proceed with hetGPU backend */
-                            state->initialized = true;
-                            /* Use requested backend type, default to NVIDIA for H100 */
-                            state->backend = (backend == HETGPU_BACKEND_AUTO) ?
-                                             HETGPU_BACKEND_NVIDIA : backend;
-                            state->context = NULL;  /* hetGPU manages internally */
-                            state->cuda_device = cuda_dev;
-
-                            /* Query device properties from hetGPU */
-                            state->props = default_props;
-                            if (g_cuda_funcs.cuDeviceGetName) {
-                                g_cuda_funcs.cuDeviceGetName(state->props.name,
-                                                             sizeof(state->props.name), cuda_dev);
-                            }
-                            if (g_cuda_funcs.cuDeviceTotalMem) {
-                                size_t mem = 0;
-                                if (g_cuda_funcs.cuDeviceTotalMem(&mem, cuda_dev) == 0) {
-                                    state->props.total_memory = mem;
-                                }
-                            }
-                            state->props.backend_type = state->backend;
-
-                            qemu_log("CXL hetGPU: hetGPU mode initialized: %s, %lu MB, backend=%d\n",
-                                     state->props.name,
-                                     (unsigned long)(state->props.total_memory / (1024*1024)),
-                                     state->backend);
-                            return HETGPU_SUCCESS;
-                        }
-
-                        if (ctx) {
-                            qemu_log("CXL hetGPU: Successfully created CUDA context %p\n", ctx);
-
-                            /* Push the context to make it current */
-                            if (g_cuda_funcs.cuCtxPushCurrent) {
-                                err = g_cuda_funcs.cuCtxPushCurrent(ctx);
-                                if (err != 0) {
-                                    qemu_log("CXL hetGPU: Warning: cuCtxPushCurrent failed: %d\n", err);
-                                } else {
-                                    qemu_log("CXL hetGPU: Context pushed as current\n");
-                                }
-                            }
-                        }
-                    } else {
-                        qemu_log("CXL hetGPU: cuCtxCreate_v2 symbol not found - GPU requires CUDA context\n");
-                        goto simulation_fallback;
-                    }
-
-                    state->initialized = true;
-                    state->backend = HETGPU_BACKEND_NVIDIA;
-                    state->cuda_device = cuda_dev;
-                    state->context = ctx;
-
-                    /* Query real GPU properties */
-                    state->props = default_props;  /* Start with defaults */
-
-                    if (g_cuda_funcs.cuDeviceGetName) {
-                        err = g_cuda_funcs.cuDeviceGetName(state->props.name,
-                                                     sizeof(state->props.name), cuda_dev);
-                        if (err != 0) {
-                            qemu_log("CXL hetGPU: cuDeviceGetName failed: %d\n", err);
-                        }
-                    }
-
-                    if (g_cuda_funcs.cuDeviceTotalMem) {
-                        if (g_cuda_funcs.cuDeviceTotalMem(&total_mem, cuda_dev) == 0) {
-                            state->props.total_memory = total_mem;
-                            qemu_log("CXL hetGPU: Real GPU total memory: %lu MB\n",
-                                     (unsigned long)(total_mem / (1024*1024)));
-                        }
-                    }
-
-                    if (g_cuda_funcs.cuDeviceGetAttribute) {
-                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
-                                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuda_dev) == 0) {
-                            state->props.compute_capability_major = attr_val;
-                        }
-                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
-                                CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuda_dev) == 0) {
-                            state->props.compute_capability_minor = attr_val;
-                        }
-                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
-                                CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_dev) == 0) {
-                            state->props.multiprocessor_count = attr_val;
-                        }
-                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
-                                CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuda_dev) == 0) {
-                            state->props.max_threads_per_block = attr_val;
-                        }
-                        if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
-                                CU_DEVICE_ATTRIBUTE_WARP_SIZE, cuda_dev) == 0) {
-                            state->props.warp_size = attr_val;
-                        }
-                    }
-
-                    state->props.backend_type = HETGPU_BACKEND_NVIDIA;
-
-                    qemu_log("CXL hetGPU: Real GPU initialized: %s, %lu MB, CC %d.%d\n",
-                             state->props.name,
-                             (unsigned long)(state->props.total_memory / (1024*1024)),
-                             state->props.compute_capability_major,
-                             state->props.compute_capability_minor);
-                    return HETGPU_SUCCESS;
+                if (err != 0) {
+                    qemu_log("CXL hetGPU: cuInit failed with error %d\n", err);
+                    qemu_mutex_unlock(&g_cuda_mutex);
+                    goto simulation_fallback;
                 }
-                qemu_log("CXL hetGPU: cuInit failed with error %d\n", err);
+            }
+            g_cuda_lib_initialized = true;
         }
+    }
+
+    /* Store library handle reference (shared, don't dlclose individually) */
+    state->hetgpu_lib = g_cuda_lib_handle;
+
+    qemu_mutex_unlock(&g_cuda_mutex);
+
+    if (state->hetgpu_lib && g_cuda_lib_initialized) {
+        /* Library loaded and cuInit succeeded — create per-device context */
+        int err = 0;
+        int cuda_dev = 0;
+        size_t total_mem = 0;
+        int attr_val = 0;
+        void *ctx = NULL;
+
+        /* Get device handle — with MIG, different device_index = different MIG instance */
+        if (g_cuda_funcs.cuDeviceGet) {
+            err = g_cuda_funcs.cuDeviceGet(&cuda_dev, device_index);
+            if (err != 0) {
+                qemu_log("CXL hetGPU: cuDeviceGet(%d) failed: %d\n", device_index, err);
+                qemu_log("CXL hetGPU: If using MIG, ensure MIG instances are configured\n");
+                goto simulation_fallback;
+            }
+            qemu_log("CXL hetGPU: Got CUDA device %d for device_index %d\n",
+                     cuda_dev, device_index);
+        }
+
+        /* Create per-device context */
+        if (g_cuda_funcs.cuCtxCreate) {
+            qemu_log("CXL hetGPU: Calling cuCtxCreate_v2 for device %d\n", cuda_dev);
+            err = g_cuda_funcs.cuCtxCreate(&ctx, 0, cuda_dev);
+
+            if (err != 0) {
+                const char *err_name = "UNKNOWN";
+                const char *err_str = "Unknown error";
+                if (g_cuda_funcs.cuGetErrorName) {
+                    g_cuda_funcs.cuGetErrorName(err, &err_name);
+                }
+                if (g_cuda_funcs.cuGetErrorString) {
+                    g_cuda_funcs.cuGetErrorString(err, &err_str);
+                }
+                qemu_log("CXL hetGPU: cuCtxCreate FAILED: %s (%d) - %s\n",
+                         err_name, err, err_str);
+                goto simulation_fallback;
+            } else if (ctx == NULL) {
+                /* hetGPU returns NULL context - use hetGPU managed mode */
+                qemu_log("CXL hetGPU: cuCtxCreate returned NULL context\n");
+                qemu_log("CXL hetGPU: Using hetGPU managed mode (backend=%d)\n", backend);
+
+                state->initialized = true;
+                state->backend = (backend == HETGPU_BACKEND_AUTO) ?
+                                 HETGPU_BACKEND_NVIDIA : backend;
+                state->context = NULL;
+                state->cuda_device = cuda_dev;
+
+                state->props = default_props;
+                if (g_cuda_funcs.cuDeviceGetName) {
+                    g_cuda_funcs.cuDeviceGetName(state->props.name,
+                                                 sizeof(state->props.name), cuda_dev);
+                }
+                if (g_cuda_funcs.cuDeviceTotalMem) {
+                    size_t mem = 0;
+                    if (g_cuda_funcs.cuDeviceTotalMem(&mem, cuda_dev) == 0) {
+                        state->props.total_memory = mem;
+                    }
+                }
+                state->props.backend_type = state->backend;
+
+                qemu_log("CXL hetGPU: hetGPU mode initialized: %s, %lu MB, backend=%d\n",
+                         state->props.name,
+                         (unsigned long)(state->props.total_memory / (1024*1024)),
+                         state->backend);
+                return HETGPU_SUCCESS;
+            }
+
+            qemu_log("CXL hetGPU: Successfully created CUDA context %p for device %d\n",
+                     ctx, device_index);
+
+            /* Pop the context cuCtxCreate auto-pushed, we'll use cuCtxSetCurrent */
+            if (g_cuda_funcs.cuCtxPopCurrent) {
+                void *popped = NULL;
+                g_cuda_funcs.cuCtxPopCurrent(&popped);
+            }
+        } else {
+            qemu_log("CXL hetGPU: cuCtxCreate_v2 symbol not found\n");
+            goto simulation_fallback;
+        }
+
+        state->initialized = true;
+        state->backend = HETGPU_BACKEND_NVIDIA;
+        state->cuda_device = cuda_dev;
+        state->context = ctx;
+
+        /* Query real GPU properties */
+        state->props = default_props;
+
+        if (g_cuda_funcs.cuDeviceGetName) {
+            err = g_cuda_funcs.cuDeviceGetName(state->props.name,
+                                         sizeof(state->props.name), cuda_dev);
+        }
+        if (g_cuda_funcs.cuDeviceTotalMem) {
+            if (g_cuda_funcs.cuDeviceTotalMem(&total_mem, cuda_dev) == 0) {
+                state->props.total_memory = total_mem;
+                qemu_log("CXL hetGPU: Device %d total memory: %lu MB\n",
+                         device_index, (unsigned long)(total_mem / (1024*1024)));
+            }
+        }
+        if (g_cuda_funcs.cuDeviceGetAttribute) {
+            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, cuda_dev) == 0) {
+                state->props.compute_capability_major = attr_val;
+            }
+            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                    CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, cuda_dev) == 0) {
+                state->props.compute_capability_minor = attr_val;
+            }
+            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_dev) == 0) {
+                state->props.multiprocessor_count = attr_val;
+            }
+            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, cuda_dev) == 0) {
+                state->props.max_threads_per_block = attr_val;
+            }
+            if (g_cuda_funcs.cuDeviceGetAttribute(&attr_val,
+                    CU_DEVICE_ATTRIBUTE_WARP_SIZE, cuda_dev) == 0) {
+                state->props.warp_size = attr_val;
+            }
+        }
+
+        state->props.backend_type = HETGPU_BACKEND_NVIDIA;
+
+        qemu_log("CXL hetGPU: Device %d initialized: %s, %lu MB, CC %d.%d\n",
+                 device_index, state->props.name,
+                 (unsigned long)(state->props.total_memory / (1024*1024)),
+                 state->props.compute_capability_major,
+                 state->props.compute_capability_minor);
+        return HETGPU_SUCCESS;
     }
 
     /* Fall through to error if library not loaded or cuInit not found */
@@ -373,12 +394,12 @@ void hetgpu_cleanup(HetGPUState *state)
 
     if (state->context && state->backend != HETGPU_BACKEND_SIMULATION &&
         g_cuda_funcs.cuCtxDestroy) {
+        qemu_mutex_lock(&g_cuda_mutex);
         g_cuda_funcs.cuCtxDestroy(state->context);
+        qemu_mutex_unlock(&g_cuda_mutex);
     }
 
-    if (state->hetgpu_lib) {
-        dlclose(state->hetgpu_lib);
-    }
+    /* Don't dlclose — library handle is shared across all devices */
 
     qemu_log("CXL hetGPU: Stats - Kernel launches: %lu, Memory ops: %lu, Coherency ops: %lu\n",
              state->kernel_launches, state->memory_ops, state->coherency_ops);
@@ -489,14 +510,72 @@ void hetgpu_destroy_context(HetGPUState *state)
     state->context = NULL;
 }
 
-/* Helper to ensure CUDA context is current before operations */
-static void ensure_cuda_context(HetGPUState *state)
+/*
+ * Multi-device context management:
+ * Uses cuCtxSetCurrent (replaces current) instead of cuCtxPushCurrent (grows stack).
+ * Each operation must be wrapped in cuda_lock/cuda_unlock to prevent races
+ * when two CXL Type 2 devices share the same physical GPU (or MIG instances).
+ */
+static void cuda_lock(HetGPUState *state)
 {
-    if (state->backend != HETGPU_BACKEND_SIMULATION &&
-        state->context && g_cuda_funcs.cuCtxPushCurrent) {
-        g_cuda_funcs.cuCtxPushCurrent(state->context);
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        return;
+    }
+    qemu_mutex_lock(&g_cuda_mutex);
+
+    if (state->context) {
+        /* Use cuCtxSetCurrent — does NOT grow the context stack */
+        if (g_cuda_funcs.cuCtxSetCurrent) {
+            int err = g_cuda_funcs.cuCtxSetCurrent(state->context);
+            if (err != 0) {
+                qemu_log("CXL hetGPU: cuCtxSetCurrent(%p) failed (%d), "
+                         "attempting context re-creation\n", state->context, err);
+                if (g_cuda_funcs.cuCtxCreate) {
+                    void *ctx = NULL;
+                    err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+                    if (err == 0 && ctx != NULL) {
+                        /* Pop the auto-pushed context from cuCtxCreate */
+                        if (g_cuda_funcs.cuCtxPopCurrent) {
+                            void *popped = NULL;
+                            g_cuda_funcs.cuCtxPopCurrent(&popped);
+                        }
+                        state->context = ctx;
+                        g_cuda_funcs.cuCtxSetCurrent(ctx);
+                        qemu_log("CXL hetGPU: Re-created CUDA context %p\n", ctx);
+                    }
+                }
+            }
+        } else if (g_cuda_funcs.cuCtxPushCurrent) {
+            /* Fallback to push if SetCurrent not available */
+            g_cuda_funcs.cuCtxPushCurrent(state->context);
+        }
+    } else if (!state->context && g_cuda_funcs.cuCtxCreate) {
+        /* No context stored (hetGPU managed mode) - create one */
+        void *ctx = NULL;
+        int err = g_cuda_funcs.cuCtxCreate(&ctx, 0, state->cuda_device);
+        if (err == 0 && ctx != NULL) {
+            /* Pop the auto-pushed context, use SetCurrent instead */
+            if (g_cuda_funcs.cuCtxPopCurrent) {
+                void *popped = NULL;
+                g_cuda_funcs.cuCtxPopCurrent(&popped);
+            }
+            state->context = ctx;
+            if (g_cuda_funcs.cuCtxSetCurrent) {
+                g_cuda_funcs.cuCtxSetCurrent(ctx);
+            }
+            qemu_log("CXL hetGPU: Created CUDA context on demand: %p\n", ctx);
+        }
     }
 }
+
+static void cuda_unlock(HetGPUState *state)
+{
+    if (state->backend == HETGPU_BACKEND_SIMULATION) {
+        return;
+    }
+    qemu_mutex_unlock(&g_cuda_mutex);
+}
+
 
 HetGPUError hetgpu_synchronize(HetGPUState *state)
 {
@@ -509,10 +588,11 @@ HetGPUError hetgpu_synchronize(HetGPUState *state)
     }
 
     /* For hetGPU managed mode (NULL context), still call synchronize */
-    ensure_cuda_context(state);
+    cuda_lock(state);
 
     if (g_cuda_funcs.cuCtxSynchronize) {
         int err = g_cuda_funcs.cuCtxSynchronize();
+        cuda_unlock(state);
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
@@ -524,6 +604,7 @@ HetGPUError hetgpu_synchronize(HetGPUState *state)
         return HETGPU_SUCCESS;
     }
 
+    cuda_unlock(state);
     return HETGPU_SUCCESS;
 }
 
@@ -540,23 +621,25 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
 
     /* For hetGPU managed mode (NULL context), still use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemAlloc && state->backend != HETGPU_BACKEND_SIMULATION) {
-        /* hetGPU manages context internally - push context if we have one */
-        ensure_cuda_context(state);
+        cuda_lock(state);
 
         uint64_t ptr = 0;
         int err = g_cuda_funcs.cuMemAlloc(&ptr, size);
+        cuda_unlock(state);
+
         if (err == 0) {
             *dev_ptr = ptr;
             state->allocated_memory += size;
-            qemu_log("CXL hetGPU: Allocated %zu bytes at device ptr 0x%lx\n",
-                     size, (unsigned long)ptr);
+            qemu_log("CXL hetGPU: [dev%d] Allocated %zu bytes at device ptr 0x%lx\n",
+                     state->device_index, size, (unsigned long)ptr);
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
             g_cuda_funcs.cuGetErrorName(err, &err_name);
         }
-        qemu_log("CXL hetGPU: cuMemAlloc(%zu) failed: %s (%d)\n", size, err_name, err);
+        qemu_log("CXL hetGPU: [dev%d] cuMemAlloc(%zu) failed: %s (%d)\n",
+                 state->device_index, size, err_name, err);
         return HETGPU_ERROR_OUT_OF_MEMORY;
     }
 
@@ -598,18 +681,19 @@ HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr)
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemFree && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         int err = g_cuda_funcs.cuMemFree(dev_ptr);
+        cuda_unlock(state);
+
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
                 g_cuda_funcs.cuGetErrorName(err, &err_name);
             }
-            qemu_log("CXL hetGPU: cuMemFree failed: %s (%d)\n", err_name, err);
+            qemu_log("CXL hetGPU: [dev%d] cuMemFree failed: %s (%d)\n",
+                     state->device_index, err_name, err);
             return HETGPU_ERROR_INVALID_VALUE;
         }
-        qemu_log("CXL hetGPU: Freed device ptr 0x%lx\n", (unsigned long)dev_ptr);
         return HETGPU_SUCCESS;
     }
 
@@ -649,19 +733,19 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemcpyHtoD && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         int err = g_cuda_funcs.cuMemcpyHtoD(dst, src, size);
+        cuda_unlock(state);
+
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
                 g_cuda_funcs.cuGetErrorName(err, &err_name);
             }
-            qemu_log("CXL hetGPU: cuMemcpyHtoD failed: %s (%d)\n", err_name, err);
+            qemu_log("CXL hetGPU: [dev%d] cuMemcpyHtoD failed: %s (%d)\n",
+                     state->device_index, err_name, err);
             return HETGPU_ERROR_INVALID_VALUE;
         }
-        // qemu_log("CXL hetGPU: memcpy HtoD 0x%lx <- %zu bytes\n",
-        //          (unsigned long)dst, size);
         return HETGPU_SUCCESS;
     }
 
@@ -696,19 +780,19 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemcpyDtoH && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         int err = g_cuda_funcs.cuMemcpyDtoH(dst, src, size);
+        cuda_unlock(state);
+
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
                 g_cuda_funcs.cuGetErrorName(err, &err_name);
             }
-            qemu_log("CXL hetGPU: cuMemcpyDtoH failed: %s (%d)\n", err_name, err);
+            qemu_log("CXL hetGPU: [dev%d] cuMemcpyDtoH failed: %s (%d)\n",
+                     state->device_index, err_name, err);
             return HETGPU_ERROR_INVALID_VALUE;
         }
-        qemu_log("CXL hetGPU: memcpy DtoH 0x%lx -> %zu bytes\n",
-                 (unsigned long)src, size);
         return HETGPU_SUCCESS;
     }
 
@@ -744,19 +828,19 @@ HetGPUError hetgpu_memcpy_dtod(HetGPUState *state, HetGPUDevicePtr dst,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemcpyDtoD && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         int err = g_cuda_funcs.cuMemcpyDtoD(dst, src, size);
+        cuda_unlock(state);
+
         if (err != 0) {
             const char *err_name = "UNKNOWN";
             if (g_cuda_funcs.cuGetErrorName) {
                 g_cuda_funcs.cuGetErrorName(err, &err_name);
             }
-            qemu_log("CXL hetGPU: cuMemcpyDtoD failed: %s (%d)\n", err_name, err);
+            qemu_log("CXL hetGPU: [dev%d] cuMemcpyDtoD failed: %s (%d)\n",
+                     state->device_index, err_name, err);
             return HETGPU_ERROR_INVALID_VALUE;
         }
-        qemu_log("CXL hetGPU: memcpy DtoD 0x%lx -> 0x%lx (%zu bytes)\n",
-                 (unsigned long)src, (unsigned long)dst, size);
         return HETGPU_SUCCESS;
     }
 
@@ -904,20 +988,23 @@ HetGPUError hetgpu_load_ptx(HetGPUState *state, const char *ptx_source,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuModuleLoadData && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         void *mod = NULL;
         int err = g_cuda_funcs.cuModuleLoadData(&mod, ptx_source);
+        cuda_unlock(state);
+
         if (err == 0) {
             *module = mod;
-            qemu_log("CXL hetGPU: Loaded PTX module %p\n", mod);
+            qemu_log("CXL hetGPU: [dev%d] Loaded PTX module %p\n",
+                     state->device_index, mod);
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
             g_cuda_funcs.cuGetErrorName(err, &err_name);
         }
-        qemu_log("CXL hetGPU: cuModuleLoadData failed: %s (%d)\n", err_name, err);
+        qemu_log("CXL hetGPU: [dev%d] cuModuleLoadData failed: %s (%d)\n",
+                 state->device_index, err_name, err);
         return HETGPU_ERROR_INVALID_PTX;
     }
 
@@ -940,20 +1027,23 @@ HetGPUError hetgpu_load_cubin(HetGPUState *state, const void *cubin_data,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuModuleLoadData && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         void *mod = NULL;
         int err = g_cuda_funcs.cuModuleLoadData(&mod, cubin_data);
+        cuda_unlock(state);
+
         if (err == 0) {
             *module = mod;
-            qemu_log("CXL hetGPU: Loaded CUBIN module %p\n", mod);
+            qemu_log("CXL hetGPU: [dev%d] Loaded CUBIN module %p\n",
+                     state->device_index, mod);
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
             g_cuda_funcs.cuGetErrorName(err, &err_name);
         }
-        qemu_log("CXL hetGPU: cuModuleLoadData (cubin) failed: %s (%d)\n", err_name, err);
+        qemu_log("CXL hetGPU: [dev%d] cuModuleLoadData (cubin) failed: %s (%d)\n",
+                 state->device_index, err_name, err);
         return HETGPU_ERROR_INVALID_PTX;
     }
 
@@ -981,21 +1071,23 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuModuleGetFunction && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
-
+        cuda_lock(state);
         void *func = NULL;
         int err = g_cuda_funcs.cuModuleGetFunction(&func, module, name);
+        cuda_unlock(state);
+
         if (err == 0) {
             *function = func;
-            qemu_log("CXL hetGPU: Got function '%s' -> %p\n", name, func);
+            qemu_log("CXL hetGPU: [dev%d] Got function '%s' -> %p\n",
+                     state->device_index, name, func);
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
             g_cuda_funcs.cuGetErrorName(err, &err_name);
         }
-        qemu_log("CXL hetGPU: cuModuleGetFunction('%s') failed: %s (%d)\n",
-                 name, err_name, err);
+        qemu_log("CXL hetGPU: [dev%d] cuModuleGetFunction('%s') failed: %s (%d)\n",
+                 state->device_index, name, err_name, err);
         return HETGPU_ERROR_UNKNOWN;
     }
 
@@ -1021,9 +1113,10 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
 
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuLaunchKernel && state->backend != HETGPU_BACKEND_SIMULATION) {
-        ensure_cuda_context(state);
+        cuda_lock(state);
 
-        qemu_log("CXL hetGPU: Launching kernel grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u\n",
+        qemu_log("CXL hetGPU: [dev%d] Launching kernel grid=(%u,%u,%u) block=(%u,%u,%u) shared=%u\n",
+                 state->device_index,
                  config->grid_dim[0], config->grid_dim[1], config->grid_dim[2],
                  config->block_dim[0], config->block_dim[1], config->block_dim[2],
                  config->shared_mem_bytes);
@@ -1034,15 +1127,17 @@ HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
             config->block_dim[0], config->block_dim[1], config->block_dim[2],
             config->shared_mem_bytes, config->stream,
             args, NULL);
+        cuda_unlock(state);
+
         if (err == 0) {
-            qemu_log("CXL hetGPU: Kernel launch successful\n");
             return HETGPU_SUCCESS;
         }
         const char *err_name = "UNKNOWN";
         if (g_cuda_funcs.cuGetErrorName) {
             g_cuda_funcs.cuGetErrorName(err, &err_name);
         }
-        qemu_log("CXL hetGPU: cuLaunchKernel failed: %s (%d)\n", err_name, err);
+        qemu_log("CXL hetGPU: [dev%d] cuLaunchKernel failed: %s (%d)\n",
+                 state->device_index, err_name, err);
         return HETGPU_ERROR_LAUNCH_FAILED;
     }
 

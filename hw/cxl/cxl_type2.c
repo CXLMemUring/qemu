@@ -1484,6 +1484,123 @@ static const MemoryRegionOps cxl_type2_device_mem_ops = {
 };
 
 /* ========================================================================
+ * Coherent Pool Allocator
+ * ======================================================================== */
+
+/* First-fit allocator from free list, page-aligned (4KB) */
+static int64_t cxl_coherent_pool_alloc(CXLType2State *ct2d, uint64_t size)
+{
+    uint64_t aligned_size = (size + 0xFFF) & ~0xFFFULL; /* 4KB page align */
+    CXLCohFreeBlock **prev = &ct2d->coherent_pool.free_list;
+    CXLCohFreeBlock *blk = ct2d->coherent_pool.free_list;
+
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+
+    while (blk) {
+        if (blk->size >= aligned_size) {
+            uint64_t alloc_offset = blk->offset;
+
+            if (blk->size == aligned_size) {
+                /* Exact fit - remove block */
+                *prev = blk->next;
+                g_free(blk);
+            } else {
+                /* Split block */
+                blk->offset += aligned_size;
+                blk->size -= aligned_size;
+            }
+
+            /* Track allocation */
+            uint64_t *key = g_new(uint64_t, 1);
+            uint64_t *val = g_new(uint64_t, 1);
+            *key = alloc_offset;
+            *val = aligned_size;
+            g_hash_table_insert(ct2d->coherent_pool.allocations, key, val);
+            ct2d->coherent_pool.used += aligned_size;
+
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+
+            qemu_log("CXL Type2: Coherent pool alloc: offset=0x%lx size=%lu\n",
+                     (unsigned long)alloc_offset, (unsigned long)aligned_size);
+            return (int64_t)alloc_offset;
+        }
+        prev = &blk->next;
+        blk = blk->next;
+    }
+
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+    qemu_log("CXL Type2: Coherent pool alloc FAILED: size=%lu (used=%lu/%lu)\n",
+             (unsigned long)size,
+             (unsigned long)ct2d->coherent_pool.used,
+             (unsigned long)ct2d->coherent_pool.size);
+    return -1;
+}
+
+/* Free allocation and coalesce with adjacent free blocks */
+static int cxl_coherent_pool_free(CXLType2State *ct2d, uint64_t offset)
+{
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+
+    uint64_t *alloc_size = g_hash_table_lookup(ct2d->coherent_pool.allocations,
+                                                &offset);
+    if (!alloc_size) {
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        qemu_log("CXL Type2: Coherent pool free FAILED: offset=0x%lx not found\n",
+                 (unsigned long)offset);
+        return -1;
+    }
+
+    uint64_t size = *alloc_size;
+    g_hash_table_remove(ct2d->coherent_pool.allocations, &offset);
+    ct2d->coherent_pool.used -= size;
+
+    /* Insert back into sorted free list with coalescing */
+    CXLCohFreeBlock *new_blk = g_new0(CXLCohFreeBlock, 1);
+    new_blk->offset = offset;
+    new_blk->size = size;
+    new_blk->next = NULL;
+
+    CXLCohFreeBlock **prev = &ct2d->coherent_pool.free_list;
+    CXLCohFreeBlock *cur = ct2d->coherent_pool.free_list;
+
+    /* Find insertion point (sorted by offset) */
+    while (cur && cur->offset < offset) {
+        prev = &cur->next;
+        cur = cur->next;
+    }
+
+    new_blk->next = cur;
+    *prev = new_blk;
+
+    /* Coalesce with next block */
+    if (new_blk->next && new_blk->offset + new_blk->size == new_blk->next->offset) {
+        CXLCohFreeBlock *merged = new_blk->next;
+        new_blk->size += merged->size;
+        new_blk->next = merged->next;
+        g_free(merged);
+    }
+
+    /* Coalesce with previous block */
+    if (prev != &ct2d->coherent_pool.free_list) {
+        CXLCohFreeBlock *prev_blk = ct2d->coherent_pool.free_list;
+        while (prev_blk && prev_blk->next != new_blk) {
+            prev_blk = prev_blk->next;
+        }
+        if (prev_blk && prev_blk->offset + prev_blk->size == new_blk->offset) {
+            prev_blk->size += new_blk->size;
+            prev_blk->next = new_blk->next;
+            g_free(new_blk);
+        }
+    }
+
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+
+    qemu_log("CXL Type2: Coherent pool free: offset=0x%lx size=%lu\n",
+             (unsigned long)offset, (unsigned long)size);
+    return 0;
+}
+
+/* ========================================================================
  * GPU Command Interface
  * ======================================================================== */
 
@@ -1494,7 +1611,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t dev_ptr;
     size_t size;
 
-    // fprintf(stderr, "CXL GPU: execute cmd 0x%x, hetgpu_init=%d\n", cmd, hetgpu->initialized);
+    fprintf(stderr, "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
+            cmd, hetgpu->initialized, hetgpu->context);
+    fflush(stderr);
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
@@ -2040,15 +2159,133 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    /* ---- Coherent shared memory pool commands ---- */
+    case CXL_GPU_CMD_COHERENT_ALLOC:
+        {
+            uint64_t alloc_size = ct2d->gpu_cmd.params[0];
+            int64_t offset = cxl_coherent_pool_alloc(ct2d, alloc_size);
+            if (offset >= 0) {
+                ct2d->gpu_cmd.results[0] = (uint64_t)offset;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_FREE:
+        {
+            uint64_t free_offset = ct2d->gpu_cmd.params[0];
+            if (cxl_coherent_pool_free(ct2d, free_offset) == 0) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_GET_INFO:
+        {
+            ct2d->gpu_cmd.results[0] = ct2d->coherent_pool.base_offset;
+            ct2d->gpu_cmd.results[1] = ct2d->coherent_pool.size;
+            ct2d->gpu_cmd.results[2] = ct2d->coherent_pool.size -
+                                        ct2d->coherent_pool.used;
+            ct2d->gpu_cmd.results[3] = ct2d->bar_coherency.snoop_filter_size;
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_FENCE:
+        {
+            /* Memory fence - ensure all pending coherency ops complete */
+            cxl_bar_memory_fence(&ct2d->bar_coherency, CXL_DOMAIN_CPU);
+            cxl_bar_process_back_invalidations(ct2d);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    /* ---- Device-biased directory commands ---- */
+    case CXL_GPU_CMD_SET_BIAS:
+        {
+            uint64_t bias_addr = ct2d->gpu_cmd.params[0];
+            uint64_t bias_size = ct2d->gpu_cmd.params[1];
+            uint8_t bias_mode = (uint8_t)ct2d->gpu_cmd.params[2];
+            if (bias_mode > CXL_BIAS_DEVICE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else {
+                cxl_bar_set_bias(&ct2d->bar_coherency, bias_addr, bias_size,
+                                 bias_mode);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_GET_BIAS:
+        {
+            uint64_t query_addr = ct2d->gpu_cmd.params[0];
+            ct2d->gpu_cmd.results[0] = cxl_bar_get_bias(&ct2d->bar_coherency,
+                                                          query_addr);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_BIAS_FLIP:
+        {
+            uint64_t flip_addr = ct2d->gpu_cmd.params[0];
+            uint64_t flip_size = ct2d->gpu_cmd.params[1];
+            uint8_t new_bias = (uint8_t)ct2d->gpu_cmd.params[2];
+            if (new_bias > CXL_BIAS_DEVICE) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else {
+                cxl_bar_bias_flip(ct2d, flip_addr, flip_size, new_bias);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            }
+        }
+        break;
+
+    /* ---- Coherency statistics commands ---- */
+    case CXL_GPU_CMD_COH_GET_STATS:
+        {
+            CXLBARCoherencyState *coh = &ct2d->bar_coherency;
+            /* Pack stats into results and data buffer */
+            ct2d->gpu_cmd.results[0] = coh->stats.snoop_hits;
+            ct2d->gpu_cmd.results[1] = coh->stats.snoop_misses;
+            ct2d->gpu_cmd.results[2] = coh->stats.coherency_requests;
+            ct2d->gpu_cmd.results[3] = coh->stats.back_invalidations;
+            /* Extended stats in data buffer */
+            if (ct2d->gpu_cmd.data_size >= 64) {
+                uint64_t *stats_buf = (uint64_t *)ct2d->gpu_cmd.data;
+                stats_buf[0] = coh->stats.writebacks;
+                stats_buf[1] = coh->stats.evictions;
+                stats_buf[2] = coh->stats.bias_flips;
+                stats_buf[3] = coh->stats.device_bias_hits;
+                stats_buf[4] = coh->stats.host_bias_hits;
+                stats_buf[5] = coh->stats.upgrades;
+                stats_buf[6] = coh->stats.downgrades;
+                stats_buf[7] = coh->snoop_filter_size;
+            }
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_COH_RESET_STATS:
+        {
+            memset(&ct2d->bar_coherency.stats, 0,
+                   sizeof(ct2d->bar_coherency.stats));
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
     default:
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
         break;
     }
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
-    // fprintf(stderr, "CXL GPU: cmd done, status=%u result=%u results[0]=0x%lx\n",
-    //         ct2d->gpu_cmd.cmd_status, ct2d->gpu_cmd.cmd_result,
-            // (unsigned long)ct2d->gpu_cmd.results[0]);
+    fprintf(stderr, "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
+            cmd, ct2d->gpu_cmd.cmd_result,
+            (unsigned long)ct2d->gpu_cmd.results[0]);
+    fflush(stderr);
 }
 
 static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
@@ -2127,6 +2364,23 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
     case CXL_GPU_REG_BACKEND:
         value = hetgpu->backend;
         break;
+    /* Coherent pool registers */
+    case CXL_GPU_REG_COH_POOL_BASE:
+        value = ct2d->coherent_pool.base_offset;
+        break;
+    case CXL_GPU_REG_COH_POOL_SIZE:
+        value = ct2d->coherent_pool.size;
+        break;
+    case CXL_GPU_REG_COH_POOL_FREE:
+        value = ct2d->coherent_pool.size - ct2d->coherent_pool.used;
+        break;
+    case CXL_GPU_REG_COH_DIR_SIZE:
+        value = ct2d->bar_coherency.snoop_filter_capacity;
+        break;
+    case CXL_GPU_REG_COH_DIR_USED:
+        value = ct2d->bar_coherency.snoop_filter_size;
+        break;
+
     default:
         /* Data region */
         if (addr >= CXL_GPU_DATA_OFFSET &&
@@ -2395,7 +2649,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Initialize GPU command state (handled directly in cache_read/write) */
     memset(&ct2d->gpu_cmd, 0, sizeof(ct2d->gpu_cmd));
-    ct2d->gpu_cmd.status = CXL_GPU_STATUS_READY;
+    /* NOTE: Do NOT set CXL_GPU_STATUS_READY here - it will be set dynamically
+     * in the register read handler based on hetgpu->initialized.
+     * Setting it here unconditionally would make cuInit succeed even when
+     * the GPU backend failed to initialize. */
+    ct2d->gpu_cmd.status = 0;
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_IDLE;
 
     /* Allocate larger data buffer for optimized transfers (1MB) */
@@ -2408,7 +2666,33 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Set capabilities */
     ct2d->gpu_cmd.capabilities = CXL_GPU_CAP_BULK_TRANSFER |
-                                 CXL_GPU_CAP_CACHE_COHERENT;
+                                 CXL_GPU_CAP_CACHE_COHERENT |
+                                 CXL_GPU_CAP_COHERENT_POOL |
+                                 CXL_GPU_CAP_DEVICE_BIAS;
+
+    /* Initialize coherent shared memory pool at top of BAR4 */
+    {
+        uint64_t coh_pool_size = 256 * MiB; /* Default 256MB */
+        if (coh_pool_size > ct2d->device_mem_size / 2) {
+            coh_pool_size = ct2d->device_mem_size / 4;
+        }
+        ct2d->coherent_pool.size = coh_pool_size;
+        ct2d->coherent_pool.base_offset = ct2d->device_mem_size - coh_pool_size;
+        ct2d->coherent_pool.used = 0;
+        ct2d->coherent_pool.allocations = g_hash_table_new(g_int64_hash,
+                                                            g_int64_equal);
+        /* Initialize free list with single block spanning the whole pool */
+        CXLCohFreeBlock *initial = g_new0(CXLCohFreeBlock, 1);
+        initial->offset = ct2d->coherent_pool.base_offset;
+        initial->size = coh_pool_size;
+        initial->next = NULL;
+        ct2d->coherent_pool.free_list = initial;
+        qemu_mutex_init(&ct2d->coherent_pool.lock);
+
+        qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx size=%lu MB\n",
+                 (unsigned long)ct2d->coherent_pool.base_offset,
+                 (unsigned long)(coh_pool_size / MiB));
+    }
 
     qemu_log("CXL Type2: GPU command interface enabled at BAR2 offset 0\n");
     qemu_log("CXL Type2: Data buffer size: %zu KB (optimized for large transfers)\n",
@@ -2461,6 +2745,22 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 
     /* Cleanup P2P DMA engine */
     cxl_p2p_dma_cleanup(&ct2d->p2p_engine);
+
+    /* Cleanup coherent pool */
+    if (ct2d->coherent_pool.allocations) {
+        g_hash_table_destroy(ct2d->coherent_pool.allocations);
+        ct2d->coherent_pool.allocations = NULL;
+    }
+    {
+        CXLCohFreeBlock *blk = ct2d->coherent_pool.free_list;
+        while (blk) {
+            CXLCohFreeBlock *next = blk->next;
+            g_free(blk);
+            blk = next;
+        }
+        ct2d->coherent_pool.free_list = NULL;
+    }
+    qemu_mutex_destroy(&ct2d->coherent_pool.lock);
 
     /* Free GPU command data buffer */
     if (ct2d->gpu_cmd.data) {
