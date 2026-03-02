@@ -1611,9 +1611,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     uint64_t dev_ptr;
     size_t size;
 
-    fprintf(stderr, "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
-            cmd, hetgpu->initialized, hetgpu->context);
-    fflush(stderr);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
+                  cmd, hetgpu->initialized, hetgpu->context);
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
@@ -2282,10 +2282,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     }
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
-    fprintf(stderr, "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
-            cmd, ct2d->gpu_cmd.cmd_result,
-            (unsigned long)ct2d->gpu_cmd.results[0]);
-    fflush(stderr);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
+                  cmd, ct2d->gpu_cmd.cmd_result,
+                  (unsigned long)ct2d->gpu_cmd.results[0]);
 }
 
 static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
