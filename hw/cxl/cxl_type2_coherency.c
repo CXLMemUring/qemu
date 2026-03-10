@@ -352,6 +352,16 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             entry->domain_mask |= (1 << source);
             response = CXL_COH_RSP_S;
         }
+        /* Track bias hits */
+        if (entry) {
+            if (entry->bias_mode == CXL_BIAS_MODE_DEVICE &&
+                source == CXL_DOMAIN_GPU) {
+                state->stats.device_bias_hits++;
+            } else if (entry->bias_mode == CXL_BIAS_MODE_HOST &&
+                       source == CXL_DOMAIN_CPU) {
+                state->stats.host_bias_hits++;
+            }
+        }
         break;
 
     case CXL_COH_REQ_RD_OWN:
@@ -359,21 +369,36 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             /* Cache miss - allocate exclusive */
             response = CXL_COH_RSP_E;
             cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_EXCLUSIVE, source);
-        } else if (entry->owner_domain != source) {
-            /* Need to invalidate other copies */
-            state->stats.back_invalidations++;
-            if (entry->state == CXL_COHERENCY_MODIFIED) {
-                state->stats.writebacks++;
-            }
-            entry->state = CXL_COHERENCY_EXCLUSIVE;
-            entry->domain_mask = (1 << source);
-            entry->owner_domain = source;
-            response = CXL_COH_RSP_E;
         } else {
-            /* Already owner - upgrade to exclusive if needed */
-            entry->state = CXL_COHERENCY_EXCLUSIVE;
-            entry->domain_mask = (1 << source);
-            response = CXL_COH_RSP_E;
+            /* Check bias mode for fast path */
+            if (entry->bias_mode == CXL_BIAS_MODE_DEVICE &&
+                source == CXL_DOMAIN_GPU) {
+                /* Device-biased: GPU gets fast exclusive access */
+                entry->state = CXL_COHERENCY_EXCLUSIVE;
+                entry->domain_mask = (1 << source);
+                entry->owner_domain = source;
+                state->stats.device_bias_hits++;
+                response = CXL_COH_RSP_E;
+            } else if (entry->owner_domain != source) {
+                /* Need to invalidate other copies */
+                state->stats.back_invalidations++;
+                if (entry->state == CXL_COHERENCY_MODIFIED) {
+                    state->stats.writebacks++;
+                }
+                entry->state = CXL_COHERENCY_EXCLUSIVE;
+                entry->domain_mask = (1 << source);
+                entry->owner_domain = source;
+                response = CXL_COH_RSP_E;
+            } else {
+                /* Already owner - upgrade to exclusive if needed */
+                entry->state = CXL_COHERENCY_EXCLUSIVE;
+                entry->domain_mask = (1 << source);
+                response = CXL_COH_RSP_E;
+            }
+            if (entry->bias_mode == CXL_BIAS_MODE_HOST &&
+                source == CXL_DOMAIN_CPU) {
+                state->stats.host_bias_hits++;
+            }
         }
         break;
 
@@ -755,6 +780,108 @@ void cxl_bar_cache_writeback(CXLBARCoherencyState *state,
 }
 
 /* ========================================================================
+ * Bias Mode Control
+ * ======================================================================== */
+
+void cxl_bar_set_bias(CXLBARCoherencyState *state,
+                      uint64_t addr, uint64_t size, uint8_t bias_mode)
+{
+    uint64_t aligned_start = addr & CXL_CACHE_LINE_MASK;
+    uint64_t aligned_end = (addr + size + CXL_CACHE_LINE_SIZE - 1) &
+                           CXL_CACHE_LINE_MASK;
+
+    qemu_mutex_lock(&state->lock);
+
+    for (uint64_t a = aligned_start; a < aligned_end; a += CXL_CACHE_LINE_SIZE) {
+        CXLSnoopEntry *entry = g_hash_table_lookup(state->snoop_filter, &a);
+        if (entry) {
+            entry->bias_mode = bias_mode;
+        } else {
+            /* Create entry with the bias setting */
+            uint64_t *key = g_new(uint64_t, 1);
+            CXLSnoopEntry *new_entry = g_new0(CXLSnoopEntry, 1);
+            *key = a;
+            new_entry->addr = a;
+            new_entry->state = CXL_COHERENCY_INVALID;
+            new_entry->bias_mode = bias_mode;
+            new_entry->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            g_hash_table_insert(state->snoop_filter, key, new_entry);
+            state->snoop_filter_size++;
+        }
+    }
+
+    qemu_mutex_unlock(&state->lock);
+
+    qemu_log_mask(LOG_TRACE,
+                 "CXL BAR Bias: Set 0x%lx-0x%lx to %s\n",
+                 (unsigned long)aligned_start, (unsigned long)aligned_end,
+                 bias_mode == CXL_BIAS_MODE_DEVICE ? "device" : "host");
+}
+
+uint8_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr)
+{
+    uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
+    uint8_t bias = CXL_BIAS_MODE_HOST; /* Default to host-biased */
+
+    qemu_mutex_lock(&state->lock);
+
+    CXLSnoopEntry *entry = g_hash_table_lookup(state->snoop_filter,
+                                                &aligned_addr);
+    if (entry) {
+        bias = entry->bias_mode;
+    }
+
+    qemu_mutex_unlock(&state->lock);
+    return bias;
+}
+
+void cxl_bar_bias_flip(CXLType2State *ct2d,
+                       uint64_t addr, uint64_t size, uint8_t new_bias)
+{
+    CXLBARCoherencyState *state = &ct2d->bar_coherency;
+    uint64_t aligned_start = addr & CXL_CACHE_LINE_MASK;
+    uint64_t aligned_end = (addr + size + CXL_CACHE_LINE_SIZE - 1) &
+                           CXL_CACHE_LINE_MASK;
+
+    /* Step 1: Flush old home domain caches */
+    if (new_bias == CXL_BIAS_MODE_DEVICE) {
+        /* Switching to device-bias: flush CPU caches for this range */
+        cxl_bar_cache_flush(state, addr, size);
+        /* Invalidate CPU entries so device becomes home */
+        for (uint64_t a = aligned_start; a < aligned_end;
+             a += CXL_CACHE_LINE_SIZE) {
+            cxl_bar_coherency_request(state, CXL_COH_REQ_CLR_DEV_CACHE,
+                                      a, CXL_CACHE_LINE_SIZE,
+                                      CXL_DOMAIN_CPU, NULL);
+        }
+    } else {
+        /* Switching to host-bias: flush GPU caches for this range */
+        for (uint64_t a = aligned_start; a < aligned_end;
+             a += CXL_CACHE_LINE_SIZE) {
+            cxl_bar_coherency_request(state, CXL_COH_REQ_CLR_DEV_CACHE,
+                                      a, CXL_CACHE_LINE_SIZE,
+                                      CXL_DOMAIN_GPU, NULL);
+        }
+    }
+
+    /* Step 2: Set the new bias mode */
+    cxl_bar_set_bias(state, addr, size, new_bias);
+
+    /* Step 3: Update statistics */
+    qemu_mutex_lock(&state->lock);
+    state->stats.bias_flips++;
+    qemu_mutex_unlock(&state->lock);
+
+    /* Step 4: Memory fence to ensure ordering */
+    __sync_synchronize();
+
+    qemu_log("CXL BAR Bias: Flip 0x%lx-0x%lx to %s (total flips: %lu)\n",
+             (unsigned long)aligned_start, (unsigned long)aligned_end,
+             new_bias == CXL_BIAS_MODE_DEVICE ? "device" : "host",
+             (unsigned long)state->stats.bias_flips);
+}
+
+/* ========================================================================
  * Atomic Operations
  * ======================================================================== */
 
@@ -867,6 +994,9 @@ void cxl_bar_coherency_dump_stats(CXLBARCoherencyState *state)
              state->stats.upgrades, state->stats.downgrades);
     qemu_log("  CPU->GPU Transfers: %lu, GPU->CPU: %lu\n",
              state->stats.cpu_to_gpu_xfers, state->stats.gpu_to_cpu_xfers);
+    qemu_log("  Bias Flips: %lu, Device-Bias Hits: %lu, Host-Bias Hits: %lu\n",
+             state->stats.bias_flips, state->stats.device_bias_hits,
+             state->stats.host_bias_hits);
 
     /* Per-region statistics */
     for (uint32_t i = 0; i < CXL_MAX_TRACKED_REGIONS; i++) {

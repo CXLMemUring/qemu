@@ -101,6 +101,13 @@ typedef struct CXLType2MemSimConn {
     char *shm_name;
 } CXLType2MemSimConn;
 
+/* Free block for coherent pool allocator */
+typedef struct CXLCohFreeBlock {
+    uint64_t offset;            /* Offset within BAR4 */
+    uint64_t size;
+    struct CXLCohFreeBlock *next;
+} CXLCohFreeBlock;
+
 /* Main Type 2 device state */
 typedef struct CXLType2State {
     PCIDevice parent_obj;
@@ -161,6 +168,16 @@ typedef struct CXLType2State {
 
     /* Memory backend for device memory */
     HostMemoryBackend *hostmem;
+
+    /* Coherent shared memory pool (carved from top of BAR4) */
+    struct {
+        uint64_t base_offset;       /* device_mem_size - pool_size */
+        uint64_t size;              /* Configurable, default 256MB */
+        uint64_t used;
+        GHashTable *allocations;    /* bar4_offset -> alloc_size */
+        struct CXLCohFreeBlock *free_list;
+        QemuMutex lock;
+    } coherent_pool;
 
     /* Statistics and monitoring */
     struct {

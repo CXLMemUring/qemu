@@ -61,6 +61,8 @@
 #define CXL_GPU_CAP_BULK_TRANSFER   (1 << 0)  /* Supports bulk transfer mode */
 #define CXL_GPU_CAP_CACHE_COHERENT  (1 << 1)  /* CXL.cache coherent memory */
 #define CXL_GPU_CAP_DMA_ENGINE      (1 << 2)  /* Hardware DMA engine available */
+#define CXL_GPU_CAP_COHERENT_POOL   (1 << 3)  /* Coherent shared memory pool */
+#define CXL_GPU_CAP_DEVICE_BIAS     (1 << 4)  /* Device-biased directory mode */
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
@@ -125,7 +127,37 @@ typedef enum {
     CXL_GPU_CMD_CACHE_FLUSH     = 0x80,  /* Flush cache lines to device */
     CXL_GPU_CMD_CACHE_INVALIDATE= 0x81,  /* Invalidate cache lines */
     CXL_GPU_CMD_CACHE_WRITEBACK = 0x82,  /* Writeback dirty cache lines */
+
+    /* P2P DMA commands: defined as macros in cxl_p2p_dma.h (0x90-0x96) */
+
+    /* Coherent shared memory pool commands */
+    CXL_GPU_CMD_COHERENT_ALLOC      = 0xA0,  /* Allocate from coherent pool */
+    CXL_GPU_CMD_COHERENT_FREE       = 0xA1,  /* Free coherent pool allocation */
+    CXL_GPU_CMD_COHERENT_GET_INFO   = 0xA2,  /* Get coherent pool info */
+    CXL_GPU_CMD_COHERENT_FENCE      = 0xA3,  /* Coherent memory fence */
+
+    /* Device-biased directory commands */
+    CXL_GPU_CMD_SET_BIAS            = 0xA4,  /* Set bias mode for region */
+    CXL_GPU_CMD_GET_BIAS            = 0xA5,  /* Get bias mode for address */
+    CXL_GPU_CMD_BIAS_FLIP           = 0xA6,  /* Flip bias with cache flush */
+
+    /* Coherency statistics commands */
+    CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */
+    CXL_GPU_CMD_COH_RESET_STATS     = 0xB1,  /* Reset coherency statistics */
 } CXLGPUCommand;
+
+/* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
+
+/* Coherent pool register offsets (in GPU command region) */
+#define CXL_GPU_REG_COH_POOL_BASE   0x0300  /* Coherent pool base offset */
+#define CXL_GPU_REG_COH_POOL_SIZE   0x0308  /* Coherent pool total size */
+#define CXL_GPU_REG_COH_POOL_FREE   0x0310  /* Coherent pool free space */
+#define CXL_GPU_REG_COH_DIR_SIZE    0x0318  /* Directory size (entries) */
+#define CXL_GPU_REG_COH_DIR_USED    0x0320  /* Directory used entries */
+
+/* Bias mode constants */
+#define CXL_BIAS_HOST               0       /* Host-biased: CPU is coherence home */
+#define CXL_BIAS_DEVICE             1       /* Device-biased: GPU snoop filter is home */
 
 /* Error codes (matching CUDA error codes) */
 typedef enum {

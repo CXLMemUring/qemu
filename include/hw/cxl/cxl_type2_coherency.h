@@ -50,12 +50,17 @@ typedef enum {
     CXL_COH_RSP_F = 6,       /* Forward - forwarding data */
 } CXLCoherencyRspType;
 
+/* Bias mode constants */
+#define CXL_BIAS_MODE_HOST      0   /* Host-biased: CPU is coherence home */
+#define CXL_BIAS_MODE_DEVICE    1   /* Device-biased: GPU snoop filter is home */
+
 /* Snoop filter entry */
 typedef struct CXLSnoopEntry {
     uint64_t addr;              /* Cache line address */
     uint8_t state;              /* Coherency state (CXLCoherencyState) */
     uint8_t domain_mask;        /* Bitmask of domains holding this line */
     uint8_t owner_domain;       /* Domain that owns exclusive/modified copy */
+    uint8_t bias_mode;          /* CXL_BIAS_MODE_HOST or CXL_BIAS_MODE_DEVICE */
     uint8_t flags;
     #define CXL_SNOOP_FLAG_DIRTY    (1 << 0)
     #define CXL_SNOOP_FLAG_PENDING  (1 << 1)
@@ -73,6 +78,8 @@ typedef struct CXLBARCoherencyRegion {
     bool gpu_accessible;        /* GPU can access this region */
     bool cpu_accessible;        /* CPU can access this region */
     bool coherent;              /* Region maintains coherency */
+
+    uint8_t default_bias;       /* Default bias mode for this region */
 
     /* Per-region statistics */
     uint64_t cpu_reads;
@@ -144,6 +151,9 @@ typedef struct CXLBARCoherencyState {
         uint64_t downgrades;      /* Exclusive/Modified -> Shared/Invalid */
         uint64_t cpu_to_gpu_xfers;
         uint64_t gpu_to_cpu_xfers;
+        uint64_t bias_flips;
+        uint64_t device_bias_hits;
+        uint64_t host_bias_hits;
     } stats;
 
 } CXLBARCoherencyState;
@@ -216,6 +226,13 @@ void cxl_bar_cache_writeback(CXLBARCoherencyState *state,
 
 /* Statistics */
 void cxl_bar_coherency_dump_stats(CXLBARCoherencyState *state);
+
+/* Bias mode control */
+void cxl_bar_set_bias(CXLBARCoherencyState *state,
+                      uint64_t addr, uint64_t size, uint8_t bias_mode);
+uint8_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr);
+void cxl_bar_bias_flip(struct CXLType2State *ct2d,
+                       uint64_t addr, uint64_t size, uint8_t new_bias);
 
 /* Atomic operation support */
 typedef enum {
