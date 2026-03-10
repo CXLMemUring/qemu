@@ -1438,6 +1438,8 @@ static void cxl_memsim_inject_latency(uint64_t call_start_ns,
     g_memsim.stats_injected_ns += remaining_ns;
     g_memsim.stats_inject_count++;
 }
+/* Forward declaration - defined after init */
+static int cxl_memsim_connect_locked(void);
 
 static void cxl_memsim_init(void) {
     /* Use double-checked locking for thread safety */
@@ -1541,7 +1543,17 @@ static void cxl_memsim_init(void) {
         info_report("CXL Type3: Active latency injection disabled "
                     "(set CXL_LATENCY_INJECT=1 to enable)");
     }
-
+    /* Eagerly establish the connection during init.
+     * cxl_type3_read/write gate on (enabled && connected), so if we
+     * defer connection to cxl_memsim_request_ext() the gate is never
+     * entered and the connection is never attempted.  Connect now. */
+    if (g_memsim.enabled && !g_memsim.connected) {
+        info_report("CXL Type3: Establishing connection during init...");
+        if (cxl_memsim_connect_locked() < 0) {
+            error_report("CXL Type3: Connection failed during init "
+                         "(will retry on first memory access)");
+        }
+    }
     pthread_mutex_unlock(&g_memsim.lock);
 }
 
