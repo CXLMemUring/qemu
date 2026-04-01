@@ -126,6 +126,17 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
     state->backend = backend;
     state->device_index = device_index;
 
+    /* Simulation backend: skip all library loading, init directly */
+    if (backend == HETGPU_BACKEND_SIMULATION) {
+        state->initialized = true;
+        state->context = NULL;  /* hetgpu_create_context sets 0xDEADBEEF */
+        state->props = default_props;
+        state->max_memory = default_props.total_memory;
+        state->sim_next_ptr = 0x100000;  /* Start simulation ptrs at 1MB */
+        qemu_log("CXL hetGPU: Simulation backend for device %d\n", device_index);
+        return HETGPU_SUCCESS;
+    }
+
     /* Try to load hetGPU library (only once for all devices) */
     const char *lib_path = hetgpu_lib_path;
     if (!lib_path || lib_path[0] == '\0') {

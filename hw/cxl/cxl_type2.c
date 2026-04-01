@@ -1395,19 +1395,47 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
         }
     }
 
-    qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
-                 addr, value);
+    // qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
+    //              addr, value);
 }
 
 static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
-    /* Forward all device memory reads through the cache coherency layer */
+    CXLType2State *ct2d = opaque;
+    uint64_t value = 0;
+
+    /* Fast path: bulk staging region and coherent pool bypass coherency.
+     * These regions are used for direct CPU<->GPU pointer sharing
+     * and high-throughput data staging — coherency is tracked in commands. */
+    if (addr < ct2d->bulk_transfer_size ||
+        addr >= ct2d->coherent_pool.base_offset) {
+        uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (mem && addr + size <= ct2d->device_mem_size) {
+            memcpy(&value, mem + addr, MIN(size, 8));
+        }
+        return value;
+    }
+
+    /* Slow path: full coherency tracking for normal device memory */
     return cxl_type2_cache_read(opaque, addr, size);
 }
 
-static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+static void cxl_type2_device_mem_write(void *opaque, hwaddr addr,
+                                        uint64_t value, unsigned size)
 {
-    /* Forward all device memory writes through the cache coherency layer */
+    CXLType2State *ct2d = opaque;
+
+    /* Fast path: bulk staging region and coherent pool bypass coherency */
+    if (addr < ct2d->bulk_transfer_size ||
+        addr >= ct2d->coherent_pool.base_offset) {
+        uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (mem && addr + size <= ct2d->device_mem_size) {
+            memcpy(mem + addr, &value, MIN(size, 8));
+        }
+        return;
+    }
+
+    /* Slow path: full coherency tracking for normal device memory */
     cxl_type2_cache_write(opaque, addr, value, size);
 }
 
@@ -1820,7 +1848,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                   (HetGPUModule *)&module);
             if (err == HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.modules[ct2d->gpu_cmd.num_modules] = module;
-                ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules;
+                /* Return 1-based ID so guest handles are never NULL-looking */
+                ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_modules + 1;
                 ct2d->gpu_cmd.num_modules++;
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_PTX;
@@ -1832,7 +1861,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_FUNC_GET:
         if (hetgpu->initialized && ct2d->gpu_cmd.num_functions < 256) {
-            uint32_t module_id = ct2d->gpu_cmd.params[0];
+            /* Guest sends 1-based module ID */
+            uint32_t module_id_1based = ct2d->gpu_cmd.params[0];
+            uint32_t module_id = module_id_1based - 1;
             /* Function name is in data buffer */
             if (module_id < ct2d->gpu_cmd.num_modules) {
                 void *func = NULL;
@@ -1842,7 +1873,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                           (HetGPUFunction *)&func);
                 if (err == HETGPU_SUCCESS) {
                     ct2d->gpu_cmd.functions[ct2d->gpu_cmd.num_functions] = func;
-                    ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions;
+                    /* Return 1-based ID */
+                    ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions + 1;
                     ct2d->gpu_cmd.num_functions++;
                 } else {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_FOUND;
@@ -1857,7 +1889,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_LAUNCH_KERNEL:
         if (hetgpu->initialized) {
-            uint32_t func_id = ct2d->gpu_cmd.params[0];
+            /* Guest sends 1-based function ID */
+            uint32_t func_id = ct2d->gpu_cmd.params[0] - 1;
             if (func_id < ct2d->gpu_cmd.num_functions) {
                 HetGPULaunchConfig config;
                 config.grid_dim[0] = ct2d->gpu_cmd.params[1] & 0xFFFFFFFF;
@@ -1889,23 +1922,20 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     /* Bulk transfer commands - optimized for large memory operations */
     case CXL_GPU_CMD_BULK_HTOD:
-        /* Bulk host-to-device transfer using BAR4 region */
+        /* Bulk host-to-device transfer via BAR4 staging RAM */
         {
-            uint64_t bar4_offset = ct2d->gpu_cmd.params[0];  /* Offset in BAR4 */
+            uint64_t bar4_offset = ct2d->gpu_cmd.params[0];  /* Offset in staging */
             uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[1];  /* Device destination */
             size_t xfer_size = ct2d->gpu_cmd.params[2];       /* Transfer size */
 
-            if (xfer_size > CXL_GPU_BULK_TRANSFER_SIZE) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-                break;
-            }
-
             if (hetgpu->initialized) {
-                /* Get data from device memory region (BAR4/HDM) */
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size) {
+                /* Guest wrote data into the bulk staging RAM subregion
+                 * (priority 2 window, no vmexits).  Read from staging ptr. */
+                if (ct2d->bulk_transfer_ptr &&
+                    bar4_offset + xfer_size <= ct2d->bulk_transfer_size) {
                     err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr,
-                                             mem + bar4_offset, xfer_size);
+                                             (uint8_t *)ct2d->bulk_transfer_ptr + bar4_offset,
+                                             xfer_size);
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                     }
@@ -1919,22 +1949,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_BULK_DTOH:
-        /* Bulk device-to-host transfer using BAR4 region */
+        /* Bulk device-to-host transfer via BAR4 staging RAM */
         {
             uint64_t src_dev_ptr = ct2d->gpu_cmd.params[0];   /* Device source */
-            uint64_t bar4_offset = ct2d->gpu_cmd.params[1];   /* Offset in BAR4 */
+            uint64_t bar4_offset = ct2d->gpu_cmd.params[1];   /* Offset in staging */
             size_t xfer_size = ct2d->gpu_cmd.params[2];        /* Transfer size */
 
-            if (xfer_size > CXL_GPU_BULK_TRANSFER_SIZE) {
-                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-                break;
-            }
-
             if (hetgpu->initialized) {
-                /* Write data to device memory region (BAR4/HDM) */
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size) {
-                    err = hetgpu_memcpy_dtoh(hetgpu, mem + bar4_offset,
+                /* Write data into the bulk staging RAM subregion
+                 * (priority 2 window).  Guest reads directly, no vmexits. */
+                if (ct2d->bulk_transfer_ptr &&
+                    bar4_offset + xfer_size <= ct2d->bulk_transfer_size) {
+                    err = hetgpu_memcpy_dtoh(hetgpu,
+                                             (uint8_t *)ct2d->bulk_transfer_ptr + bar4_offset,
                                              src_dev_ptr, xfer_size);
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -2627,11 +2654,32 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
+    /* I/O overlay for per-access coherency tracking on BAR4.
+     * The device_mem_read/write handlers fast-path the bulk staging region
+     * (offset 0..64MB) and coherent pool (top of BAR4) to avoid coherency
+     * overhead on high-throughput regions. Normal device memory goes through
+     * full cache coherency tracking. */
     memory_region_init_io(&ct2d->device_mem_io, OBJECT(ct2d),
                          &cxl_type2_device_mem_ops, ct2d,
                          "cxl-type2-device-mem-io", ct2d->device_mem_size);
+    memory_region_add_subregion_overlap(&ct2d->device_mem, 0,
+                                        &ct2d->device_mem_io, 1);
 
-    memory_region_add_subregion_overlap(&ct2d->device_mem, 0, &ct2d->device_mem_io, 1);
+    ct2d->bulk_transfer_size = MIN(CXL_GPU_BULK_TRANSFER_SIZE, ct2d->device_mem_size);
+
+    /* Add bulk staging RAM subregion at priority 2 to physically bypass the
+     * I/O overlay (priority 1).  Guest writes here go directly to RAM without
+     * causing KVM vmexits, making large memcpy-to-BAR4 feasible. */
+    memory_region_init_ram(&ct2d->bulk_transfer_region, OBJECT(ct2d),
+                           "cxl-type2-bulk-staging",
+                           ct2d->bulk_transfer_size, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+    ct2d->bulk_transfer_ptr = memory_region_get_ram_ptr(&ct2d->bulk_transfer_region);
+    memory_region_add_subregion_overlap(&ct2d->device_mem, 0,
+                                        &ct2d->bulk_transfer_region, 2);
 
     pci_register_bar(pci_dev, 4,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -2689,7 +2737,22 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         ct2d->coherent_pool.free_list = initial;
         qemu_mutex_init(&ct2d->coherent_pool.lock);
 
-        qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx size=%lu MB\n",
+        /* Add coherent pool RAM subregion at priority 2 to physically bypass
+         * the I/O overlay.  Guest pointer-sharing and coherent alloc/free
+         * go directly to RAM without KVM vmexits. */
+        memory_region_init_ram(&ct2d->coherent_pool_region, OBJECT(ct2d),
+                               "cxl-type2-coh-pool-ram",
+                               coh_pool_size, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
+        memory_region_add_subregion_overlap(&ct2d->device_mem,
+                                            ct2d->coherent_pool.base_offset,
+                                            &ct2d->coherent_pool_region, 2);
+
+        qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx size=%lu MB"
+                 " (RAM bypass at priority 2)\n",
                  (unsigned long)ct2d->coherent_pool.base_offset,
                  (unsigned long)(coh_pool_size / MiB));
     }
@@ -2768,11 +2831,10 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         ct2d->gpu_cmd.data = NULL;
     }
 
-    /* Free bulk transfer region if allocated */
-    if (ct2d->bulk_transfer_ptr) {
-        g_free(ct2d->bulk_transfer_ptr);
-        ct2d->bulk_transfer_ptr = NULL;
-    }
+    /* Bulk staging and coherent pool RAM subregions are cleaned up
+     * automatically when the parent device_mem region is destroyed.
+     * bulk_transfer_ptr is managed by QEMU's memory subsystem, not g_malloc. */
+    ct2d->bulk_transfer_ptr = NULL;
 
     qemu_log("CXL Type2: Device exit complete\n");
 }
