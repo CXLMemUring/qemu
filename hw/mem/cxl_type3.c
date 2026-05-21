@@ -1217,6 +1217,12 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 #define CXL_OP_FENCE        5   /* Memory fence */
 #define CXL_OP_LSA_READ     6   /* Label Storage Area read */
 #define CXL_OP_LSA_WRITE    7   /* Label Storage Area write */
+#define CXL_OP_DCD_ADD      8   /* Dynamic capacity add */
+#define CXL_OP_DCD_RELEASE  9   /* Dynamic capacity release */
+#define CXL_OP_DCD_QUERY    10  /* Dynamic capacity statistics */
+#define CXL_OP_GFAM_MAP     11  /* Grant GFAM host access */
+#define CXL_OP_GFAM_UNMAP   12  /* Revoke GFAM host access */
+#define CXL_OP_GFAM_QUERY   13  /* GFAM statistics */
 
 /* LSA address offset - distinguishes LSA from regular memory */
 #define CXL_LSA_ADDR_OFFSET 0xFFFF000000000000ULL
@@ -1260,6 +1266,12 @@ typedef struct __attribute__((packed)) {
 #define CXL_SHM_REQ_WRITE_META    7   /* Write with metadata */
 #define CXL_SHM_REQ_GET_META      8   /* Get metadata only */
 #define CXL_SHM_REQ_SET_META      9   /* Set metadata only */
+#define CXL_SHM_REQ_DCD_ADD       10  /* Dynamic capacity add */
+#define CXL_SHM_REQ_DCD_RELEASE   11  /* Dynamic capacity release */
+#define CXL_SHM_REQ_DCD_QUERY     12  /* Dynamic capacity statistics */
+#define CXL_SHM_REQ_GFAM_MAP      13  /* Grant GFAM host access */
+#define CXL_SHM_REQ_GFAM_UNMAP    14  /* Revoke GFAM host access */
+#define CXL_SHM_REQ_GFAM_QUERY    15  /* GFAM statistics */
 
 /* Response status */
 #define CXL_SHM_RESP_NONE     0
@@ -1363,6 +1375,20 @@ static struct {
     uint64_t latency_inject_min;  /* Minimum latency to bother injecting (ns) */
     uint64_t stats_injected_ns;   /* Total injected delay (ns) */
     uint64_t stats_inject_count;  /* Number of times delay was injected */
+    /* DCD/GFAM state reported by cxlmemsim_server */
+    uint64_t dcd_total_capacity;
+    uint64_t dcd_allocated_capacity;
+    uint64_t dcd_free_capacity;
+    uint64_t dcd_active_extents;
+    uint64_t dcd_failed_requests;
+    uint64_t gfam_hosts;
+    uint64_t gfam_mappings;
+    uint64_t gfam_shared_mappings;
+    uint64_t gfam_read_ops;
+    uint64_t gfam_write_ops;
+    uint64_t gfam_atomic_ops;
+    uint64_t gfam_denied_accesses;
+    uint64_t gfam_avg_latency_ns;
 } g_memsim = {
     .enabled = false,
     .initialized = false,
@@ -1389,7 +1415,7 @@ static struct {
  * that the total wall-clock time of the memory access is >= target_latency_ns.
  *
  * We use a spin loop rather than nanosleep() because:
- *   1. CXL latencies are typically 80-300 ns — too short for the kernel
+ *   1. CXL latencies are typically 80-300 ns - too short for the kernel
  *      scheduler to handle accurately (nanosleep minimum ~50 us on Linux).
  *   2. We WANT the vCPU thread to stall: this is the memory access path,
  *      and stalling it is semantically correct for simulating slow memory.
@@ -1440,6 +1466,10 @@ static void cxl_memsim_inject_latency(uint64_t call_start_ns,
 }
 /* Forward declaration - defined after init */
 static int cxl_memsim_connect_locked(void);
+static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
+                                  void *data, uint64_t value, uint64_t expected,
+                                  CXLMemSimResponse *resp);
+static void cxl_memsim_refresh_fabric_state(void);
 
 static void cxl_memsim_init(void) {
     /* Use double-checked locking for thread safety */
@@ -1527,8 +1557,8 @@ static void cxl_memsim_init(void) {
     }
 
     /* Parse active latency injection settings.
-     *   CXL_LATENCY_INJECT=1          — enable active delay enforcement
-     *   CXL_LATENCY_INJECT_MIN_NS=80  — skip injection below this threshold (default 0)
+     *   CXL_LATENCY_INJECT=1          - enable active delay enforcement
+     *   CXL_LATENCY_INJECT_MIN_NS=80  - skip injection below this threshold (default 0)
      */
     const char *inject_env = getenv("CXL_LATENCY_INJECT");
     if (inject_env && (strcmp(inject_env, "1") == 0 || strcmp(inject_env, "true") == 0)) {
@@ -1554,7 +1584,12 @@ static void cxl_memsim_init(void) {
                          "(will retry on first memory access)");
         }
     }
+    bool refresh_fabric_state = g_memsim.enabled && g_memsim.connected;
     pthread_mutex_unlock(&g_memsim.lock);
+
+    if (refresh_fabric_state) {
+        cxl_memsim_refresh_fabric_state();
+    }
 }
 
 /* Connect function - assumes lock is already held */
@@ -1738,7 +1773,17 @@ static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
         case CXL_OP_ATOMIC_FAA: shm_req_type = CXL_SHM_REQ_ATOMIC_FAA; break;
         case CXL_OP_ATOMIC_CAS: shm_req_type = CXL_SHM_REQ_ATOMIC_CAS; break;
         case CXL_OP_FENCE:      shm_req_type = CXL_SHM_REQ_FENCE; break;
+        case CXL_OP_DCD_ADD:    shm_req_type = CXL_SHM_REQ_DCD_ADD; break;
+        case CXL_OP_DCD_RELEASE: shm_req_type = CXL_SHM_REQ_DCD_RELEASE; break;
+        case CXL_OP_DCD_QUERY:  shm_req_type = CXL_SHM_REQ_DCD_QUERY; break;
+        case CXL_OP_GFAM_MAP:   shm_req_type = CXL_SHM_REQ_GFAM_MAP; break;
+        case CXL_OP_GFAM_UNMAP: shm_req_type = CXL_SHM_REQ_GFAM_UNMAP; break;
+        case CXL_OP_GFAM_QUERY: shm_req_type = CXL_SHM_REQ_GFAM_QUERY; break;
         default:                shm_req_type = CXL_SHM_REQ_NONE; break;
+    }
+    if (shm_req_type == CXL_SHM_REQ_NONE) {
+        error_report("CXL Type3: Unsupported SHM request op %u", op);
+        return -1;
     }
     __atomic_store_n(&slot->req_type, shm_req_type, __ATOMIC_RELEASE);
 
@@ -1766,6 +1811,9 @@ static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
     } else if (op == CXL_OP_ATOMIC_FAA || op == CXL_OP_ATOMIC_CAS) {
         /* For atomic ops, old_value is stored in slot->value after server processes */
         resp->old_value = slot->value;
+    } else if (op == CXL_OP_DCD_ADD || op == CXL_OP_DCD_QUERY || op == CXL_OP_GFAM_QUERY) {
+        resp->old_value = slot->value;
+        memcpy(resp->data, (void *)slot->data, CXL_SHM_CACHELINE_SIZE);
     }
 
     /* Clear response status for next request */
@@ -1795,6 +1843,12 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
             case CXL_OP_FENCE:      op_name = "FENCE"; break;
             case CXL_OP_LSA_READ:   op_name = "LSA_READ"; break;
             case CXL_OP_LSA_WRITE:  op_name = "LSA_WRITE"; break;
+            case CXL_OP_DCD_ADD:    op_name = "DCD_ADD"; break;
+            case CXL_OP_DCD_RELEASE: op_name = "DCD_RELEASE"; break;
+            case CXL_OP_DCD_QUERY:  op_name = "DCD_QUERY"; break;
+            case CXL_OP_GFAM_MAP:   op_name = "GFAM_MAP"; break;
+            case CXL_OP_GFAM_UNMAP: op_name = "GFAM_UNMAP"; break;
+            case CXL_OP_GFAM_QUERY: op_name = "GFAM_QUERY"; break;
             default:                op_name = "UNKNOWN"; break;
         }
         info_report("CXL Type3: Request #%d (op=%s, connected=%d, transport=%s)",
@@ -1900,6 +1954,77 @@ static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
     return 0;
 }
 
+static uint64_t cxl_memsim_resp_u64(const CXLMemSimResponse *resp, size_t offset)
+{
+    uint64_t value = 0;
+
+    if (offset + sizeof(value) <= sizeof(resp->data)) {
+        memcpy(&value, resp->data + offset, sizeof(value));
+    }
+    return value;
+}
+
+static void cxl_memsim_refresh_fabric_state(void)
+{
+    if (!g_memsim.enabled || !g_memsim.connected) {
+        return;
+    }
+
+    CXLMemSimResponse dcd = {0};
+    if (cxl_memsim_request_ext(CXL_OP_DCD_QUERY, 0, 0, NULL, 0, 0, &dcd) == 0 &&
+        dcd.status == 0) {
+        g_memsim.dcd_allocated_capacity = dcd.old_value;
+        g_memsim.dcd_total_capacity = cxl_memsim_resp_u64(&dcd, 0);
+        g_memsim.dcd_free_capacity = cxl_memsim_resp_u64(&dcd, 8);
+        g_memsim.dcd_active_extents = cxl_memsim_resp_u64(&dcd, 16);
+        g_memsim.dcd_failed_requests = cxl_memsim_resp_u64(&dcd, 24);
+
+        if (g_memsim.dcd_total_capacity > 0) {
+            info_report("CXL Type3: DCD dynamic capacity reported by CXLMemSim: "
+                        "allocated=%lu MB total=%lu MB free=%lu MB extents=%lu failures=%lu",
+                        (unsigned long)(g_memsim.dcd_allocated_capacity / MiB),
+                        (unsigned long)(g_memsim.dcd_total_capacity / MiB),
+                        (unsigned long)(g_memsim.dcd_free_capacity / MiB),
+                        (unsigned long)g_memsim.dcd_active_extents,
+                        (unsigned long)g_memsim.dcd_failed_requests);
+        } else {
+            info_report("CXL Type3: DCD query returned no dynamic-capacity pool");
+        }
+    } else {
+        info_report("CXL Type3: DCD query unavailable from CXLMemSim");
+    }
+
+    CXLMemSimResponse gfam = {0};
+    if (cxl_memsim_request_ext(CXL_OP_GFAM_QUERY, 0, 0, NULL, 0, 0, &gfam) == 0 &&
+        gfam.status == 0) {
+        g_memsim.gfam_hosts = gfam.old_value;
+        g_memsim.gfam_mappings = cxl_memsim_resp_u64(&gfam, 0);
+        g_memsim.gfam_shared_mappings = cxl_memsim_resp_u64(&gfam, 8);
+        g_memsim.gfam_read_ops = cxl_memsim_resp_u64(&gfam, 16);
+        g_memsim.gfam_write_ops = cxl_memsim_resp_u64(&gfam, 24);
+        g_memsim.gfam_atomic_ops = cxl_memsim_resp_u64(&gfam, 32);
+        g_memsim.gfam_denied_accesses = cxl_memsim_resp_u64(&gfam, 40);
+        g_memsim.gfam_avg_latency_ns = cxl_memsim_resp_u64(&gfam, 48);
+
+        if (g_memsim.gfam_hosts > 0) {
+            info_report("CXL Type3: GFAM status from CXLMemSim: hosts=%lu mappings=%lu "
+                        "shared=%lu reads=%lu writes=%lu atomics=%lu denied=%lu avg_latency=%lu ns",
+                        (unsigned long)g_memsim.gfam_hosts,
+                        (unsigned long)g_memsim.gfam_mappings,
+                        (unsigned long)g_memsim.gfam_shared_mappings,
+                        (unsigned long)g_memsim.gfam_read_ops,
+                        (unsigned long)g_memsim.gfam_write_ops,
+                        (unsigned long)g_memsim.gfam_atomic_ops,
+                        (unsigned long)g_memsim.gfam_denied_accesses,
+                        (unsigned long)g_memsim.gfam_avg_latency_ns);
+        } else {
+            info_report("CXL Type3: GFAM query returned no active fabric hosts");
+        }
+    } else {
+        info_report("CXL Type3: GFAM query unavailable from CXLMemSim");
+    }
+}
+
 /* Simple request wrapper for backward compatibility */
 static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
                               void *data, CXLMemSimResponse *resp) {
@@ -1979,7 +2104,13 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         }
 
         if (cxl_memsim_request(CXL_OP_READ, dpa_offset, size, NULL, &resp) == 0) {
-            if (resp.status == 0 && size <= 64) {
+            if (resp.status != 0) {
+                error_report("CXL Type3: CXLMemSim READ denied or failed at dpa=0x%lx status=%u",
+                             (unsigned long)dpa_offset, resp.status);
+                return MEMTX_ERROR;
+            }
+
+            if (size <= 64) {
                 memcpy(data, resp.data, size);
             }
 
@@ -2036,6 +2167,12 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         }
 
         if (cxl_memsim_request(CXL_OP_WRITE, dpa_offset, size, &data, &resp) == 0) {
+            if (resp.status != 0) {
+                error_report("CXL Type3: CXLMemSim WRITE denied or failed at dpa=0x%lx status=%u",
+                             (unsigned long)dpa_offset, resp.status);
+                return MEMTX_ERROR;
+            }
+
             /* Enforce simulated CXL latency */
             cxl_memsim_inject_latency(start_ns, resp.latency_ns);
 

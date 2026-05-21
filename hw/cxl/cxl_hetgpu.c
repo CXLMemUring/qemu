@@ -14,6 +14,10 @@
 #include "hw/cxl/cxl_hetgpu.h"
 #include <dlfcn.h>
 
+#ifndef DEFAULT_HETGPU_LIB_PATH
+#define DEFAULT_HETGPU_LIB_PATH NULL
+#endif
+
 /* Default device properties for simulation mode */
 static const HetGPUDeviceProps default_props = {
     .name = "Virtual GPU (TMatmul)",
@@ -128,6 +132,9 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
 
     /* Try to load hetGPU library (only once for all devices) */
     const char *lib_path = hetgpu_lib_path;
+    if (!lib_path || lib_path[0] == '\0') {
+        lib_path = DEFAULT_HETGPU_LIB_PATH;
+    }
     if (!lib_path || lib_path[0] == '\0') {
         lib_path = "/usr/lib/x86_64-linux-gnu/libcuda.so";
     }
