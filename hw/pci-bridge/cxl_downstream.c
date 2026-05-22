@@ -16,6 +16,8 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_vcs_switch.h"
+#include "hw/pci-bridge/cxl_upstream_port.h"
 #include "qapi/error.h"
 
 typedef struct CXLDownstreamPort {
@@ -189,8 +191,22 @@ static void cxl_dsp_realize(PCIDevice *d, Error **errp)
                          PCI_BASE_ADDRESS_MEM_TYPE_64,
                      component_bar);
 
+    PCIDevice *parent = pci_bridge_get_device(pci_get_bus(d));
+    if (parent && object_dynamic_cast(OBJECT(parent), TYPE_CXL_USP)) {
+        CXLUpstreamPort *usp = CXL_USP(parent);
+
+        if (usp->vcs_name && usp->swcci.vcs) {
+            cxl_vcs_register_vppb(usp->swcci.vcs, usp, dsp, errp);
+            if (*errp) {
+                goto err_aer;
+            }
+        }
+    }
+
     return;
 
+ err_aer:
+    pcie_aer_exit(d);
  err_chassis:
     pcie_chassis_del_slot(s);
  err_pcie_cap:
@@ -217,6 +233,8 @@ static const Property cxl_dsp_props[] = {
                                 speed, PCIE_LINK_SPEED_64),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", PCIESlot,
                                 width, PCIE_LINK_WIDTH_16),
+    DEFINE_PROP_BIT(COMPAT_PROP_PCP, PCIDevice, cap_present,
+                    QEMU_PCIE_SLTCAP_PCP_BITNR, true),
 };
 
 static void cxl_dsp_class_init(ObjectClass *oc, const void *data)

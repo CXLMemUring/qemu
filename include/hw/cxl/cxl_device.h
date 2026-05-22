@@ -143,6 +143,7 @@ typedef enum {
 } CXLDSMASFlags;
 
 typedef struct CXLCCI CXLCCI;
+typedef struct CXLVCSSwitch CXLVCSSwitch;
 typedef struct cxl_device_state CXLDeviceState;
 struct cxl_cmd;
 typedef CXLRetCode (*opcode_handler)(const struct cxl_cmd *cmd,
@@ -212,6 +213,8 @@ typedef struct CXLCCI {
     DeviceState *d;
     /* Pointer to the device hosting the protocol conversion */
     DeviceState *intf;
+    /* Pointer to a VCS switch when this CCI targets switch-wide state */
+    CXLVCSSwitch *vcs;
     bool initialized;
 } CXLCCI;
 
@@ -327,6 +330,9 @@ CXL_DEVICE_CAPABILITY_HEADER_REGISTER(MEMORY_DEVICE,
 void cxl_initialize_mailbox_t3(CXLCCI *cci, DeviceState *d, size_t payload_max);
 void cxl_initialize_mailbox_swcci(CXLCCI *cci, DeviceState *intf,
                                   DeviceState *d, size_t payload_max);
+void cxl_initialize_vcs_swcci(CXLCCI *cci, CXLVCSSwitch *vcs,
+                              DeviceState *intf, DeviceState *d,
+                              size_t payload_max);
 void cxl_init_cci(CXLCCI *cci, size_t payload_max);
 void cxl_destroy_cci(CXLCCI *cci);
 void cxl_add_cci_commands(CXLCCI *cci, const struct cxl_cmd (*cxl_cmd_set)[256],
@@ -526,6 +532,7 @@ typedef struct CXLDCExtent {
 typedef QTAILQ_HEAD(, CXLDCExtent) CXLDCExtentList;
 
 typedef struct CXLDCExtentGroup {
+    uint16_t host_id;
     CXLDCExtentList list;
     QTAILQ_ENTRY(CXLDCExtentGroup) node;
 } CXLDCExtentGroup;
@@ -624,6 +631,26 @@ struct CXLType3Dev {
     CXLMemECSReadAttrs ecs_attrs;
     CXLMemECSWriteAttrs ecs_wr_attrs;
 
+    /* CXLMemSim DCD/GFAM integration knobs and cached fabric state */
+    bool memsim_dcd;
+    bool memsim_gfam;
+    uint32_t memsim_gfam_host_id;
+    bool memsim_dcd_report_valid;
+    uint64_t memsim_dcd_total_capacity;
+    uint64_t memsim_dcd_allocated_capacity;
+    uint64_t memsim_dcd_free_capacity;
+    uint64_t memsim_dcd_active_extents;
+    uint64_t memsim_dcd_failed_requests;
+    bool memsim_gfam_report_valid;
+    uint64_t memsim_gfam_hosts;
+    uint64_t memsim_gfam_mappings;
+    uint64_t memsim_gfam_shared_mappings;
+    uint64_t memsim_gfam_read_ops;
+    uint64_t memsim_gfam_write_ops;
+    uint64_t memsim_gfam_atomic_ops;
+    uint64_t memsim_gfam_denied_accesses;
+    uint64_t memsim_gfam_avg_latency_ns;
+
     struct dynamic_capacity {
         HostMemoryBackend *host_dc;
         AddressSpace host_dc_as;
@@ -665,7 +692,7 @@ struct CXLType3Class {
 
 struct CSWMBCCIDev {
     PCIDevice parent_obj;
-    PCIDevice *target;
+    Object *target;
     CXLComponentState cxl_cstate;
     CXLDeviceState cxl_dstate;
     CXLCCI *cci;
@@ -721,6 +748,13 @@ void ct3_clear_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
                                    uint64_t len);
 bool ct3_test_region_block_backed(CXLType3Dev *ct3d, uint64_t dpa,
                                   uint64_t len);
+bool cxl_type3_memsim_dcd_enabled(CXLType3Dev *ct3d);
+CXLRetCode cxl_type3_memsim_sync_dcd_add(CXLType3Dev *ct3d,
+                                          uint16_t host_id,
+                                          uint64_t dpa, uint64_t len);
+CXLRetCode cxl_type3_memsim_sync_dcd_release(CXLType3Dev *ct3d,
+                                              uint16_t host_id,
+                                              uint64_t dpa, uint64_t len);
 void cxl_assign_event_header(CXLEventRecordHdr *hdr,
                              const QemuUUID *uuid, uint32_t flags,
                              uint8_t length, uint64_t timestamp);

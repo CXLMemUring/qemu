@@ -875,6 +875,9 @@ static void init_alert_config(CXLType3Dev *ct3d)
     };
 }
 
+static bool cxl_memsim_boot_enabled(CXLType3Dev *ct3d);
+static void cxl_memsim_init(CXLType3Dev *ct3d);
+
 static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 {
     ERRP_GUARD();
@@ -890,6 +893,9 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
+    }
+    if (cxl_memsim_boot_enabled(ct3d)) {
+        cxl_memsim_init(ct3d);
     }
 
     pci_config_set_prog_interface(pci_conf, 0x10);
@@ -1005,12 +1011,15 @@ static void ct3_exit(PCIDevice *pci_dev)
     cxl_destroy_cci(&ct3d->cci);
     if (ct3d->dc.host_dc) {
         cxl_destroy_dc_regions(ct3d);
+        host_memory_backend_set_mapped(ct3d->dc.host_dc, false);
         address_space_destroy(&ct3d->dc.host_dc_as);
     }
     if (ct3d->hostpmem) {
+        host_memory_backend_set_mapped(ct3d->hostpmem, false);
         address_space_destroy(&ct3d->hostpmem_as);
     }
     if (ct3d->hostvmem) {
+        host_memory_backend_set_mapped(ct3d->hostvmem, false);
         address_space_destroy(&ct3d->hostvmem_as);
     }
 }
@@ -1224,6 +1233,21 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 #define CXL_OP_GFAM_UNMAP   12  /* Revoke GFAM host access */
 #define CXL_OP_GFAM_QUERY   13  /* GFAM statistics */
 
+#define CXL_DCD_STATUS_OK              0
+#define CXL_DCD_STATUS_OUT_OF_CAPACITY 1
+#define CXL_DCD_STATUS_OVERLAP         2
+#define CXL_DCD_STATUS_NOT_FOUND       3
+#define CXL_DCD_STATUS_INVALID_REQUEST 4
+#define CXL_DCD_STATUS_ACCESS_DENIED   5
+
+#define CXL_GFAM_PERM_READ   (1u << 0)
+#define CXL_GFAM_PERM_WRITE  (1u << 1)
+#define CXL_GFAM_PERM_ATOMIC (1u << 2)
+#define CXL_GFAM_PERM_SHARED (1u << 3)
+#define CXL_GFAM_PERM_ALL \
+    (CXL_GFAM_PERM_READ | CXL_GFAM_PERM_WRITE | \
+     CXL_GFAM_PERM_ATOMIC | CXL_GFAM_PERM_SHARED)
+
 /* LSA address offset - distinguishes LSA from regular memory */
 #define CXL_LSA_ADDR_OFFSET 0xFFFF000000000000ULL
 
@@ -1363,6 +1387,12 @@ static struct {
     uint64_t stats_writes;
     uint64_t stats_atomics;
     uint64_t stats_fences;
+    bool dcd_enabled;
+    bool gfam_enabled;
+    uint32_t gfam_host_id;
+    uint64_t fabric_refresh_interval_ns;
+    uint64_t last_fabric_refresh_ns;
+    bool topology_checked;
     /* PGAS shared memory fields */
     char shm_name[256];
     int shm_fd;
@@ -1402,6 +1432,12 @@ static struct {
     .latency_inject_min = 0,
     .stats_injected_ns = 0,
     .stats_inject_count = 0,
+    .dcd_enabled = false,
+    .gfam_enabled = false,
+    .gfam_host_id = 0,
+    .fabric_refresh_interval_ns = 1000000000ULL,
+    .last_fabric_refresh_ns = 0,
+    .topology_checked = false,
 };
 
 /*
@@ -1469,9 +1505,89 @@ static int cxl_memsim_connect_locked(void);
 static int cxl_memsim_request_ext(uint8_t op, uint64_t addr, uint64_t size,
                                   void *data, uint64_t value, uint64_t expected,
                                   CXLMemSimResponse *resp);
-static void cxl_memsim_refresh_fabric_state(void);
+static void cxl_memsim_refresh_fabric_state(CXLType3Dev *ct3d);
+static void cxl_memsim_maybe_refresh_fabric_state(CXLType3Dev *ct3d);
 
-static void cxl_memsim_init(void) {
+static bool cxl_memsim_parse_bool_env(const char *name, bool default_value)
+{
+    const char *value = getenv(name);
+
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    if (g_ascii_strcasecmp(value, "1") == 0 ||
+        g_ascii_strcasecmp(value, "true") == 0 ||
+        g_ascii_strcasecmp(value, "yes") == 0 ||
+        g_ascii_strcasecmp(value, "on") == 0) {
+        return true;
+    }
+    if (g_ascii_strcasecmp(value, "0") == 0 ||
+        g_ascii_strcasecmp(value, "false") == 0 ||
+        g_ascii_strcasecmp(value, "no") == 0 ||
+        g_ascii_strcasecmp(value, "off") == 0) {
+        return false;
+    }
+    warn_report("CXL Type3: ignoring invalid boolean %s=%s", name, value);
+    return default_value;
+}
+
+static bool cxl_memsim_boot_enabled(CXLType3Dev *ct3d)
+{
+    if (cxl_memsim_parse_bool_env("CXL_MEMSIM_EARLY_INIT", false)) {
+        return true;
+    }
+    if (ct3d && (ct3d->memsim_dcd || ct3d->memsim_gfam)) {
+        return true;
+    }
+    if (cxl_memsim_parse_bool_env("CXL_DCD_ENABLE", false) ||
+        cxl_memsim_parse_bool_env("CXL_GFAM_ENABLE", false)) {
+        return true;
+    }
+    return false;
+}
+
+static const char *cxl_memsim_dcd_status_str(uint8_t status)
+{
+    switch (status) {
+    case CXL_DCD_STATUS_OK:
+        return "OK";
+    case CXL_DCD_STATUS_OUT_OF_CAPACITY:
+        return "OUT_OF_CAPACITY";
+    case CXL_DCD_STATUS_OVERLAP:
+        return "OVERLAP";
+    case CXL_DCD_STATUS_NOT_FOUND:
+        return "NOT_FOUND";
+    case CXL_DCD_STATUS_INVALID_REQUEST:
+        return "INVALID_REQUEST";
+    case CXL_DCD_STATUS_ACCESS_DENIED:
+        return "ACCESS_DENIED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static CXLRetCode cxl_memsim_dcd_status_to_mbox(uint8_t status)
+{
+    switch (status) {
+    case CXL_DCD_STATUS_OK:
+        return CXL_MBOX_SUCCESS;
+    case CXL_DCD_STATUS_OUT_OF_CAPACITY:
+        return CXL_MBOX_RESOURCES_EXHAUSTED;
+    case CXL_DCD_STATUS_OVERLAP:
+        return CXL_MBOX_INVALID_EXTENT_LIST;
+    case CXL_DCD_STATUS_NOT_FOUND:
+        return CXL_MBOX_INVALID_PA;
+    case CXL_DCD_STATUS_INVALID_REQUEST:
+        return CXL_MBOX_INVALID_INPUT;
+    case CXL_DCD_STATUS_ACCESS_DENIED:
+        return CXL_MBOX_INVALID_INPUT;
+    default:
+        return CXL_MBOX_INTERNAL_ERROR;
+    }
+}
+
+static void cxl_memsim_init(CXLType3Dev *ct3d)
+{
     /* Use double-checked locking for thread safety */
     if (g_memsim.initialized) {
         return;
@@ -1495,6 +1611,8 @@ static void cxl_memsim_init(void) {
     }
     const char *rdma_server = getenv("CXL_MEMSIM_RDMA_SERVER");
     const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
+    const char *gfam_host_id = getenv("CXL_GFAM_HOST_ID");
+    const char *fabric_refresh_ns = getenv("CXL_MEMSIM_FABRIC_REFRESH_NS");
 
     if (!host || !host[0]) {
         host = CXL_MEMSIM_DEFAULT_HOST;
@@ -1503,6 +1621,26 @@ static void cxl_memsim_init(void) {
     int port = CXL_MEMSIM_DEFAULT_PORT;
     if (port_str && port_str[0]) {
         port = atoi(port_str);
+    }
+
+    g_memsim.dcd_enabled =
+        cxl_memsim_parse_bool_env("CXL_DCD_ENABLE",
+                                  ct3d ? ct3d->memsim_dcd : false);
+    g_memsim.gfam_enabled =
+        cxl_memsim_parse_bool_env("CXL_GFAM_ENABLE",
+                                  ct3d ? ct3d->memsim_gfam : false);
+    g_memsim.gfam_host_id = ct3d ? ct3d->memsim_gfam_host_id : 0;
+    if (gfam_host_id && gfam_host_id[0]) {
+        g_memsim.gfam_host_id = strtoul(gfam_host_id, NULL, 10);
+    }
+    if (fabric_refresh_ns && fabric_refresh_ns[0]) {
+        g_memsim.fabric_refresh_interval_ns =
+            strtoull(fabric_refresh_ns, NULL, 10);
+    }
+    if (ct3d) {
+        ct3d->memsim_dcd = g_memsim.dcd_enabled;
+        ct3d->memsim_gfam = g_memsim.gfam_enabled;
+        ct3d->memsim_gfam_host_id = g_memsim.gfam_host_id;
     }
 
     /* Default to SHM transport when unspecified */
@@ -1588,7 +1726,7 @@ static void cxl_memsim_init(void) {
     pthread_mutex_unlock(&g_memsim.lock);
 
     if (refresh_fabric_state) {
-        cxl_memsim_refresh_fabric_state();
+        cxl_memsim_refresh_fabric_state(ct3d);
     }
 }
 
@@ -1964,65 +2102,273 @@ static uint64_t cxl_memsim_resp_u64(const CXLMemSimResponse *resp, size_t offset
     return value;
 }
 
-static void cxl_memsim_refresh_fabric_state(void)
+static void cxl_memsim_validate_boot_topology(CXLType3Dev *ct3d)
+{
+    uint64_t qemu_dc_capacity;
+    uint64_t server_dc_capacity;
+
+    if (!ct3d || g_memsim.topology_checked ||
+        !ct3d->memsim_dcd_report_valid) {
+        return;
+    }
+
+    g_memsim.topology_checked = true;
+    qemu_dc_capacity = ct3d->dc.total_capacity;
+    server_dc_capacity = ct3d->memsim_dcd_total_capacity;
+
+    if (ct3d->dc.num_regions == 0) {
+        warn_report("CXL Type3: CXLMemSim DCD is enabled but QEMU has no "
+                    "dynamic-capacity regions; add num-dc-regions and "
+                    "volatile-dc-memdev to the cxl-type3 device");
+        return;
+    }
+
+    if (server_dc_capacity != 0 && qemu_dc_capacity != server_dc_capacity) {
+        warn_report("CXL Type3: QEMU dynamic capacity (%lu MB) does not match "
+                    "CXLMemSim server DCD capacity (%lu MB). Align QEMU "
+                    "volatile-dc-memdev size/num-dc-regions with the server "
+                    "--capacity and --dcd-initial-capacity settings.",
+                    (unsigned long)(qemu_dc_capacity / MiB),
+                    (unsigned long)(server_dc_capacity / MiB));
+        return;
+    }
+
+    info_report("CXL Type3: QEMU DCD capacity matches CXLMemSim server "
+                "capacity (%lu MB)", (unsigned long)(qemu_dc_capacity / MiB));
+}
+
+static void cxl_memsim_refresh_fabric_state(CXLType3Dev *ct3d)
 {
     if (!g_memsim.enabled || !g_memsim.connected) {
         return;
     }
 
-    CXLMemSimResponse dcd = {0};
-    if (cxl_memsim_request_ext(CXL_OP_DCD_QUERY, 0, 0, NULL, 0, 0, &dcd) == 0 &&
-        dcd.status == 0) {
-        g_memsim.dcd_allocated_capacity = dcd.old_value;
-        g_memsim.dcd_total_capacity = cxl_memsim_resp_u64(&dcd, 0);
-        g_memsim.dcd_free_capacity = cxl_memsim_resp_u64(&dcd, 8);
-        g_memsim.dcd_active_extents = cxl_memsim_resp_u64(&dcd, 16);
-        g_memsim.dcd_failed_requests = cxl_memsim_resp_u64(&dcd, 24);
-
-        if (g_memsim.dcd_total_capacity > 0) {
-            info_report("CXL Type3: DCD dynamic capacity reported by CXLMemSim: "
-                        "allocated=%lu MB total=%lu MB free=%lu MB extents=%lu failures=%lu",
-                        (unsigned long)(g_memsim.dcd_allocated_capacity / MiB),
-                        (unsigned long)(g_memsim.dcd_total_capacity / MiB),
-                        (unsigned long)(g_memsim.dcd_free_capacity / MiB),
-                        (unsigned long)g_memsim.dcd_active_extents,
-                        (unsigned long)g_memsim.dcd_failed_requests);
-        } else {
-            info_report("CXL Type3: DCD query returned no dynamic-capacity pool");
-        }
-    } else {
-        info_report("CXL Type3: DCD query unavailable from CXLMemSim");
+    if (!g_memsim.dcd_enabled && !g_memsim.gfam_enabled) {
+        return;
     }
 
-    CXLMemSimResponse gfam = {0};
-    if (cxl_memsim_request_ext(CXL_OP_GFAM_QUERY, 0, 0, NULL, 0, 0, &gfam) == 0 &&
-        gfam.status == 0) {
-        g_memsim.gfam_hosts = gfam.old_value;
-        g_memsim.gfam_mappings = cxl_memsim_resp_u64(&gfam, 0);
-        g_memsim.gfam_shared_mappings = cxl_memsim_resp_u64(&gfam, 8);
-        g_memsim.gfam_read_ops = cxl_memsim_resp_u64(&gfam, 16);
-        g_memsim.gfam_write_ops = cxl_memsim_resp_u64(&gfam, 24);
-        g_memsim.gfam_atomic_ops = cxl_memsim_resp_u64(&gfam, 32);
-        g_memsim.gfam_denied_accesses = cxl_memsim_resp_u64(&gfam, 40);
-        g_memsim.gfam_avg_latency_ns = cxl_memsim_resp_u64(&gfam, 48);
+    g_memsim.last_fabric_refresh_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
-        if (g_memsim.gfam_hosts > 0) {
-            info_report("CXL Type3: GFAM status from CXLMemSim: hosts=%lu mappings=%lu "
-                        "shared=%lu reads=%lu writes=%lu atomics=%lu denied=%lu avg_latency=%lu ns",
-                        (unsigned long)g_memsim.gfam_hosts,
-                        (unsigned long)g_memsim.gfam_mappings,
-                        (unsigned long)g_memsim.gfam_shared_mappings,
-                        (unsigned long)g_memsim.gfam_read_ops,
-                        (unsigned long)g_memsim.gfam_write_ops,
-                        (unsigned long)g_memsim.gfam_atomic_ops,
-                        (unsigned long)g_memsim.gfam_denied_accesses,
-                        (unsigned long)g_memsim.gfam_avg_latency_ns);
+    if (g_memsim.dcd_enabled) {
+        CXLMemSimResponse dcd = {0};
+
+        if (cxl_memsim_request_ext(CXL_OP_DCD_QUERY, 0, 0, NULL, 0, 0,
+                                   &dcd) == 0 &&
+            dcd.status == 0) {
+            g_memsim.dcd_allocated_capacity = dcd.old_value;
+            g_memsim.dcd_total_capacity = cxl_memsim_resp_u64(&dcd, 0);
+            g_memsim.dcd_free_capacity = cxl_memsim_resp_u64(&dcd, 8);
+            g_memsim.dcd_active_extents = cxl_memsim_resp_u64(&dcd, 16);
+            g_memsim.dcd_failed_requests = cxl_memsim_resp_u64(&dcd, 24);
+            if (ct3d) {
+                ct3d->memsim_dcd_report_valid = true;
+                ct3d->memsim_dcd_allocated_capacity =
+                    g_memsim.dcd_allocated_capacity;
+                ct3d->memsim_dcd_total_capacity =
+                    g_memsim.dcd_total_capacity;
+                ct3d->memsim_dcd_free_capacity =
+                    g_memsim.dcd_free_capacity;
+                ct3d->memsim_dcd_active_extents =
+                    g_memsim.dcd_active_extents;
+                ct3d->memsim_dcd_failed_requests =
+                    g_memsim.dcd_failed_requests;
+            }
+
+            if (g_memsim.dcd_total_capacity > 0) {
+                info_report("CXL Type3: DCD dynamic capacity reported by CXLMemSim: "
+                            "allocated=%lu MB total=%lu MB free=%lu MB extents=%lu failures=%lu",
+                            (unsigned long)(g_memsim.dcd_allocated_capacity /
+                                            MiB),
+                            (unsigned long)(g_memsim.dcd_total_capacity /
+                                            MiB),
+                            (unsigned long)(g_memsim.dcd_free_capacity / MiB),
+                            (unsigned long)g_memsim.dcd_active_extents,
+                            (unsigned long)g_memsim.dcd_failed_requests);
+            } else {
+                info_report("CXL Type3: DCD query returned no dynamic-capacity pool");
+            }
+            cxl_memsim_validate_boot_topology(ct3d);
         } else {
-            info_report("CXL Type3: GFAM query returned no active fabric hosts");
+            info_report("CXL Type3: DCD query unavailable from CXLMemSim");
         }
-    } else {
-        info_report("CXL Type3: GFAM query unavailable from CXLMemSim");
     }
+
+    if (g_memsim.gfam_enabled) {
+        CXLMemSimResponse gfam = {0};
+
+        if (cxl_memsim_request_ext(CXL_OP_GFAM_QUERY, 0, 0, NULL, 0, 0,
+                                   &gfam) == 0 &&
+            gfam.status == 0) {
+            g_memsim.gfam_hosts = gfam.old_value;
+            g_memsim.gfam_mappings = cxl_memsim_resp_u64(&gfam, 0);
+            g_memsim.gfam_shared_mappings = cxl_memsim_resp_u64(&gfam, 8);
+            g_memsim.gfam_read_ops = cxl_memsim_resp_u64(&gfam, 16);
+            g_memsim.gfam_write_ops = cxl_memsim_resp_u64(&gfam, 24);
+            g_memsim.gfam_atomic_ops = cxl_memsim_resp_u64(&gfam, 32);
+            g_memsim.gfam_denied_accesses = cxl_memsim_resp_u64(&gfam, 40);
+            g_memsim.gfam_avg_latency_ns = cxl_memsim_resp_u64(&gfam, 48);
+            if (ct3d) {
+                ct3d->memsim_gfam_report_valid = true;
+                ct3d->memsim_gfam_hosts = g_memsim.gfam_hosts;
+                ct3d->memsim_gfam_mappings = g_memsim.gfam_mappings;
+                ct3d->memsim_gfam_shared_mappings =
+                    g_memsim.gfam_shared_mappings;
+                ct3d->memsim_gfam_read_ops = g_memsim.gfam_read_ops;
+                ct3d->memsim_gfam_write_ops = g_memsim.gfam_write_ops;
+                ct3d->memsim_gfam_atomic_ops = g_memsim.gfam_atomic_ops;
+                ct3d->memsim_gfam_denied_accesses =
+                    g_memsim.gfam_denied_accesses;
+                ct3d->memsim_gfam_avg_latency_ns =
+                    g_memsim.gfam_avg_latency_ns;
+            }
+
+            if (g_memsim.gfam_hosts > 0) {
+                info_report("CXL Type3: GFAM status from CXLMemSim: hosts=%lu mappings=%lu "
+                            "shared=%lu reads=%lu writes=%lu atomics=%lu denied=%lu avg_latency=%lu ns",
+                            (unsigned long)g_memsim.gfam_hosts,
+                            (unsigned long)g_memsim.gfam_mappings,
+                            (unsigned long)g_memsim.gfam_shared_mappings,
+                            (unsigned long)g_memsim.gfam_read_ops,
+                            (unsigned long)g_memsim.gfam_write_ops,
+                            (unsigned long)g_memsim.gfam_atomic_ops,
+                            (unsigned long)g_memsim.gfam_denied_accesses,
+                            (unsigned long)g_memsim.gfam_avg_latency_ns);
+            } else {
+                info_report("CXL Type3: GFAM query returned no active fabric hosts");
+            }
+        } else {
+            info_report("CXL Type3: GFAM query unavailable from CXLMemSim");
+        }
+    }
+}
+
+static void cxl_memsim_maybe_refresh_fabric_state(CXLType3Dev *ct3d)
+{
+    uint64_t now;
+
+    if (!g_memsim.dcd_enabled && !g_memsim.gfam_enabled) {
+        return;
+    }
+    if (g_memsim.fabric_refresh_interval_ns == 0) {
+        return;
+    }
+
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    if (g_memsim.last_fabric_refresh_ns == 0 ||
+        now - g_memsim.last_fabric_refresh_ns >=
+            g_memsim.fabric_refresh_interval_ns) {
+        cxl_memsim_refresh_fabric_state(ct3d);
+    }
+}
+
+static bool cxl_memsim_dc_dpa_to_offset(CXLType3Dev *ct3d, uint64_t dpa,
+                                        uint64_t len, uint64_t *offset)
+{
+    uint64_t base;
+
+    if (!ct3d || !ct3d->dc.num_regions || len == 0) {
+        return false;
+    }
+
+    base = ct3d->dc.regions[0].base;
+    if (dpa < base) {
+        return false;
+    }
+
+    *offset = dpa - base;
+    if (*offset > ct3d->dc.total_capacity ||
+        len > ct3d->dc.total_capacity - *offset) {
+        return false;
+    }
+
+    return true;
+}
+
+bool cxl_type3_memsim_dcd_enabled(CXLType3Dev *ct3d)
+{
+    cxl_memsim_init(ct3d);
+    return g_memsim.enabled && g_memsim.dcd_enabled;
+}
+
+CXLRetCode cxl_type3_memsim_sync_dcd_add(CXLType3Dev *ct3d,
+                                          uint16_t host_id,
+                                          uint64_t dpa, uint64_t len)
+{
+    CXLMemSimResponse resp = {0};
+    uint64_t offset;
+    int ret;
+
+    (void)host_id;
+
+    if (!cxl_type3_memsim_dcd_enabled(ct3d)) {
+        return CXL_MBOX_SUCCESS;
+    }
+    if (!cxl_memsim_dc_dpa_to_offset(ct3d, dpa, len, &offset)) {
+        return CXL_MBOX_INVALID_PA;
+    }
+
+    ret = cxl_memsim_request_ext(CXL_OP_DCD_ADD, offset, len, NULL, 0, 0,
+                                 &resp);
+    if (ret < 0) {
+        error_report("CXL Type3: failed to add DCD extent in CXLMemSim "
+                     "at dpa=0x%lx len=0x%lx",
+                     (unsigned long)dpa, (unsigned long)len);
+        return CXL_MBOX_RETRY_REQUIRED;
+    }
+    if (resp.status != CXL_DCD_STATUS_OK) {
+        error_report("CXL Type3: CXLMemSim rejected DCD add at dpa=0x%lx "
+                     "len=0x%lx status=%s",
+                     (unsigned long)dpa, (unsigned long)len,
+                     cxl_memsim_dcd_status_str(resp.status));
+        cxl_memsim_refresh_fabric_state(ct3d);
+        return cxl_memsim_dcd_status_to_mbox(resp.status);
+    }
+
+    if (resp.old_value != offset) {
+        warn_report("CXL Type3: CXLMemSim DCD add returned base 0x%lx for "
+                    "requested base 0x%lx",
+                    (unsigned long)resp.old_value, (unsigned long)offset);
+    }
+    cxl_memsim_refresh_fabric_state(ct3d);
+    return CXL_MBOX_SUCCESS;
+}
+
+CXLRetCode cxl_type3_memsim_sync_dcd_release(CXLType3Dev *ct3d,
+                                              uint16_t host_id,
+                                              uint64_t dpa, uint64_t len)
+{
+    CXLMemSimResponse resp = {0};
+    uint64_t offset;
+    int ret;
+
+    (void)host_id;
+
+    if (!cxl_type3_memsim_dcd_enabled(ct3d)) {
+        return CXL_MBOX_SUCCESS;
+    }
+    if (!cxl_memsim_dc_dpa_to_offset(ct3d, dpa, len, &offset)) {
+        return CXL_MBOX_INVALID_PA;
+    }
+
+    ret = cxl_memsim_request_ext(CXL_OP_DCD_RELEASE, offset, len, NULL, 0, 0,
+                                 &resp);
+    if (ret < 0) {
+        error_report("CXL Type3: failed to release DCD extent in CXLMemSim "
+                     "at dpa=0x%lx len=0x%lx",
+                     (unsigned long)dpa, (unsigned long)len);
+        return CXL_MBOX_RETRY_REQUIRED;
+    }
+    if (resp.status != CXL_DCD_STATUS_OK) {
+        error_report("CXL Type3: CXLMemSim rejected DCD release at dpa=0x%lx "
+                     "len=0x%lx status=%s",
+                     (unsigned long)dpa, (unsigned long)len,
+                     cxl_memsim_dcd_status_str(resp.status));
+        cxl_memsim_refresh_fabric_state(ct3d);
+        return cxl_memsim_dcd_status_to_mbox(resp.status);
+    }
+
+    cxl_memsim_refresh_fabric_state(ct3d);
+    return CXL_MBOX_SUCCESS;
 }
 
 /* Simple request wrapper for backward compatibility */
@@ -2073,7 +2419,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    cxl_memsim_init();
+    cxl_memsim_init(ct3d);
     
     /* Log all CXL Type3 reads */
     //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
@@ -2107,6 +2453,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
             if (resp.status != 0) {
                 error_report("CXL Type3: CXLMemSim READ denied or failed at dpa=0x%lx status=%u",
                              (unsigned long)dpa_offset, resp.status);
+                cxl_memsim_refresh_fabric_state(ct3d);
                 return MEMTX_ERROR;
             }
 
@@ -2116,6 +2463,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
 
             /* Enforce simulated CXL latency */
             cxl_memsim_inject_latency(start_ns, resp.latency_ns);
+            cxl_memsim_maybe_refresh_fabric_state(ct3d);
 
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local read */
             if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
@@ -2137,7 +2485,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    cxl_memsim_init();
+    cxl_memsim_init(ct3d);
     
     /* Log all CXL Type3 writes */
     // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
@@ -2170,11 +2518,13 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
             if (resp.status != 0) {
                 error_report("CXL Type3: CXLMemSim WRITE denied or failed at dpa=0x%lx status=%u",
                              (unsigned long)dpa_offset, resp.status);
+                cxl_memsim_refresh_fabric_state(ct3d);
                 return MEMTX_ERROR;
             }
 
             /* Enforce simulated CXL latency */
             cxl_memsim_inject_latency(start_ns, resp.latency_ns);
+            cxl_memsim_maybe_refresh_fabric_state(ct3d);
 
             /* For TCP/RDMA mode, CXLMemSim is authoritative - skip local write */
             if (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
@@ -2229,6 +2579,10 @@ static const Property ct3_props[] = {
     DEFINE_PROP_UINT8("num-dc-regions", CXLType3Dev, dc.num_regions, 0),
     DEFINE_PROP_LINK("volatile-dc-memdev", CXLType3Dev, dc.host_dc,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_BOOL("memsim-dcd", CXLType3Dev, memsim_dcd, false),
+    DEFINE_PROP_BOOL("memsim-gfam", CXLType3Dev, memsim_gfam, false),
+    DEFINE_PROP_UINT32("memsim-gfam-host-id", CXLType3Dev,
+                       memsim_gfam_host_id, 0),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType3Dev,
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev,
@@ -3076,6 +3430,7 @@ static void qmp_cxl_process_dynamic_capacity_prescriptive(const char *path,
         i++;
     }
     if (group) {
+        group->host_id = hid;
         cxl_extent_group_list_insert_tail(&dcd->dc.extents_pending, group);
         dcd->dc.total_extent_count += num_extents;
     }

@@ -15,6 +15,7 @@
 #include "hw/pci/msi.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/pcie_port.h"
+#include "hw/cxl/cxl_vcs_switch.h"
 #include "hw/pci-bridge/cxl_upstream_port.h"
 /*
  * Null value of all Fs suggested by IEEE RA guidelines for use of
@@ -344,6 +345,24 @@ static void cxl_usp_realize(PCIDevice *d, Error **errp)
         goto err_cap;
     }
 
+    if (usp->vcs_name && usp->ppb != UINT8_MAX) {
+        Object *obj = object_resolve_path_component(object_get_objects_root(),
+                                                    usp->vcs_name);
+
+        if (!obj) {
+            error_setg(errp, "vcs '%s' not found", usp->vcs_name);
+            goto err_cap;
+        }
+        if (!object_dynamic_cast(obj, TYPE_CXL_VCS_SWITCH)) {
+            error_setg(errp, "'%s' is not a cxl-vcs-switch", usp->vcs_name);
+            goto err_cap;
+        }
+        cxl_vcs_register_usp(CXL_VCS_SWITCH(obj), usp, errp);
+        if (*errp) {
+            goto err_cap;
+        }
+    }
+
     return;
 
 err_cap:
@@ -369,6 +388,8 @@ static const Property cxl_upstream_props[] = {
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLUpstreamPort,
                                 width, PCIE_LINK_WIDTH_16),
+    DEFINE_PROP_STRING("vcs", CXLUpstreamPort, vcs_name),
+    DEFINE_PROP_UINT8("usppb", CXLUpstreamPort, ppb, UINT8_MAX),
 };
 
 static void cxl_upstream_class_init(ObjectClass *oc, const void *data)

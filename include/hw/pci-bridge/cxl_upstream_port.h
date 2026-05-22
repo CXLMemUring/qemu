@@ -18,6 +18,8 @@ typedef struct CXLUpstreamPort {
 
     DOECap doe_cdat;
     uint64_t sn;
+    char *vcs_name;
+    uint8_t ppb;
 } CXLUpstreamPort;
 
 #endif /* CXL_SUP_H */
