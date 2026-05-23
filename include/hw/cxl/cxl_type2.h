@@ -28,6 +28,12 @@
 /* Type 2 combines Type 1 (accelerator/cache) + Type 3 (memory) */
 #define CXL_TYPE2_DEFAULT_CACHE_SIZE (128 * MiB)
 #define CXL_TYPE2_DEFAULT_MEM_SIZE (4 * GiB)
+#define CXL_TYPE2_DCD_DEFAULT_GRANULARITY (1 * MiB)
+#define CXL_TYPE2_DCD_INIT_AUTO UINT64_MAX
+#define CXL_TYPE2_MAX_DCD_EXTENTS 64
+#define CXL_TYPE2_MAX_GFAM_HOSTS 16
+#define CXL_TYPE2_MAX_GFAM_MAPPINGS 128
+#define CXL_TYPE2_MAX_MHSLD_LINES 4096
 
 /* Coherency states for cache lines */
 typedef enum {
@@ -108,6 +114,71 @@ typedef struct CXLCohFreeBlock {
     struct CXLCohFreeBlock *next;
 } CXLCohFreeBlock;
 
+/* Dynamic Capacity Device extent state for Type2 CXL.mem BAR4 */
+typedef struct CXLType2DCDExtent {
+    uint64_t base;
+    uint64_t size;
+    uint64_t tag;
+    bool active;
+} CXLType2DCDExtent;
+
+typedef struct CXLType2DCDState {
+    bool enabled;
+    uint64_t granularity;
+    uint64_t initial_size;
+    uint64_t allocated;
+    uint64_t next_tag;
+    uint64_t add_requests;
+    uint64_t release_requests;
+    uint64_t failed_requests;
+    CXLType2DCDExtent extents[CXL_TYPE2_MAX_DCD_EXTENTS];
+    QemuMutex lock;
+} CXLType2DCDState;
+
+typedef struct CXLType2GFAMMapping {
+    uint32_t host_id;
+    uint32_t permissions;
+    uint64_t base;
+    uint64_t size;
+    bool active;
+} CXLType2GFAMMapping;
+
+typedef struct CXLType2GFAMState {
+    bool enabled;
+    uint32_t local_host_id;
+    uint32_t num_hosts;
+    uint32_t default_permissions;
+    uint32_t fabric_latency_ns;
+    uint32_t bandwidth_mbps;
+    uint64_t allowed_accesses;
+    uint64_t denied_accesses;
+    uint64_t total_latency_ns;
+    CXLType2GFAMMapping mappings[CXL_TYPE2_MAX_GFAM_MAPPINGS];
+    QemuMutex lock;
+} CXLType2GFAMState;
+
+typedef struct CXLType2MHSLDLine {
+    uint64_t line_addr;
+    uint32_t owner_head;
+    uint32_t sharer_mask;
+    bool valid;
+    bool modified;
+} CXLType2MHSLDLine;
+
+typedef struct CXLType2MHSLDState {
+    bool enabled;
+    uint32_t num_heads;
+    uint32_t local_head_id;
+    uint32_t coherency_latency_ns;
+    uint64_t reads;
+    uint64_t writes;
+    uint64_t atomics;
+    uint64_t conflicts;
+    uint64_t invalidations;
+    CXLType2MHSLDLine lines[CXL_TYPE2_MAX_MHSLD_LINES];
+    QemuMutex lock;
+} CXLType2MHSLDState;
+
 /* Main Type 2 device state */
 typedef struct CXLType2State {
     PCIDevice parent_obj;
@@ -150,6 +221,11 @@ typedef struct CXLType2State {
     uint64_t cache_size;
     uint64_t device_mem_size;
     uint64_t sn;                       /* Serial number */
+
+    /* Fabric memory feature models */
+    CXLType2DCDState dcd;
+    CXLType2GFAMState gfam;
+    CXLType2MHSLDState mhsld;
 
     /* GPU passthrough */
     CXLType2GPUInfo gpu_info;

@@ -63,6 +63,9 @@
 #define CXL_GPU_CAP_DMA_ENGINE      (1 << 2)  /* Hardware DMA engine available */
 #define CXL_GPU_CAP_COHERENT_POOL   (1 << 3)  /* Coherent shared memory pool */
 #define CXL_GPU_CAP_DEVICE_BIAS     (1 << 4)  /* Device-biased directory mode */
+#define CXL_GPU_CAP_DCD             (1 << 5)  /* Dynamic Capacity Device model */
+#define CXL_GPU_CAP_GFAM            (1 << 6)  /* Global Fabric Attached Memory */
+#define CXL_GPU_CAP_MHSLD           (1 << 7)  /* Multi-headed SLD coherency */
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
@@ -144,6 +147,16 @@ typedef enum {
     /* Coherency statistics commands */
     CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */
     CXL_GPU_CMD_COH_RESET_STATS     = 0xB1,  /* Reset coherency statistics */
+
+    /* DCD/GFAM/MH-SLD fabric-memory commands */
+    CXL_GPU_CMD_DCD_ADD             = 0xC0,  /* params: base, size, tag */
+    CXL_GPU_CMD_DCD_RELEASE         = 0xC1,  /* params: base, size, tag */
+    CXL_GPU_CMD_DCD_GET_INFO        = 0xC2,  /* results: total, alloc, free */
+    CXL_GPU_CMD_GFAM_GRANT          = 0xC8,  /* params: host, base, size, perms */
+    CXL_GPU_CMD_GFAM_REVOKE         = 0xC9,  /* params: host, base, size */
+    CXL_GPU_CMD_GFAM_GET_INFO       = 0xCA,  /* results: hosts, mappings, deny */
+    CXL_GPU_CMD_MHSLD_GET_INFO      = 0xD0,  /* results: heads, current, stats */
+    CXL_GPU_CMD_MHSLD_SET_HEAD      = 0xD1,  /* params: head_id */
 } CXLGPUCommand;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
@@ -155,9 +168,32 @@ typedef enum {
 #define CXL_GPU_REG_COH_DIR_SIZE    0x0318  /* Directory size (entries) */
 #define CXL_GPU_REG_COH_DIR_USED    0x0320  /* Directory used entries */
 
+/* DCD/GFAM/MH-SLD status registers */
+#define CXL_GPU_REG_DCD_TOTAL       0x0330  /* DCD total capacity */
+#define CXL_GPU_REG_DCD_ALLOCATED   0x0338  /* DCD allocated capacity */
+#define CXL_GPU_REG_DCD_FREE        0x0340  /* DCD free capacity */
+#define CXL_GPU_REG_DCD_EXTENTS     0x0348  /* Active DCD extent count */
+#define CXL_GPU_REG_GFAM_HOSTS      0x0350  /* Configured GFAM hosts */
+#define CXL_GPU_REG_GFAM_MAPPINGS   0x0358  /* Active GFAM mappings */
+#define CXL_GPU_REG_GFAM_DENIED     0x0360  /* Denied GFAM accesses */
+#define CXL_GPU_REG_MHSLD_HEADS     0x0370  /* MH-SLD head count */
+#define CXL_GPU_REG_MHSLD_HEAD_ID   0x0378  /* Local MH-SLD head id */
+#define CXL_GPU_REG_MHSLD_CONFLICTS 0x0380  /* MH-SLD coherency conflicts */
+#define CXL_GPU_REG_MHSLD_INV       0x0388  /* MH-SLD invalidations */
+
 /* Bias mode constants */
 #define CXL_BIAS_HOST               0       /* Host-biased: CPU is coherence home */
 #define CXL_BIAS_DEVICE             1       /* Device-biased: GPU snoop filter is home */
+
+/* DCD/GFAM permission bits */
+#define CXL_DCD_PERM_READ           (1 << 0)
+#define CXL_DCD_PERM_WRITE          (1 << 1)
+#define CXL_DCD_PERM_ATOMIC         (1 << 2)
+#define CXL_DCD_PERM_SHARED         (1 << 3)
+#define CXL_DCD_PERM_ALL            (CXL_DCD_PERM_READ | \
+                                     CXL_DCD_PERM_WRITE | \
+                                     CXL_DCD_PERM_ATOMIC | \
+                                     CXL_DCD_PERM_SHARED)
 
 /* Error codes (matching CUDA error codes) */
 typedef enum {

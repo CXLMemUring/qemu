@@ -1,5 +1,5 @@
 /*
- * CXL VCS-capable switch object
+ * Zettai CXL VCS-capable switch object
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -15,7 +15,7 @@
 #include "qom/object.h"
 #include "qom/object_interfaces.h"
 
-#define TYPE_CXL_VCS_SWITCH "cxl-vcs-switch"
+#define TYPE_CXL_VCS_SWITCH "zettai"
 OBJECT_DECLARE_TYPE(CXLVCSSwitch, CXLVCSSwitchClass, CXL_VCS_SWITCH)
 
 #define CXL_VPPB_BINDING_STATUS_UNBOUND      0x00

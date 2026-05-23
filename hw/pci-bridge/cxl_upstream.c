@@ -354,7 +354,7 @@ static void cxl_usp_realize(PCIDevice *d, Error **errp)
             goto err_cap;
         }
         if (!object_dynamic_cast(obj, TYPE_CXL_VCS_SWITCH)) {
-            error_setg(errp, "'%s' is not a cxl-vcs-switch", usp->vcs_name);
+            error_setg(errp, "'%s' is not a Zettai switch", usp->vcs_name);
             goto err_cap;
         }
         cxl_vcs_register_usp(CXL_VCS_SWITCH(obj), usp, errp);

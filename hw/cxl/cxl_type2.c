@@ -1406,14 +1406,30 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
                  addr, value);
 }
 
+static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
+                                            uint64_t size, bool is_write,
+                                            bool is_atomic);
+
 static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
+    CXLType2State *ct2d = opaque;
+
+    if (!cxl_type2_fabric_access_allowed(ct2d, addr, size, false, false)) {
+        return 0;
+    }
+
     /* Forward all device memory reads through the cache coherency layer */
     return cxl_type2_cache_read(opaque, addr, size);
 }
 
 static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
+    CXLType2State *ct2d = opaque;
+
+    if (!cxl_type2_fabric_access_allowed(ct2d, addr, size, true, false)) {
+        return;
+    }
+
     /* Forward all device memory writes through the cache coherency layer */
     cxl_type2_cache_write(opaque, addr, value, size);
 }
@@ -1489,6 +1505,567 @@ static const MemoryRegionOps cxl_type2_device_mem_ops = {
         .max_access_size = 8,
     },
 };
+
+/* ========================================================================
+ * DCD / GFAM / MH-SLD Fabric Memory Models
+ * ======================================================================== */
+
+static uint64_t cxl_type2_dcd_align(CXLType2State *ct2d, uint64_t value)
+{
+    uint64_t granularity = ct2d->dcd.granularity;
+
+    if (!granularity) {
+        granularity = CXL_TYPE2_DCD_DEFAULT_GRANULARITY;
+    }
+
+    return (value + granularity - 1) & ~(granularity - 1);
+}
+
+static bool cxl_type2_range_valid(CXLType2State *ct2d, uint64_t base,
+                                  uint64_t size)
+{
+    return size && base < ct2d->device_mem_size &&
+           size <= ct2d->device_mem_size - base;
+}
+
+static bool cxl_type2_dcd_overlaps_locked(CXLType2State *ct2d,
+                                          uint64_t base, uint64_t size)
+{
+    uint64_t end = base + size;
+
+    for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+        CXLType2DCDExtent *extent = &ct2d->dcd.extents[i];
+        uint64_t extent_end;
+
+        if (!extent->active) {
+            continue;
+        }
+
+        extent_end = extent->base + extent->size;
+        if (base < extent_end && extent->base < end) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool cxl_type2_dcd_allocated_locked(CXLType2State *ct2d,
+                                           uint64_t base, uint64_t size)
+{
+    uint64_t end = base + size;
+
+    if (!ct2d->dcd.enabled) {
+        return true;
+    }
+
+    for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+        CXLType2DCDExtent *extent = &ct2d->dcd.extents[i];
+
+        if (!extent->active) {
+            continue;
+        }
+        if (base >= extent->base && end <= extent->base + extent->size) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool cxl_type2_dcd_allocated(CXLType2State *ct2d, uint64_t base,
+                                    uint64_t size)
+{
+    bool allocated;
+
+    qemu_mutex_lock(&ct2d->dcd.lock);
+    allocated = cxl_type2_dcd_allocated_locked(ct2d, base, size);
+    qemu_mutex_unlock(&ct2d->dcd.lock);
+
+    return allocated;
+}
+
+static uint64_t cxl_type2_dcd_active_extents_locked(CXLType2State *ct2d)
+{
+    uint64_t count = 0;
+
+    for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+        if (ct2d->dcd.extents[i].active) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static bool cxl_type2_dcd_find_free_locked(CXLType2State *ct2d, uint64_t size,
+                                           uint64_t *base)
+{
+    uint64_t candidate = 0;
+
+    while (cxl_type2_range_valid(ct2d, candidate, size)) {
+        bool moved = false;
+
+        for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+            CXLType2DCDExtent *extent = &ct2d->dcd.extents[i];
+
+            if (!extent->active) {
+                continue;
+            }
+            if (candidate < extent->base + extent->size &&
+                extent->base < candidate + size) {
+                candidate = cxl_type2_dcd_align(ct2d,
+                                                extent->base + extent->size);
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) {
+            *base = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int cxl_type2_dcd_add(CXLType2State *ct2d, uint64_t requested_base,
+                             uint64_t size, uint64_t tag, uint64_t *out_base,
+                             uint64_t *out_size, uint64_t *out_tag)
+{
+    uint64_t base = requested_base;
+    uint64_t aligned_size = cxl_type2_dcd_align(ct2d, size);
+    int slot = -1;
+
+    if (!ct2d->dcd.enabled) {
+        return -EOPNOTSUPP;
+    }
+
+    qemu_mutex_lock(&ct2d->dcd.lock);
+    ct2d->dcd.add_requests++;
+
+    if (!aligned_size || aligned_size > ct2d->device_mem_size) {
+        ct2d->dcd.failed_requests++;
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+        return -EINVAL;
+    }
+
+    if (requested_base == UINT64_MAX) {
+        if (!cxl_type2_dcd_find_free_locked(ct2d, aligned_size, &base)) {
+            ct2d->dcd.failed_requests++;
+            qemu_mutex_unlock(&ct2d->dcd.lock);
+            return -ENOSPC;
+        }
+    } else if (base != cxl_type2_dcd_align(ct2d, base)) {
+        ct2d->dcd.failed_requests++;
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+        return -EINVAL;
+    }
+
+    if (!cxl_type2_range_valid(ct2d, base, aligned_size) ||
+        cxl_type2_dcd_overlaps_locked(ct2d, base, aligned_size)) {
+        ct2d->dcd.failed_requests++;
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+        return -ENOSPC;
+    }
+
+    for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+        if (!ct2d->dcd.extents[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        ct2d->dcd.failed_requests++;
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+        return -ENOSPC;
+    }
+
+    if (!tag) {
+        tag = ct2d->dcd.next_tag++;
+    }
+
+    ct2d->dcd.extents[slot] = (CXLType2DCDExtent) {
+        .base = base,
+        .size = aligned_size,
+        .tag = tag,
+        .active = true,
+    };
+    ct2d->dcd.allocated += aligned_size;
+
+    if (out_base) {
+        *out_base = base;
+    }
+    if (out_size) {
+        *out_size = aligned_size;
+    }
+    if (out_tag) {
+        *out_tag = tag;
+    }
+
+    qemu_mutex_unlock(&ct2d->dcd.lock);
+
+    qemu_log("CXL Type2 DCD: add base=0x%" PRIx64 " size=0x%" PRIx64
+             " tag=%" PRIu64 "\n", base, aligned_size, tag);
+    return 0;
+}
+
+static int cxl_type2_dcd_release(CXLType2State *ct2d, uint64_t base,
+                                 uint64_t size, uint64_t tag)
+{
+    uint64_t aligned_size = cxl_type2_dcd_align(ct2d, size);
+
+    if (!ct2d->dcd.enabled) {
+        return -EOPNOTSUPP;
+    }
+
+    qemu_mutex_lock(&ct2d->dcd.lock);
+    ct2d->dcd.release_requests++;
+
+    for (int i = 0; i < CXL_TYPE2_MAX_DCD_EXTENTS; i++) {
+        CXLType2DCDExtent *extent = &ct2d->dcd.extents[i];
+
+        if (!extent->active || extent->base != base ||
+            extent->size != aligned_size) {
+            continue;
+        }
+        if (tag && extent->tag != tag) {
+            continue;
+        }
+
+        extent->active = false;
+        ct2d->dcd.allocated -= extent->size;
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+
+        qemu_log("CXL Type2 DCD: release base=0x%" PRIx64
+                 " size=0x%" PRIx64 " tag=%" PRIu64 "\n",
+                 base, aligned_size, tag);
+        return 0;
+    }
+
+    ct2d->dcd.failed_requests++;
+    qemu_mutex_unlock(&ct2d->dcd.lock);
+    return -ENOENT;
+}
+
+static void cxl_type2_gfam_revoke_range(CXLType2State *ct2d, uint64_t base,
+                                        uint64_t size)
+{
+    uint64_t end = base + size;
+
+    qemu_mutex_lock(&ct2d->gfam.lock);
+    for (int i = 0; i < CXL_TYPE2_MAX_GFAM_MAPPINGS; i++) {
+        CXLType2GFAMMapping *mapping = &ct2d->gfam.mappings[i];
+        uint64_t mapping_end;
+
+        if (!mapping->active) {
+            continue;
+        }
+
+        mapping_end = mapping->base + mapping->size;
+        if (base < mapping_end && mapping->base < end) {
+            mapping->active = false;
+        }
+    }
+    qemu_mutex_unlock(&ct2d->gfam.lock);
+}
+
+static int cxl_type2_gfam_grant(CXLType2State *ct2d, uint32_t host_id,
+                                uint64_t base, uint64_t size,
+                                uint32_t permissions)
+{
+    int slot = -1;
+
+    if (!ct2d->gfam.enabled) {
+        return -EOPNOTSUPP;
+    }
+    if (host_id >= ct2d->gfam.num_hosts || !permissions ||
+        !cxl_type2_dcd_allocated(ct2d, base, size)) {
+        return -EINVAL;
+    }
+
+    qemu_mutex_lock(&ct2d->gfam.lock);
+    for (int i = 0; i < CXL_TYPE2_MAX_GFAM_MAPPINGS; i++) {
+        CXLType2GFAMMapping *mapping = &ct2d->gfam.mappings[i];
+
+        if (mapping->active && mapping->host_id == host_id &&
+            mapping->base == base && mapping->size == size) {
+            mapping->permissions = permissions;
+            qemu_mutex_unlock(&ct2d->gfam.lock);
+            return 0;
+        }
+        if (!mapping->active && slot < 0) {
+            slot = i;
+        }
+    }
+
+    if (slot < 0) {
+        qemu_mutex_unlock(&ct2d->gfam.lock);
+        return -ENOSPC;
+    }
+
+    ct2d->gfam.mappings[slot] = (CXLType2GFAMMapping) {
+        .host_id = host_id,
+        .permissions = permissions,
+        .base = base,
+        .size = size,
+        .active = true,
+    };
+
+    qemu_mutex_unlock(&ct2d->gfam.lock);
+    return 0;
+}
+
+static int cxl_type2_gfam_revoke(CXLType2State *ct2d, uint32_t host_id,
+                                 uint64_t base, uint64_t size)
+{
+    if (!ct2d->gfam.enabled) {
+        return -EOPNOTSUPP;
+    }
+
+    qemu_mutex_lock(&ct2d->gfam.lock);
+    for (int i = 0; i < CXL_TYPE2_MAX_GFAM_MAPPINGS; i++) {
+        CXLType2GFAMMapping *mapping = &ct2d->gfam.mappings[i];
+
+        if (mapping->active && mapping->host_id == host_id &&
+            mapping->base == base && mapping->size == size) {
+            mapping->active = false;
+            qemu_mutex_unlock(&ct2d->gfam.lock);
+            return 0;
+        }
+    }
+    qemu_mutex_unlock(&ct2d->gfam.lock);
+    return -ENOENT;
+}
+
+static uint64_t cxl_type2_gfam_active_mappings_locked(CXLType2State *ct2d)
+{
+    uint64_t count = 0;
+
+    for (int i = 0; i < CXL_TYPE2_MAX_GFAM_MAPPINGS; i++) {
+        if (ct2d->gfam.mappings[i].active) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static bool cxl_type2_gfam_allowed(CXLType2State *ct2d, uint32_t host_id,
+                                   uint64_t base, uint64_t size,
+                                   bool is_write, bool is_atomic)
+{
+    uint32_t required = is_write ? CXL_DCD_PERM_WRITE : CXL_DCD_PERM_READ;
+    uint64_t end = base + size;
+
+    if (!ct2d->gfam.enabled) {
+        return true;
+    }
+    if (is_atomic) {
+        required |= CXL_DCD_PERM_ATOMIC;
+    }
+
+    qemu_mutex_lock(&ct2d->gfam.lock);
+    for (int i = 0; i < CXL_TYPE2_MAX_GFAM_MAPPINGS; i++) {
+        CXLType2GFAMMapping *mapping = &ct2d->gfam.mappings[i];
+
+        if (!mapping->active || mapping->host_id != host_id) {
+            continue;
+        }
+        if (base >= mapping->base && end <= mapping->base + mapping->size &&
+            (mapping->permissions & required) == required) {
+            ct2d->gfam.allowed_accesses++;
+            ct2d->gfam.total_latency_ns += ct2d->gfam.fabric_latency_ns;
+            qemu_mutex_unlock(&ct2d->gfam.lock);
+            return true;
+        }
+    }
+
+    ct2d->gfam.denied_accesses++;
+    qemu_mutex_unlock(&ct2d->gfam.lock);
+    return false;
+}
+
+static uint32_t cxl_type2_popcount32(uint32_t value)
+{
+    uint32_t count = 0;
+
+    while (value) {
+        count += value & 1;
+        value >>= 1;
+    }
+
+    return count;
+}
+
+static void cxl_type2_mhsld_record(CXLType2State *ct2d, uint64_t addr,
+                                   bool is_write, bool is_atomic)
+{
+    CXLType2MHSLDLine *line;
+    uint64_t line_addr;
+    uint32_t head;
+    uint32_t head_mask;
+    uint32_t other_sharers;
+    uint32_t index;
+
+    if (!ct2d->mhsld.enabled) {
+        return;
+    }
+
+    line_addr = addr & CXL_CACHE_LINE_MASK;
+    index = (line_addr >> 6) % CXL_TYPE2_MAX_MHSLD_LINES;
+    head = ct2d->mhsld.local_head_id;
+    head_mask = head < 32 ? 1u << head : 0;
+
+    qemu_mutex_lock(&ct2d->mhsld.lock);
+    line = &ct2d->mhsld.lines[index];
+    if (!line->valid || line->line_addr != line_addr) {
+        *line = (CXLType2MHSLDLine) {
+            .line_addr = line_addr,
+            .owner_head = head,
+            .sharer_mask = head_mask,
+            .valid = true,
+            .modified = false,
+        };
+    }
+
+    if (is_write || is_atomic) {
+        other_sharers = line->sharer_mask & ~head_mask;
+        if ((line->modified && line->owner_head != head) || other_sharers) {
+            ct2d->mhsld.conflicts++;
+            ct2d->mhsld.invalidations += cxl_type2_popcount32(other_sharers);
+        }
+        line->owner_head = head;
+        line->sharer_mask = head_mask;
+        line->modified = true;
+        ct2d->mhsld.writes++;
+        if (is_atomic) {
+            ct2d->mhsld.atomics++;
+        }
+    } else {
+        if (line->modified && line->owner_head != head) {
+            ct2d->mhsld.conflicts++;
+            line->modified = false;
+        }
+        line->sharer_mask |= head_mask;
+        ct2d->mhsld.reads++;
+    }
+
+    qemu_mutex_unlock(&ct2d->mhsld.lock);
+}
+
+static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
+                                            uint64_t size, bool is_write,
+                                            bool is_atomic)
+{
+    if (!cxl_type2_range_valid(ct2d, addr, size)) {
+        return false;
+    }
+
+    if (!cxl_type2_dcd_allocated(ct2d, addr, size)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "CXL Type2 DCD: access outside allocated capacity "
+                      "addr=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+                      addr, size);
+        return false;
+    }
+
+    if (!cxl_type2_gfam_allowed(ct2d, ct2d->gfam.local_host_id, addr, size,
+                                is_write, is_atomic)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "CXL Type2 GFAM: denied host=%u addr=0x%" PRIx64
+                      " size=0x%" PRIx64 " write=%d\n",
+                      ct2d->gfam.local_host_id, addr, size, is_write);
+        return false;
+    }
+
+    cxl_type2_mhsld_record(ct2d, addr, is_write, is_atomic);
+    return true;
+}
+
+static void cxl_type2_fabric_features_init(CXLType2State *ct2d)
+{
+    bool use_dcd = ct2d->dcd.enabled || ct2d->gfam.enabled;
+    uint64_t initial_size;
+
+    qemu_mutex_init(&ct2d->dcd.lock);
+    qemu_mutex_init(&ct2d->gfam.lock);
+    qemu_mutex_init(&ct2d->mhsld.lock);
+
+    if (!ct2d->dcd.granularity ||
+        (ct2d->dcd.granularity & (ct2d->dcd.granularity - 1))) {
+        ct2d->dcd.granularity = CXL_TYPE2_DCD_DEFAULT_GRANULARITY;
+    }
+    ct2d->dcd.next_tag = 1;
+
+    if (ct2d->gfam.num_hosts == 0) {
+        ct2d->gfam.num_hosts = 1;
+    }
+    if (ct2d->gfam.num_hosts > CXL_TYPE2_MAX_GFAM_HOSTS) {
+        ct2d->gfam.num_hosts = CXL_TYPE2_MAX_GFAM_HOSTS;
+    }
+    if (ct2d->gfam.local_host_id >= ct2d->gfam.num_hosts) {
+        ct2d->gfam.local_host_id = 0;
+    }
+    if (!ct2d->gfam.default_permissions) {
+        ct2d->gfam.default_permissions = CXL_DCD_PERM_ALL;
+    }
+    if (!ct2d->gfam.fabric_latency_ns) {
+        ct2d->gfam.fabric_latency_ns = 150;
+    }
+    if (!ct2d->gfam.bandwidth_mbps) {
+        ct2d->gfam.bandwidth_mbps = 32768;
+    }
+
+    if (!ct2d->mhsld.num_heads) {
+        ct2d->mhsld.num_heads = ct2d->gfam.num_hosts;
+    }
+    if (ct2d->mhsld.num_heads > 32) {
+        ct2d->mhsld.num_heads = 32;
+    }
+    if (ct2d->mhsld.local_head_id >= ct2d->mhsld.num_heads) {
+        ct2d->mhsld.local_head_id = 0;
+    }
+    if (!ct2d->mhsld.coherency_latency_ns) {
+        ct2d->mhsld.coherency_latency_ns = 200;
+    }
+
+    if (!use_dcd) {
+        return;
+    }
+
+    ct2d->dcd.enabled = true;
+    initial_size = ct2d->dcd.initial_size;
+    if (initial_size == CXL_TYPE2_DCD_INIT_AUTO) {
+        initial_size = ct2d->device_mem_size;
+    }
+    if (initial_size) {
+        uint64_t base;
+        uint64_t size;
+        uint64_t tag;
+
+        if (cxl_type2_dcd_add(ct2d, 0, initial_size, 1, &base, &size,
+                              &tag) == 0 && ct2d->gfam.enabled) {
+            for (uint32_t host = 0; host < ct2d->gfam.num_hosts; host++) {
+                cxl_type2_gfam_grant(ct2d, host, base, size,
+                                     ct2d->gfam.default_permissions);
+            }
+        }
+    }
+
+    qemu_log("CXL Type2 fabric: DCD=%d GFAM=%d MHSLD=%d initial=%" PRIu64
+             "MB hosts=%u heads=%u\n",
+             ct2d->dcd.enabled, ct2d->gfam.enabled, ct2d->mhsld.enabled,
+             initial_size / MiB, ct2d->gfam.num_hosts,
+             ct2d->mhsld.num_heads);
+}
+
+static void cxl_type2_fabric_features_cleanup(CXLType2State *ct2d)
+{
+    qemu_mutex_destroy(&ct2d->mhsld.lock);
+    qemu_mutex_destroy(&ct2d->gfam.lock);
+    qemu_mutex_destroy(&ct2d->dcd.lock);
+}
 
 /* ========================================================================
  * Coherent Pool Allocator
@@ -1748,7 +2325,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
             /* Also update shadow copy in device_mem for coherency tracking */
-            if (dev_ptr + size <= ct2d->device_mem_size) {
+            if (dev_ptr + size <= ct2d->device_mem_size &&
+                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
+                                                true, false)) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
@@ -1761,7 +2340,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
         } else {
             /* Fallback: copy to device memory region */
-            if (dev_ptr + size <= ct2d->device_mem_size) {
+            if (dev_ptr + size <= ct2d->device_mem_size &&
+                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
+                                                true, false)) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
@@ -1795,7 +2376,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             }
             /* Update shadow copy from GPU for coherency */
-            if (dev_ptr + size <= ct2d->device_mem_size) {
+            if (dev_ptr + size <= ct2d->device_mem_size &&
+                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
+                                                false, false)) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
@@ -1803,7 +2386,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             }
         } else {
             /* Fallback: copy from device memory region */
-            if (dev_ptr + size <= ct2d->device_mem_size) {
+            if (dev_ptr + size <= ct2d->device_mem_size &&
+                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
+                                                false, false)) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     /* Notify BAR coherency layer before GPU read */
@@ -1910,7 +2495,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (hetgpu->initialized) {
                 /* Get data from device memory region (BAR4/HDM) */
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size) {
+                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size &&
+                    cxl_type2_fabric_access_allowed(ct2d, bar4_offset,
+                                                    xfer_size, false, false)) {
                     err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr,
                                              mem + bar4_offset, xfer_size);
                     if (err != HETGPU_SUCCESS) {
@@ -1940,7 +2527,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             if (hetgpu->initialized) {
                 /* Write data to device memory region (BAR4/HDM) */
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size) {
+                if (mem && bar4_offset + xfer_size <= ct2d->device_mem_size &&
+                    cxl_type2_fabric_access_allowed(ct2d, bar4_offset,
+                                                    xfer_size, true, false)) {
                     err = hetgpu_memcpy_dtoh(hetgpu, mem + bar4_offset,
                                              src_dev_ptr, xfer_size);
                     if (err != HETGPU_SUCCESS) {
@@ -2283,6 +2872,157 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    /* ---- DCD / GFAM / MH-SLD fabric-memory commands ---- */
+    case CXL_GPU_CMD_DCD_ADD:
+        {
+            uint64_t base = ct2d->gpu_cmd.params[0];
+            uint64_t add_size = ct2d->gpu_cmd.params[1];
+            uint64_t tag = ct2d->gpu_cmd.params[2];
+            uint64_t out_base = 0;
+            uint64_t out_size = 0;
+            uint64_t out_tag = 0;
+            int ret;
+
+            ret = cxl_type2_dcd_add(ct2d, base, add_size, tag, &out_base,
+                                    &out_size, &out_tag);
+            if (ret == 0) {
+                ct2d->gpu_cmd.results[0] = out_base;
+                ct2d->gpu_cmd.results[1] = out_size;
+                ct2d->gpu_cmd.results[2] = out_tag;
+                ct2d->gpu_cmd.results[3] = ct2d->dcd.allocated;
+                if (ct2d->gfam.enabled) {
+                    for (uint32_t host = 0; host < ct2d->gfam.num_hosts; host++) {
+                        cxl_type2_gfam_grant(ct2d, host, out_base, out_size,
+                                             ct2d->gfam.default_permissions);
+                    }
+                }
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_OUT_OF_MEMORY;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_DCD_RELEASE:
+        {
+            uint64_t base = ct2d->gpu_cmd.params[0];
+            uint64_t release_size = ct2d->gpu_cmd.params[1];
+            uint64_t tag = ct2d->gpu_cmd.params[2];
+            int ret;
+
+            ret = cxl_type2_dcd_release(ct2d, base, release_size, tag);
+            if (ret == 0) {
+                cxl_type2_gfam_revoke_range(ct2d, base, release_size);
+                ct2d->gpu_cmd.results[0] = ct2d->dcd.allocated;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_DCD_GET_INFO:
+        {
+            qemu_mutex_lock(&ct2d->dcd.lock);
+            ct2d->gpu_cmd.results[0] = ct2d->device_mem_size;
+            ct2d->gpu_cmd.results[1] = ct2d->dcd.enabled ?
+                                       ct2d->dcd.allocated :
+                                       ct2d->device_mem_size;
+            ct2d->gpu_cmd.results[2] = ct2d->dcd.enabled ?
+                                       ct2d->device_mem_size -
+                                       ct2d->dcd.allocated : 0;
+            ct2d->gpu_cmd.results[3] =
+                cxl_type2_dcd_active_extents_locked(ct2d);
+            if (ct2d->gpu_cmd.data_size >=
+                sizeof(ct2d->dcd.extents)) {
+                memcpy(ct2d->gpu_cmd.data, ct2d->dcd.extents,
+                       sizeof(ct2d->dcd.extents));
+            }
+            qemu_mutex_unlock(&ct2d->dcd.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_GFAM_GRANT:
+        {
+            uint32_t host = ct2d->gpu_cmd.params[0];
+            uint64_t base = ct2d->gpu_cmd.params[1];
+            uint64_t grant_size = ct2d->gpu_cmd.params[2];
+            uint32_t permissions = ct2d->gpu_cmd.params[3];
+            int ret;
+
+            ret = cxl_type2_gfam_grant(ct2d, host, base, grant_size,
+                                       permissions);
+            ct2d->gpu_cmd.cmd_result = ret == 0 ? CXL_GPU_SUCCESS :
+                                                  CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        break;
+
+    case CXL_GPU_CMD_GFAM_REVOKE:
+        {
+            uint32_t host = ct2d->gpu_cmd.params[0];
+            uint64_t base = ct2d->gpu_cmd.params[1];
+            uint64_t revoke_size = ct2d->gpu_cmd.params[2];
+            int ret;
+
+            ret = cxl_type2_gfam_revoke(ct2d, host, base, revoke_size);
+            ct2d->gpu_cmd.cmd_result = ret == 0 ? CXL_GPU_SUCCESS :
+                                                  CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        break;
+
+    case CXL_GPU_CMD_GFAM_GET_INFO:
+        {
+            qemu_mutex_lock(&ct2d->gfam.lock);
+            ct2d->gpu_cmd.results[0] = ct2d->gfam.num_hosts;
+            ct2d->gpu_cmd.results[1] =
+                cxl_type2_gfam_active_mappings_locked(ct2d);
+            ct2d->gpu_cmd.results[2] = ct2d->gfam.allowed_accesses;
+            ct2d->gpu_cmd.results[3] = ct2d->gfam.denied_accesses;
+            if (ct2d->gpu_cmd.data_size >=
+                sizeof(ct2d->gfam.mappings)) {
+                memcpy(ct2d->gpu_cmd.data, ct2d->gfam.mappings,
+                       sizeof(ct2d->gfam.mappings));
+            }
+            qemu_mutex_unlock(&ct2d->gfam.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_MHSLD_GET_INFO:
+        {
+            qemu_mutex_lock(&ct2d->mhsld.lock);
+            ct2d->gpu_cmd.results[0] = ct2d->mhsld.num_heads;
+            ct2d->gpu_cmd.results[1] = ct2d->mhsld.local_head_id;
+            ct2d->gpu_cmd.results[2] = ct2d->mhsld.reads;
+            ct2d->gpu_cmd.results[3] = ct2d->mhsld.writes;
+            if (ct2d->gpu_cmd.data_size >= 4 * sizeof(uint64_t)) {
+                uint64_t *stats = (uint64_t *)ct2d->gpu_cmd.data;
+
+                stats[0] = ct2d->mhsld.atomics;
+                stats[1] = ct2d->mhsld.conflicts;
+                stats[2] = ct2d->mhsld.invalidations;
+                stats[3] = ct2d->mhsld.coherency_latency_ns;
+            }
+            qemu_mutex_unlock(&ct2d->mhsld.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_MHSLD_SET_HEAD:
+        {
+            uint32_t head = ct2d->gpu_cmd.params[0];
+
+            if (head >= ct2d->mhsld.num_heads) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else {
+                ct2d->mhsld.local_head_id = head;
+                ct2d->gpu_cmd.results[0] = head;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            }
+        }
+        break;
+
     default:
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
         break;
@@ -2341,7 +3081,9 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         value = ct2d->gpu_cmd.results[3];
         break;
     case CXL_GPU_REG_TOTAL_MEM:
-        if (hetgpu->initialized && hetgpu->props.total_memory > 0) {
+        if (ct2d->dcd.enabled) {
+            value = ct2d->dcd.allocated;
+        } else if (hetgpu->initialized && hetgpu->props.total_memory > 0) {
             value = hetgpu->props.total_memory;
         } else {
             value = ct2d->device_mem_size;
@@ -2350,8 +3092,11 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         //         (unsigned long)value, (unsigned long)(value / (1024*1024)));
         break;
     case CXL_GPU_REG_FREE_MEM:
-        /* Report device memory as free memory */
-        value = ct2d->device_mem_size;
+        if (ct2d->dcd.enabled) {
+            value = ct2d->device_mem_size - ct2d->dcd.allocated;
+        } else {
+            value = ct2d->device_mem_size;
+        }
         break;
     case CXL_GPU_REG_CC_MAJOR:
         value = hetgpu->initialized ? hetgpu->props.compute_capability_major : 8;
@@ -2386,6 +3131,45 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case CXL_GPU_REG_COH_DIR_USED:
         value = ct2d->bar_coherency.snoop_filter_size;
+        break;
+    case CXL_GPU_REG_DCD_TOTAL:
+        value = ct2d->device_mem_size;
+        break;
+    case CXL_GPU_REG_DCD_ALLOCATED:
+        value = ct2d->dcd.enabled ? ct2d->dcd.allocated :
+                                    ct2d->device_mem_size;
+        break;
+    case CXL_GPU_REG_DCD_FREE:
+        value = ct2d->dcd.enabled ? ct2d->device_mem_size -
+                                    ct2d->dcd.allocated : 0;
+        break;
+    case CXL_GPU_REG_DCD_EXTENTS:
+        qemu_mutex_lock(&ct2d->dcd.lock);
+        value = cxl_type2_dcd_active_extents_locked(ct2d);
+        qemu_mutex_unlock(&ct2d->dcd.lock);
+        break;
+    case CXL_GPU_REG_GFAM_HOSTS:
+        value = ct2d->gfam.num_hosts;
+        break;
+    case CXL_GPU_REG_GFAM_MAPPINGS:
+        qemu_mutex_lock(&ct2d->gfam.lock);
+        value = cxl_type2_gfam_active_mappings_locked(ct2d);
+        qemu_mutex_unlock(&ct2d->gfam.lock);
+        break;
+    case CXL_GPU_REG_GFAM_DENIED:
+        value = ct2d->gfam.denied_accesses;
+        break;
+    case CXL_GPU_REG_MHSLD_HEADS:
+        value = ct2d->mhsld.num_heads;
+        break;
+    case CXL_GPU_REG_MHSLD_HEAD_ID:
+        value = ct2d->mhsld.local_head_id;
+        break;
+    case CXL_GPU_REG_MHSLD_CONFLICTS:
+        value = ct2d->mhsld.conflicts;
+        break;
+    case CXL_GPU_REG_MHSLD_INV:
+        value = ct2d->mhsld.invalidations;
         break;
 
     default:
@@ -2564,6 +3348,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
     }
 
+    /* Initialize Type2 CXL.mem fabric feature models. */
+    cxl_type2_fabric_features_init(ct2d);
+
     /* Initialize coherency protocol */
     cxl_type2_coherency_init(ct2d);
 
@@ -2676,6 +3463,15 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                                  CXL_GPU_CAP_CACHE_COHERENT |
                                  CXL_GPU_CAP_COHERENT_POOL |
                                  CXL_GPU_CAP_DEVICE_BIAS;
+    if (ct2d->dcd.enabled) {
+        ct2d->gpu_cmd.capabilities |= CXL_GPU_CAP_DCD;
+    }
+    if (ct2d->gfam.enabled) {
+        ct2d->gpu_cmd.capabilities |= CXL_GPU_CAP_GFAM;
+    }
+    if (ct2d->mhsld.enabled) {
+        ct2d->gpu_cmd.capabilities |= CXL_GPU_CAP_MHSLD;
+    }
 
     /* Initialize coherent shared memory pool at top of BAR4 */
     {
@@ -2781,6 +3577,8 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         ct2d->bulk_transfer_ptr = NULL;
     }
 
+    cxl_type2_fabric_features_cleanup(ct2d);
+
     qemu_log("CXL Type2: Device exit complete\n");
 }
 
@@ -2802,6 +3600,25 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_INT32("hetgpu-device", CXLType2State, gpu_info.hetgpu_device_index, 0),
     DEFINE_PROP_UINT32("hetgpu-backend", CXLType2State, gpu_info.hetgpu_backend,
                        HETGPU_BACKEND_AUTO),
+    DEFINE_PROP_BOOL("dcd", CXLType2State, dcd.enabled, false),
+    DEFINE_PROP_SIZE("dcd-granularity", CXLType2State, dcd.granularity,
+                     CXL_TYPE2_DCD_DEFAULT_GRANULARITY),
+    DEFINE_PROP_SIZE("dcd-initial-size", CXLType2State, dcd.initial_size,
+                     CXL_TYPE2_DCD_INIT_AUTO),
+    DEFINE_PROP_BOOL("gfam", CXLType2State, gfam.enabled, false),
+    DEFINE_PROP_UINT32("gfam-hosts", CXLType2State, gfam.num_hosts, 1),
+    DEFINE_PROP_UINT32("gfam-host-id", CXLType2State, gfam.local_host_id, 0),
+    DEFINE_PROP_UINT32("gfam-default-perms", CXLType2State,
+                       gfam.default_permissions, CXL_DCD_PERM_ALL),
+    DEFINE_PROP_UINT32("gfam-latency-ns", CXLType2State,
+                       gfam.fabric_latency_ns, 150),
+    DEFINE_PROP_UINT32("gfam-bandwidth-mbps", CXLType2State,
+                       gfam.bandwidth_mbps, 32768),
+    DEFINE_PROP_BOOL("mhsld", CXLType2State, mhsld.enabled, false),
+    DEFINE_PROP_UINT32("mhsld-heads", CXLType2State, mhsld.num_heads, 1),
+    DEFINE_PROP_UINT32("mhsld-head-id", CXLType2State, mhsld.local_head_id, 0),
+    DEFINE_PROP_UINT32("mhsld-coh-latency-ns", CXLType2State,
+                       mhsld.coherency_latency_ns, 200),
 };
 
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)

@@ -16,8 +16,11 @@
 #include "qemu/module.h"
 #include "hw/qdev-properties.h"
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_vcs_switch.h"
 
 #define CXL_SWCCI_MSIX_MBOX 3
+#define PCI_VENDOR_ID_ZETTAI 0x7a74
+#define PCI_DEVICE_ID_ZETTAI_SWITCH_MAILBOX_CCI 0xa123
 
 static void cswmbcci_reset(DeviceState *dev)
 {
@@ -31,18 +34,31 @@ static void cswbcci_realize(PCIDevice *pci_dev, Error **errp)
     CXLComponentState *cxl_cstate = &cswmb->cxl_cstate;
     CXLDeviceState *cxl_dstate = &cswmb->cxl_dstate;
     CXLDVSECRegisterLocator *regloc_dvsec;
-    CXLUpstreamPort *usp;
+    CXLUpstreamPort *usp = NULL;
+    CXLVCSSwitch *vcs = NULL;
 
     if (!cswmb->target) {
         error_setg(errp, "Target not set");
         return;
     }
-    usp = CXL_USP(cswmb->target);
+    if (object_dynamic_cast(cswmb->target, TYPE_CXL_VCS_SWITCH)) {
+        vcs = CXL_VCS_SWITCH(cswmb->target);
+        if (!vcs->usp_ppbs[0]) {
+            error_setg(errp, "VCS target requires a registered usppb 0");
+            return;
+        }
+        usp = vcs->usp_ppbs[0]->usp;
+    } else if (object_dynamic_cast(cswmb->target, TYPE_CXL_USP)) {
+        usp = CXL_USP(cswmb->target);
+    } else {
+        error_setg(errp, "Target must be a cxl-upstream or Zettai switch");
+        return;
+    }
 
     pcie_endpoint_cap_init(pci_dev, 0x80);
     cxl_cstate->dvsec_offset = 0x100;
     cxl_cstate->pdev = pci_dev;
-    cswmb->cci = &usp->swcci;
+    cswmb->cci = vcs ? &vcs->swcci : &usp->swcci;
     cxl_device_register_block_init(OBJECT(pci_dev), cxl_dstate, cswmb->cci);
     pci_register_bar(pci_dev, 0,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -57,9 +73,14 @@ static void cswbcci_realize(PCIDevice *pci_dev, Error **errp)
                                REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC,
                                REG_LOC_DVSEC_REVID, (uint8_t *)regloc_dvsec);
 
-    cxl_initialize_mailbox_swcci(cswmb->cci, DEVICE(pci_dev),
-                                 DEVICE(cswmb->target),
-                                 CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+    if (vcs) {
+        cxl_initialize_vcs_swcci(cswmb->cci, vcs, DEVICE(pci_dev),
+                                 DEVICE(usp), CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+    } else {
+        cxl_initialize_mailbox_swcci(cswmb->cci, DEVICE(pci_dev),
+                                     DEVICE(usp),
+                                     CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+    }
 }
 
 static void cswmbcci_exit(PCIDevice *pci_dev)
@@ -69,7 +90,7 @@ static void cswmbcci_exit(PCIDevice *pci_dev)
 
 static const Property cxl_switch_cci_props[] = {
     DEFINE_PROP_LINK("target", CSWMBCCIDev,
-                     target, TYPE_CXL_USP, PCIDevice *),
+                     target, TYPE_OBJECT, Object *),
 };
 
 static void cswmbcci_class_init(ObjectClass *oc, const void *data)
@@ -82,12 +103,11 @@ static void cswmbcci_class_init(ObjectClass *oc, const void *data)
     /* Serial bus, CXL Switch CCI */
     pc->class_id = 0x0c0b;
     /*
-     * Huawei Technologies
-     * CXL Switch Mailbox CCI - DID assigned for emulation only.
-     * No real hardware will ever use this ID.
+     * Zettai emulated CXL Switch Mailbox CCI. The vendor id is reserved for
+     * this simulator tree and is not a PCI-SIG assigned production id.
      */
-    pc->vendor_id = 0x19e5;
-    pc->device_id = 0xa123;
+    pc->vendor_id = PCI_VENDOR_ID_ZETTAI;
+    pc->device_id = PCI_DEVICE_ID_ZETTAI_SWITCH_MAILBOX_CCI;
     pc->revision = 0;
     dc->desc = "CXL Switch Mailbox CCI";
     device_class_set_legacy_reset(dc, cswmbcci_reset);
