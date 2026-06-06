@@ -359,6 +359,23 @@
   'if': 'CONFIG_VHOST_CRYPTO' }
 
 ##
+# @ZettaiProperties:
+#
+# Properties for Zettai CXL VCS-capable switch objects.
+#
+# @usp-ppbs: number of physical upstream PPBs in the switch
+#
+# @dsp-ppbs: number of physical downstream PPBs in the switch
+#
+# @local-fm: true when this QEMU instance owns the Fabric Manager CCI
+##
+{ 'struct': 'ZettaiProperties',
+  'data': {
+    '*usp-ppbs': 'uint8',
+    '*dsp-ppbs': 'uint8',
+    '*local-fm': 'bool' } }
+
+##
 # @DBusVMStateProperties:
 #
 # Properties for dbus-vmstate objects.
@@ -1242,6 +1259,7 @@
     'tls-creds-x509',
     'tls-cipher-suites',
     { 'name': 'x-remote-object', 'features': [ 'unstable' ] },
+    'zettai',
     { 'name': 'x-vfio-user-server', 'features': [ 'unstable' ] }
   ] }
 
@@ -1318,6 +1336,7 @@
       'tls-creds-x509':             'TlsCredsX509Properties',
       'tls-cipher-suites':          'TlsCredsProperties',
       'x-remote-object':            'RemoteObjectProperties',
+      'zettai':                     'ZettaiProperties',
       'x-vfio-user-server':         'VfioUserServerProperties'
   } }
 

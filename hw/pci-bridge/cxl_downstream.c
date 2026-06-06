@@ -20,6 +20,9 @@
 #include "hw/pci-bridge/cxl_upstream_port.h"
 #include "qapi/error.h"
 
+#define PCI_VENDOR_ID_ZETTAI 0x7a74
+#define PCI_DEVICE_ID_ZETTAI_CXL_DSP 0xa129
+
 typedef struct CXLDownstreamPort {
     /*< private >*/
     PCIESlot parent_obj;
@@ -41,7 +44,7 @@ static void latch_registers(CXLDownstreamPort *dsp)
     uint32_t *write_msk = dsp->cxl_cstate.crb.cache_mem_regs_write_mask;
 
     cxl_component_register_init_common(reg_state, write_msk,
-                                       CXL2_DOWNSTREAM_PORT);
+                                       CXL2_DOWNSTREAM_PORT, true);
 }
 
 /* TODO: Look at sharing this code across all CXL port types */
@@ -109,7 +112,7 @@ static void build_dvsecs(CXLComponentState *cxl)
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
         .cap                     = 0x27, /* Cache, IO, Mem, non-MLD */
         .ctrl                    = 0x02, /* IO always enabled */
-        .status                  = 0x26, /* same */
+        .status                  = 0x6, /* 256B flit, no 68B */
         .rcvd_mod_ts_data_phase1 = 0xef, /* WTF? */
     };
     cxl_component_create_dvsec(cxl, CXL2_DOWNSTREAM_PORT,
@@ -246,11 +249,11 @@ static void cxl_dsp_class_init(ObjectClass *oc, const void *data)
     k->config_write = cxl_dsp_config_write;
     k->realize = cxl_dsp_realize;
     k->exit = cxl_dsp_exitfn;
-    k->vendor_id = 0x19e5; /* Huawei */
-    k->device_id = 0xa129; /* Emulated CXL Switch Downstream Port */
+    k->vendor_id = PCI_VENDOR_ID_ZETTAI;
+    k->device_id = PCI_DEVICE_ID_ZETTAI_CXL_DSP;
     k->revision = 0;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
-    dc->desc = "CXL Switch Downstream Port";
+    dc->desc = "Zettai CXL Switch Downstream Port";
     device_class_set_legacy_reset(dc, cxl_dsp_reset);
 }
 

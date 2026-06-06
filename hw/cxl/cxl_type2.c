@@ -48,9 +48,44 @@
 #define DEFAULT_HETGPU_LIB_PATH NULL
 #endif
 
+#define CXL_OP_READ         0
+#define CXL_OP_WRITE        1
+#define CXL_OP_FENCE        5
+#define CXL_OP_BI_ENABLE    14
+#define CXL_OP_BI_DISABLE   15
+#define CXL_OP_BI_INVALIDATE 16
+#define CXL_OP_BI_WRITEBACK 17
+#define CXL_OP_BI_QUERY     18
+
+typedef struct QEMU_PACKED CXLMemSimRequest {
+    uint8_t op_type;
+    uint64_t addr;
+    uint64_t size;
+    uint64_t timestamp;
+    uint64_t value;
+    uint64_t expected;
+    uint8_t data[64];
+} CXLMemSimRequest;
+
+typedef struct QEMU_PACKED CXLMemSimResponse {
+    uint8_t status;
+    uint64_t latency_ns;
+    uint64_t old_value;
+    uint8_t data[64];
+} CXLMemSimResponse;
+
 /* Forward declarations for hetGPU coherency integration */
 static void cxl_type2_hetgpu_coherency_callback(void *opaque, uint64_t addr,
                                                  uint64_t size, bool invalidate);
+static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
+                                         uint64_t addr, uint64_t size,
+                                         const uint8_t *data, uint64_t value,
+                                         uint64_t expected,
+                                         CXLMemSimResponse *resp);
+static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
+                                     uint64_t addr, uint64_t size,
+                                     const uint8_t *data,
+                                     CXLMemSimResponse *resp);
 
 /* ========================================================================
  * Coherency Protocol Implementation
@@ -139,6 +174,11 @@ void cxl_type2_cache_invalidate(CXLType2State *ct2d, uint64_t addr)
                      cache_line_addr);
     }
     qemu_mutex_unlock(&ct2d->coherency.lock);
+
+    if (ct2d->bi_enabled) {
+        cxl_type2_memsim_request(ct2d, CXL_OP_BI_INVALIDATE,
+                                 cache_line_addr, 64, NULL, NULL);
+    }
 }
 
 void cxl_type2_cache_writeback(CXLType2State *ct2d, uint64_t addr)
@@ -158,20 +198,12 @@ void cxl_type2_cache_writeback(CXLType2State *ct2d, uint64_t addr)
             }
         }
 
-        /* Send writeback to CXLMemSim */
-        if (ct2d->memsim.connected) {
-            CXLType2Message msg = {
-                .type = CXL_T2_MSG_WRITEBACK,
-                .size = 64,
-                .addr = cache_line_addr,
-                .timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                .coherency_state = line->state,
-                .source_id = 0,
-            };
-            memcpy(msg.data, line->data, 64);
-
-            qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                 (char *)&msg, sizeof(msg), NULL);
+        if (ct2d->bi_enabled) {
+            cxl_type2_memsim_request(ct2d, CXL_OP_BI_WRITEBACK,
+                                     cache_line_addr, 64, line->data, NULL);
+        } else {
+            cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, cache_line_addr,
+                                     64, line->data, NULL);
         }
 
         line->dirty = false;
@@ -1102,20 +1134,7 @@ int cxl_type2_gpu_write(CXLType2State *ct2d, uint64_t offset, const void *buf, s
         /* Invalidate cache line if present for coherency */
         cxl_type2_cache_invalidate(ct2d, offset);
 
-        /* Notify CXLMemSim of GPU write for coherency protocol */
-        if (ct2d->memsim.connected) {
-            CXLType2Message msg = {
-                .type = CXL_T2_MSG_GPU_ACCESS,
-                .size = size,
-                .addr = offset,
-                .timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                .coherency_state = CXL_COHERENCY_MODIFIED,
-                .source_id = 1,  /* GPU source */
-            };
-
-            qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                 (char *)&msg, sizeof(msg), NULL);
-        }
+        cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, offset, size, buf, NULL);
 
         ct2d->stats.gpu_accesses++;
         return 0;
@@ -1141,6 +1160,17 @@ int cxl_type2_gpu_write(CXLType2State *ct2d, uint64_t offset, const void *buf, s
 /* ========================================================================
  * CXLMemSim Communication
  * ======================================================================== */
+
+static void cxlmemsim_drop_locked(CXLType2State *ct2d)
+{
+    ct2d->memsim.connected = false;
+
+    if (ct2d->memsim.socket) {
+        qio_channel_close(QIO_CHANNEL(ct2d->memsim.socket), NULL);
+        object_unref(OBJECT(ct2d->memsim.socket));
+        ct2d->memsim.socket = NULL;
+    }
+}
 
 static void cxlmemsim_connect(CXLType2State *ct2d)
 {
@@ -1194,67 +1224,85 @@ static void cxlmemsim_connect(CXLType2State *ct2d)
 
 static void cxlmemsim_disconnect(CXLType2State *ct2d)
 {
-    if (!ct2d->memsim.connected) {
-        return;
-    }
+    qemu_mutex_lock(&ct2d->memsim.lock);
 
-    ct2d->memsim.connected = false;
-
-    if (ct2d->memsim.socket) {
-        qio_channel_close(QIO_CHANNEL(ct2d->memsim.socket), NULL);
-        object_unref(OBJECT(ct2d->memsim.socket));
-        ct2d->memsim.socket = NULL;
-    }
+    cxlmemsim_drop_locked(ct2d);
 
     if (ct2d->memsim.use_shm && ct2d->memsim.shm_base) {
         munmap(ct2d->memsim.shm_base, ct2d->memsim.shm_size);
         ct2d->memsim.shm_base = NULL;
     }
+
+    qemu_mutex_unlock(&ct2d->memsim.lock);
 }
 
-static void *cxlmemsim_recv_thread(void *opaque)
+static bool cxl_type2_memsim_request_ext(CXLType2State *ct2d, uint8_t op_type,
+                                         uint64_t addr, uint64_t size,
+                                         const uint8_t *data, uint64_t value,
+                                         uint64_t expected,
+                                         CXLMemSimResponse *resp)
 {
-    CXLType2State *ct2d = opaque;
-    CXLType2Message msg;
+    CXLMemSimRequest req;
+    CXLMemSimResponse local_resp;
     Error *err = NULL;
+    bool ok = false;
 
-    while (ct2d->memsim.connected) {
-        if (qio_channel_read_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                 (char *)&msg, sizeof(msg), &err) < 0) {
-            if (ct2d->memsim.connected) {
-                error_report("CXL Type2: Failed to receive from CXLMemSim: %s",
-                           error_get_pretty(err));
-                error_free(err);
-            }
-            break;
-        }
-
-        /* Handle incoming coherency messages */
-        switch (msg.type) {
-        case CXL_T2_MSG_SNOOP_REQ:
-            /* Remote snoop request */
-            cxl_type2_snoop_request(ct2d, msg.addr, msg.coherency_state != 0);
-            break;
-
-        case CXL_T2_MSG_INVALIDATE:
-            /* Remote invalidation */
-            cxl_type2_cache_invalidate(ct2d, msg.addr);
-            break;
-
-        case CXL_T2_MSG_RESPONSE:
-            /* Response to our request */
-            qemu_log_mask(LOG_TRACE, "CXL Type2: Received response for addr 0x%lx\n",
-                         msg.addr);
-            break;
-
-        default:
-            qemu_log_mask(LOG_UNIMP, "CXL Type2: Unhandled message type %d\n",
-                         msg.type);
-            break;
-        }
+    if (!ct2d->memsim.connected || ct2d->memsim.use_shm) {
+        return false;
     }
 
-    return NULL;
+    memset(&req, 0, sizeof(req));
+    memset(&local_resp, 0, sizeof(local_resp));
+    req.op_type = op_type;
+    req.addr = addr;
+    req.size = size;
+    req.timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    req.value = value;
+    req.expected = expected;
+    if (data) {
+        memcpy(req.data, data, MIN(size, sizeof(req.data)));
+    }
+
+    qemu_mutex_lock(&ct2d->memsim.lock);
+    if (!ct2d->memsim.connected || !ct2d->memsim.socket) {
+        goto out;
+    }
+
+    if (qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
+                              (const char *)&req, sizeof(req), &err) < 0) {
+        error_report("CXL Type2: Failed to send request to CXLMemSim: %s",
+                     error_get_pretty(err));
+        error_free(err);
+        cxlmemsim_drop_locked(ct2d);
+        goto out;
+    }
+
+    if (qio_channel_read_all(QIO_CHANNEL(ct2d->memsim.socket),
+                             (char *)&local_resp, sizeof(local_resp), &err) < 0) {
+        error_report("CXL Type2: Failed to receive response from CXLMemSim: %s",
+                     error_get_pretty(err));
+        error_free(err);
+        cxlmemsim_drop_locked(ct2d);
+        goto out;
+    }
+
+    if (resp) {
+        *resp = local_resp;
+    }
+    ok = local_resp.status == 0;
+
+out:
+    qemu_mutex_unlock(&ct2d->memsim.lock);
+    return ok;
+}
+
+static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
+                                     uint64_t addr, uint64_t size,
+                                     const uint8_t *data,
+                                     CXLMemSimResponse *resp)
+{
+    return cxl_type2_memsim_request_ext(ct2d, op_type, addr, size, data, 0, 0,
+                                        resp);
 }
 
 /* ========================================================================
@@ -1309,20 +1357,7 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
             cxl_type2_cache_insert(ct2d, addr, cache_data, CXL_COHERENCY_SHARED);
         }
 
-        /* Notify CXLMemSim of cache miss */
-        if (ct2d->memsim.connected) {
-            CXLType2Message msg = {
-                .type = CXL_T2_MSG_READ,
-                .size = size,
-                .addr = addr,
-                .timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                .coherency_state = CXL_COHERENCY_SHARED,
-                .source_id = 0,
-            };
-
-            qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                 (char *)&msg, sizeof(msg), NULL);
-        }
+        cxl_type2_memsim_request(ct2d, CXL_OP_READ, addr, size, NULL, NULL);
 
         qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read miss at 0x%lx = 0x%lx\n",
                      addr, value);
@@ -1385,21 +1420,8 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
             memcpy(mem_ptr + addr, &value, size);
         }
 
-        /* Notify CXLMemSim of write */
-        if (ct2d->memsim.connected) {
-            CXLType2Message msg = {
-                .type = CXL_T2_MSG_WRITE,
-                .size = size,
-                .addr = addr,
-                .timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                .coherency_state = CXL_COHERENCY_MODIFIED,
-                .source_id = 0,
-            };
-            memcpy(msg.data, &value, MIN(size, 64));
-
-            qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                 (char *)&msg, sizeof(msg), NULL);
-        }
+        cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, addr, size,
+                                 (const uint8_t *)&value, NULL);
     }
 
     qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
@@ -1433,50 +1455,6 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value
     /* Forward all device memory writes through the cache coherency layer */
     cxl_type2_cache_write(opaque, addr, value, size);
 }
-
-/* Component register operations - for BAR0 CXL component registers */
-static uint64_t cxl_type2_component_reg_read(void *opaque, hwaddr offset, unsigned size)
-{
-    CXLComponentState *cxl_cstate = opaque;
-
-    if (offset >= CXL2_COMPONENT_CM_REGION_SIZE) {
-        qemu_log_mask(LOG_UNIMP,
-                     "CXL Type2: Unimplemented component register read at 0x%lx\n",
-                     offset);
-        return 0;
-    }
-
-    return ldl_le_p((uint8_t *)cxl_cstate->crb.cache_mem_registers + offset);
-}
-
-static void cxl_type2_component_reg_write(void *opaque, hwaddr offset,
-                                          uint64_t value, unsigned size)
-{
-    CXLComponentState *cxl_cstate = opaque;
-
-    if (offset >= CXL2_COMPONENT_CM_REGION_SIZE) {
-        qemu_log_mask(LOG_UNIMP,
-                     "CXL Type2: Unimplemented component register write at 0x%lx\n",
-                     offset);
-        return;
-    }
-
-    stl_le_p((uint8_t *)cxl_cstate->crb.cache_mem_registers + offset, value);
-}
-
-static const MemoryRegionOps cxl_type2_component_reg_ops = {
-    .read = cxl_type2_component_reg_read,
-    .write = cxl_type2_component_reg_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 8,
-    },
-    .impl = {
-        .min_access_size = 4,
-        .max_access_size = 8,
-    },
-};
 
 static const MemoryRegionOps cxl_type2_cache_ops = {
     .read = cxl_type2_cache_read,
@@ -2570,21 +2548,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             size_t flush_size = ct2d->gpu_cmd.params[1];
 
             if (ct2d->coherency.coherency_enabled && ct2d->memsim.connected) {
-                CXLType2Message msg;
-                msg.type = CXL_T2_MSG_CACHE_FLUSH;
-                msg.addr = flush_addr;
-                msg.size = flush_size;
-                msg.timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                msg.coherency_state = CXL_COHERENCY_INVALID;
-                msg.source_id = 0;  /* GPU */
-
-                qemu_mutex_lock(&ct2d->memsim.lock);
-                if (ct2d->memsim.socket) {
-                    qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                          (const char *)&msg, sizeof(msg), NULL);
-                }
-                qemu_mutex_unlock(&ct2d->memsim.lock);
-
+                cxl_type2_memsim_request(ct2d, CXL_OP_FENCE, flush_addr,
+                                         flush_size, NULL, NULL);
                 /* Invalidate local cache entries */
                 for (uint64_t addr = flush_addr; addr < flush_addr + flush_size; addr += 64) {
                     cxl_type2_cache_invalidate(ct2d, addr);
@@ -2605,24 +2570,6 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     cxl_type2_cache_invalidate(ct2d, addr);
                 }
                 ct2d->coherency.coherency_ops++;
-
-                /* Notify CXLMemSim if connected */
-                if (ct2d->memsim.connected) {
-                    CXLType2Message msg;
-                    msg.type = CXL_T2_MSG_INVALIDATE;
-                    msg.addr = inv_addr;
-                    msg.size = inv_size;
-                    msg.timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                    msg.coherency_state = CXL_COHERENCY_INVALID;
-                    msg.source_id = 0;
-
-                    qemu_mutex_lock(&ct2d->memsim.lock);
-                    if (ct2d->memsim.socket) {
-                        qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                              (const char *)&msg, sizeof(msg), NULL);
-                    }
-                    qemu_mutex_unlock(&ct2d->memsim.lock);
-                }
             }
         }
         break;
@@ -2638,24 +2585,6 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                     cxl_type2_cache_writeback(ct2d, addr);
                 }
                 ct2d->coherency.coherency_ops++;
-
-                /* Notify CXLMemSim if connected */
-                if (ct2d->memsim.connected) {
-                    CXLType2Message msg;
-                    msg.type = CXL_T2_MSG_WRITEBACK;
-                    msg.addr = wb_addr;
-                    msg.size = wb_size;
-                    msg.timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-                    msg.coherency_state = CXL_COHERENCY_SHARED;
-                    msg.source_id = 0;
-
-                    qemu_mutex_lock(&ct2d->memsim.lock);
-                    if (ct2d->memsim.socket) {
-                        qio_channel_write_all(QIO_CHANNEL(ct2d->memsim.socket),
-                                              (const char *)&msg, sizeof(msg), NULL);
-                    }
-                    qemu_mutex_unlock(&ct2d->memsim.lock);
-                }
             }
         }
         break;
@@ -3247,6 +3176,27 @@ static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr,
  * DVSEC Configuration
  * ======================================================================== */
 
+static void cxl_type2_bi_control_write(CXLComponentState *cxl_cstate,
+                                       uint32_t old_ctrl, uint32_t new_ctrl,
+                                       void *opaque)
+{
+    CXLType2State *ct2d = opaque;
+    bool old_enabled = FIELD_EX32(old_ctrl, CXL_BI_DECODER_CTRL, BI_ENABLE);
+    bool new_enabled = FIELD_EX32(new_ctrl, CXL_BI_DECODER_CTRL, BI_ENABLE);
+
+    if (old_enabled == new_enabled) {
+        return;
+    }
+
+    ct2d->bi_enabled = new_enabled;
+    cxl_type2_memsim_request(ct2d,
+                             new_enabled ? CXL_OP_BI_ENABLE :
+                                           CXL_OP_BI_DISABLE,
+                             0, ct2d->device_mem_size, NULL, NULL);
+    qemu_log("CXL Type2: BI %s via decoder control\n",
+             new_enabled ? "enabled" : "disabled");
+}
+
 static void build_dvsecs(CXLType2State *ct2d)
 {
     CXLComponentState *cxl_cstate = &ct2d->cxl_cstate;
@@ -3297,7 +3247,7 @@ static void build_dvsecs(CXLType2State *ct2d)
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
         .cap = 0x26,
         .ctrl = 0x02,
-        .status = 0x26,
+        .status = ct2d->flitmode ? 0x6 : 0x26,
         .rcvd_mod_ts_data_phase1 = 0xef,
     };
 
@@ -3318,7 +3268,13 @@ static void cxl_type2_reset(DeviceState *dev)
     uint32_t *reg_state = cxl_cstate->crb.cache_mem_registers;
     uint32_t *write_msk = cxl_cstate->crb.cache_mem_regs_write_mask;
 
-    cxl_component_register_init_common(reg_state, write_msk, CXL2_TYPE3_DEVICE);
+    pcie_cap_fill_link_ep_usp(PCI_DEVICE(dev), ct2d->width, ct2d->speed,
+                              ct2d->flitmode);
+    cxl_component_register_init_common(reg_state, write_msk,
+                                       CXL2_TYPE3_DEVICE, ct2d->hdmdb);
+    cxl_cstate->bi_control_write = cxl_type2_bi_control_write;
+    cxl_cstate->bi_control_opaque = ct2d;
+    ct2d->bi_enabled = false;
 
     /* Reset statistics */
     memset(&ct2d->stats, 0, sizeof(ct2d->stats));
@@ -3346,6 +3302,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     }
     if (ct2d->device_mem_size == 0) {
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
+    }
+
+    if (ct2d->hdmdb && !ct2d->flitmode) {
+        error_setg(errp, "hdm-db requires operating in 256B flit mode");
+        return;
     }
 
     /* Initialize Type2 CXL.mem fabric feature models. */
@@ -3378,20 +3339,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate,
                                       TYPE_CXL_TYPE2);
 
-    /* BAR0: Component registers */
-    memory_region_init(&ct2d->bar0, OBJECT(ct2d), "cxl-type2-bar0",
-                      CXL2_COMPONENT_BLOCK_SIZE);
-
-    memory_region_init_io(&ct2d->component_registers, OBJECT(ct2d),
-                         &cxl_type2_component_reg_ops, cxl_cstate,
-                         "cxl-type2-component",
-                         CXL2_COMPONENT_CM_REGION_SIZE);
-    memory_region_add_subregion(&ct2d->bar0, 0, &ct2d->component_registers);
-
+    /* BAR0: standard CXL component register block */
     pci_register_bar(pci_dev, 0,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
                     PCI_BASE_ADDRESS_MEM_TYPE_64,
-                    &ct2d->bar0);
+                    &cxl_cstate->crb.component_registers);
 
     /* BAR2: Cache memory region (Type 1 feature) */
     memory_region_init_ram(&ct2d->cache_mem, OBJECT(ct2d),
@@ -3515,12 +3467,8 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         }
     }
 
-    /* Connect to CXLMemSim */
+    /* Connect to CXLMemSim. The TCP server protocol is request/response. */
     cxlmemsim_connect(ct2d);
-    if (ct2d->memsim.connected && !ct2d->memsim.use_shm) {
-        qemu_thread_create(&ct2d->memsim.recv_thread, "cxlmemsim-recv",
-                          cxlmemsim_recv_thread, ct2d, QEMU_THREAD_JOINABLE);
-    }
 
     qemu_log("CXL Type2: Device realized - Cache: %zu MB, DevMem: %zu MB\n",
              ct2d->cache_size / MiB, ct2d->device_mem_size / MiB);
@@ -3532,9 +3480,6 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
-    if (ct2d->memsim.recv_thread.thread) {
-        qemu_thread_join(&ct2d->memsim.recv_thread);
-    }
     qemu_mutex_destroy(&ct2d->memsim.lock);
 
     /* Cleanup GPU passthrough */
@@ -3588,6 +3533,12 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_SIZE("mem-size", CXLType2State, device_mem_size,
                      CXL_TYPE2_DEFAULT_MEM_SIZE),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
+    DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType2State,
+                                speed, PCIE_LINK_SPEED_64),
+    DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType2State,
+                                width, PCIE_LINK_WIDTH_32),
+    DEFINE_PROP_BOOL("x-256b-flit", CXLType2State, flitmode, true),
+    DEFINE_PROP_BOOL("hdm-db", CXLType2State, hdmdb, true),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType2State, memsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType2State, memsim.server_port, 9999),
     DEFINE_PROP_STRING("gpu-device", CXLType2State, gpu_info.vfio_device),

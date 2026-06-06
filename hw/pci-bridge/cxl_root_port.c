@@ -101,7 +101,7 @@ static void latch_registers(CXLRootPort *crp)
     uint32_t *reg_state = crp->cxl_cstate.crb.cache_mem_registers;
     uint32_t *write_msk = crp->cxl_cstate.crb.cache_mem_regs_write_mask;
 
-    cxl_component_register_init_common(reg_state, write_msk, CXL2_ROOT_PORT);
+    cxl_component_register_init_common(reg_state, write_msk, CXL2_ROOT_PORT, true);
 }
 
 static void build_dvsecs(CXLComponentState *cxl)
@@ -126,7 +126,7 @@ static void build_dvsecs(CXLComponentState *cxl)
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
         .cap                     = 0x26, /* IO, Mem, non-MLD */
         .ctrl                    = 0x2,
-        .status                  = 0x26, /* same */
+        .status                  = 0x6, /* 256B flit, no 68B */
         .rcvd_mod_ts_data_phase1 = 0xef,
     };
     cxl_component_create_dvsec(cxl, CXL2_ROOT_PORT,

@@ -168,7 +168,8 @@ static void cxl_type1_reset(DeviceState *dev)
     uint32_t *write_msk = cxl_cstate->crb.cache_mem_regs_write_mask;
     
     /* Initialize component registers */
-    cxl_component_register_init_common(reg_state, write_msk, CXL2_TYPE3_DEVICE);
+    cxl_component_register_init_common(reg_state, write_msk,
+                                       CXL2_TYPE3_DEVICE, false);
 }
 
 static void cxlmemsim_connect(CXLType1StateImpl *ct1d)

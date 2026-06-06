@@ -189,7 +189,6 @@ typedef struct CXLType2State {
 
     /* Memory regions */
     MemoryRegion bar0;                 /* Component registers */
-    MemoryRegion component_registers;
     MemoryRegion cache_mem;            /* Type 1: Cache for coherent access */
     MemoryRegion cache_io;             /* Cache access interceptor */
     MemoryRegion device_mem;           /* Type 3: Device-attached memory */
@@ -221,6 +220,12 @@ typedef struct CXLType2State {
     uint64_t cache_size;
     uint64_t device_mem_size;
     uint64_t sn;                       /* Serial number */
+
+    PCIExpLinkSpeed speed;
+    PCIExpLinkWidth width;
+    bool flitmode;
+    bool hdmdb;
+    bool bi_enabled;
 
     /* Fabric memory feature models */
     CXLType2DCDState dcd;

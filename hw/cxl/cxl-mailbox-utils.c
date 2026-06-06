@@ -4300,6 +4300,19 @@ static void cxl_copy_cci_commands(CXLCCI *cci, const struct cxl_cmd (*cxl_cmds)[
     }
 }
 
+static void cxl_disable_feature_commands(CXLCCI *cci)
+{
+    /*
+     * Linux 6.18 initializes optional CXL Features when the CEL advertises
+     * Get Supported Features and Get Feature. The simulator does not require
+     * patrol-scrub/ECS feature support for DCD operation, and advertising the
+     * optional feature path currently trips CONFIG_FORTIFY_SOURCE in the guest
+     * during hotplug probe. Keep DCD endpoints focused on the DCD mailbox
+     * command set until the feature payload path is fully version-aligned.
+     */
+    memset(cci->cxl_cmd_set[FEATURES], 0, sizeof(cci->cxl_cmd_set[FEATURES]));
+}
+
 void cxl_add_cci_commands(CXLCCI *cci, const struct cxl_cmd (*cxl_cmd_set)[256],
                                  size_t payload_max)
 {
@@ -4336,6 +4349,7 @@ void cxl_initialize_mailbox_t3(CXLCCI *cci, DeviceState *d, size_t payload_max)
     cxl_copy_cci_commands(cci, cxl_cmd_set);
     if (ct3d->dc.num_regions) {
         cxl_copy_cci_commands(cci, cxl_cmd_set_dcd);
+        cxl_disable_feature_commands(cci);
     }
     cci->d = d;
 
