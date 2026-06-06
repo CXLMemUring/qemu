@@ -99,12 +99,6 @@ void cxl_vcs_register_vppb(CXLVCSSwitch *sw, CXLUpstreamPort *usp,
 bool cxl_vcs_hide_device_listener(DeviceListener *listener,
                                   const QDict *device_opts, bool from_json,
                                   Error **errp);
-void qmp_zettai_bind_vppb(const char *path, uint8_t vcs_id, uint8_t vppb_id,
-                          uint8_t dsp_ppb_id, bool has_ld_id, uint16_t ld_id,
-                          Error **errp);
-void qmp_zettai_unbind_vppb(const char *path, uint8_t vcs_id, uint8_t vppb_id,
-                            bool has_option, uint16_t option, Error **errp);
-
 CXLRetCode cxl_vcs_bind_vppb(CXLVCSSwitch *sw, uint8_t vcs_id,
                               uint8_t vppb_id, uint8_t dsp_ppb_id,
                               uint16_t ld_id);

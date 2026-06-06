@@ -215,6 +215,87 @@ void cxl_type2_cache_writeback(CXLType2State *ct2d, uint64_t addr)
     qemu_mutex_unlock(&ct2d->coherency.lock);
 }
 
+static bool cxl_type2_cache_fill_line(CXLType2State *ct2d, uint64_t cache_line_addr,
+                                      uint8_t cache_data[64])
+{
+    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    uint8_t *mem_ptr;
+
+    memset(cache_data, 0, 64);
+
+    if (hetgpu->initialized) {
+        HetGPUError err;
+
+        err = hetgpu_memcpy_dtoh(hetgpu, cache_data, cache_line_addr, 64);
+        if (err == HETGPU_SUCCESS) {
+            return true;
+        }
+    }
+
+    mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
+    if (mem_ptr && cache_line_addr < ct2d->device_mem_size) {
+        size_t copy_size = MIN(64, ct2d->device_mem_size - cache_line_addr);
+
+        memcpy(cache_data, mem_ptr + cache_line_addr, copy_size);
+        return true;
+    }
+
+    return false;
+}
+
+static void cxl_type2_cache_prefetch(CXLType2State *ct2d, uint64_t addr,
+                                     uint64_t size, bool write_intent)
+{
+    uint64_t start;
+    uint64_t last;
+
+    if (!ct2d->coherency.coherency_enabled || size == 0) {
+        return;
+    }
+
+    start = addr & ~0x3FULL;
+    if (addr + size - 1 < addr) {
+        last = UINT64_MAX & ~0x3FULL;
+    } else {
+        last = (addr + size - 1) & ~0x3FULL;
+    }
+
+    for (uint64_t line_addr = start;; line_addr += 64) {
+        CXLCacheLine *line = cxl_type2_cache_lookup(ct2d, line_addr);
+
+        if (line && line->state != CXL_COHERENCY_INVALID) {
+            if (write_intent) {
+                qemu_mutex_lock(&ct2d->coherency.lock);
+                line->state = CXL_COHERENCY_EXCLUSIVE;
+                line->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                qemu_mutex_unlock(&ct2d->coherency.lock);
+            }
+        } else {
+            uint8_t cache_data[64];
+            CXLCoherencyState state = write_intent ?
+                CXL_COHERENCY_EXCLUSIVE : CXL_COHERENCY_SHARED;
+
+            if (cxl_type2_cache_fill_line(ct2d, line_addr, cache_data)) {
+                cxl_type2_cache_insert(ct2d, line_addr, cache_data, state);
+                cxl_type2_memsim_request(ct2d, CXL_OP_READ, line_addr, 64,
+                                         NULL, NULL);
+                ct2d->stats.read_ops++;
+            }
+        }
+
+        if (line_addr == last || line_addr > UINT64_MAX - 64) {
+            break;
+        }
+    }
+
+    ct2d->coherency.coherency_ops++;
+
+    qemu_log_mask(LOG_TRACE,
+                  "CXL Type2: Cache prefetch addr=0x%" PRIx64
+                  " size=0x%" PRIx64 " write_intent=%d\n",
+                  addr, size, write_intent);
+}
+
 bool cxl_type2_snoop_request(CXLType2State *ct2d, uint64_t addr, bool invalidate)
 {
     uint64_t cache_line_addr = addr & ~0x3F;
@@ -2586,6 +2667,19 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 }
                 ct2d->coherency.coherency_ops++;
             }
+        }
+        break;
+
+    case CXL_GPU_CMD_CACHE_PREFETCH:
+        /* Prefetch cache lines into the Type2 coherent cache */
+        {
+            uint64_t pf_addr = ct2d->gpu_cmd.params[0];
+            uint64_t pf_size = ct2d->gpu_cmd.params[1];
+            bool write_intent = (ct2d->gpu_cmd.params[2] & 1) != 0;
+
+            cxl_type2_cache_prefetch(ct2d, pf_addr, pf_size, write_intent);
+            ct2d->gpu_cmd.results[0] = pf_size;
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         }
         break;
 
