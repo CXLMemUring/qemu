@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <errno.h>
 
+#define CXL_OP_WRITE     1
+#define CXL_OP_LSA_WRITE 7
+
 /* RDMA-like message structures */
 typedef struct __attribute__((packed)) {
     uint8_t op_type;
@@ -128,7 +131,7 @@ int cxl_memsim_rdma_request(uint8_t op, uint64_t addr, uint64_t size,
     req.timestamp = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     req.host_id = 0;
     
-    if (op == 1 && data) {  /* Write operation */
+    if ((op == CXL_OP_WRITE || op == CXL_OP_LSA_WRITE) && data) {
         memcpy(req.data, data, MIN(size, 64));
     }
     
