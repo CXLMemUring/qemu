@@ -56,6 +56,12 @@
 #define CXL_OP_BI_INVALIDATE 16
 #define CXL_OP_BI_WRITEBACK 17
 #define CXL_OP_BI_QUERY     18
+#define CXL_OP_SWITCH_MEMCPY       19
+#define CXL_OP_SWITCH_MEMSET       20
+#define CXL_OP_SWITCH_REDUCE_ADD64 21
+#define CXL_OP_SWITCH_DOT_I32      22
+#define CXL_OP_SWITCH_MATMUL_I32   23
+#define CXL_OP_SWITCH_QUERY        24
 
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
@@ -3046,6 +3052,129 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    /* ---- Near-switch runtime offloads ---- */
+    case CXL_GPU_CMD_SWITCH_MEMCPY:
+        {
+            CXLMemSimResponse resp;
+            uint64_t dst = ct2d->gpu_cmd.params[0];
+            uint64_t src = ct2d->gpu_cmd.params[1];
+            uint64_t copy_size = ct2d->gpu_cmd.params[2];
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_MEMCPY,
+                                             src, copy_size, NULL, dst, 0,
+                                             &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_MEMSET:
+        {
+            CXLMemSimResponse resp;
+            uint64_t dst = ct2d->gpu_cmd.params[0];
+            uint64_t pattern = ct2d->gpu_cmd.params[1];
+            uint64_t set_size = ct2d->gpu_cmd.params[2];
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_MEMSET,
+                                             dst, set_size, NULL, pattern, 0,
+                                             &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_REDUCE_ADD64:
+        {
+            CXLMemSimResponse resp;
+            uint64_t src = ct2d->gpu_cmd.params[0];
+            uint64_t reduce_size = ct2d->gpu_cmd.params[1];
+
+            if (cxl_type2_memsim_request_ext(ct2d,
+                                             CXL_OP_SWITCH_REDUCE_ADD64,
+                                             src, reduce_size, NULL, 0, 0,
+                                             &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_DOT_I32:
+        {
+            CXLMemSimResponse resp;
+            uint64_t a = ct2d->gpu_cmd.params[0];
+            uint64_t b = ct2d->gpu_cmd.params[1];
+            uint64_t count = ct2d->gpu_cmd.params[2];
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_DOT_I32,
+                                             a, 0, NULL, b, count, &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_MATMUL_I32:
+        {
+            CXLMemSimResponse resp;
+            CXLSwitchMatmulI32Descriptor desc = {
+                .a_addr = ct2d->gpu_cmd.params[0],
+                .b_addr = ct2d->gpu_cmd.params[1],
+                .c_addr = ct2d->gpu_cmd.params[2],
+                .m = (uint32_t)ct2d->gpu_cmd.params[3],
+                .n = (uint32_t)ct2d->gpu_cmd.params[4],
+                .k = (uint32_t)ct2d->gpu_cmd.params[5],
+                .flags = (uint32_t)ct2d->gpu_cmd.params[6],
+            };
+
+            if (cxl_type2_memsim_request_ext(ct2d,
+                                             CXL_OP_SWITCH_MATMUL_I32,
+                                             0, sizeof(desc),
+                                             (const uint8_t *)&desc,
+                                             0, 0, &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_GET_STATS:
+        {
+            CXLMemSimResponse resp;
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_QUERY,
+                                             0, 0, NULL, 0, 0, &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.results[2] = 0;
+                ct2d->gpu_cmd.results[3] = 0;
+                if (ct2d->gpu_cmd.data_size >= sizeof(resp.data)) {
+                    memcpy(ct2d->gpu_cmd.data, resp.data, sizeof(resp.data));
+                }
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
     default:
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
         break;
@@ -3508,7 +3637,8 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     ct2d->gpu_cmd.capabilities = CXL_GPU_CAP_BULK_TRANSFER |
                                  CXL_GPU_CAP_CACHE_COHERENT |
                                  CXL_GPU_CAP_COHERENT_POOL |
-                                 CXL_GPU_CAP_DEVICE_BIAS;
+                                 CXL_GPU_CAP_DEVICE_BIAS |
+                                 CXL_GPU_CAP_SWITCH_CORES;
     if (ct2d->dcd.enabled) {
         ct2d->gpu_cmd.capabilities |= CXL_GPU_CAP_DCD;
     }

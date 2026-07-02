@@ -66,6 +66,7 @@
 #define CXL_GPU_CAP_DCD             (1 << 5)  /* Dynamic Capacity Device model */
 #define CXL_GPU_CAP_GFAM            (1 << 6)  /* Global Fabric Attached Memory */
 #define CXL_GPU_CAP_MHSLD           (1 << 7)  /* Multi-headed SLD coherency */
+#define CXL_GPU_CAP_SWITCH_CORES    (1 << 8)  /* Near-switch runtime cores */
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
@@ -158,7 +159,25 @@ typedef enum {
     CXL_GPU_CMD_GFAM_GET_INFO       = 0xCA,  /* results: hosts, mappings, deny */
     CXL_GPU_CMD_MHSLD_GET_INFO      = 0xD0,  /* results: heads, current, stats */
     CXL_GPU_CMD_MHSLD_SET_HEAD      = 0xD1,  /* params: head_id */
+
+    /* Near-switch runtime offload commands */
+    CXL_GPU_CMD_SWITCH_MEMCPY       = 0xE0,  /* params: dst, src, size */
+    CXL_GPU_CMD_SWITCH_MEMSET       = 0xE1,  /* params: dst, byte_pattern, size */
+    CXL_GPU_CMD_SWITCH_REDUCE_ADD64 = 0xE2,  /* params: src, bytes; result0=sum */
+    CXL_GPU_CMD_SWITCH_DOT_I32      = 0xE3,  /* params: a, b, count; result0=dot */
+    CXL_GPU_CMD_SWITCH_MATMUL_I32   = 0xE4,  /* params: a, b, c, m, n, k */
+    CXL_GPU_CMD_SWITCH_GET_STATS    = 0xE5,  /* results/data: server switch stats */
 } CXLGPUCommand;
+
+typedef struct CXLSwitchMatmulI32Descriptor {
+    uint64_t a_addr;
+    uint64_t b_addr;
+    uint64_t c_addr;
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t flags;
+} CXLSwitchMatmulI32Descriptor;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
 
