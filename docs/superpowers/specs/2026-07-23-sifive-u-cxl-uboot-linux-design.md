@@ -155,6 +155,7 @@ layout is:
 
 | Resource | Guest physical range | Size |
 | --- | ---: | ---: |
+| PCI I/O aperture | `0x1008_0000..0x1008_ffff` | 64 KiB |
 | PCIe ECAM | `0x3000_0000..0x3fff_ffff` | 256 MiB |
 | General PCI MMIO32 | `0x4000_0000..0x6fff_ffff` | 768 MiB |
 | CXL component MMIO32 | `0x7000_0000..0x7fff_ffff` | 256 MiB |
