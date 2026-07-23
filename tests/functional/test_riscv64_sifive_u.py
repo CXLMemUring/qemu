@@ -80,6 +80,7 @@ class SifiveU(LinuxKernelTest):
         self.assertIn('bus-range = <0x00 0xff>', dts)
         self.assertIn('qemu,fw-cfg-mmio', dts)
         self.assertIn('qemu,synthetic-cxl-host', dts)
+        self.assertIn('0x70000000', dts)
         self.assertIn('0x43000000', dts)
 
     def _add_dual_cxl_topology(self):

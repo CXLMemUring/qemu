@@ -148,6 +148,8 @@ static void sifive_u_cxl_fdt(SiFiveUState *s, uint32_t plic_phandle)
     hwaddr ecam = memmap[SIFIVE_U_DEV_PCIE_ECAM].base;
     hwaddr pio = memmap[SIFIVE_U_DEV_PCIE_PIO].base;
     hwaddr mmio = memmap[SIFIVE_U_DEV_PCIE_MMIO].base;
+    hwaddr cxl_mmio = mmio + memmap[SIFIVE_U_DEV_PCIE_MMIO].size -
+                      SIFIVE_U_CXL_MMIO32_SIZE;
     hwaddr high = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base;
     hwaddr fw_cfg = memmap[SIFIVE_U_DEV_FW_CFG].base;
 
@@ -172,9 +174,8 @@ static void sifive_u_cxl_fdt(SiFiveUState *s, uint32_t plic_phandle)
         fdt, node, "ranges",
         1, FDT_PCI_RANGE_IOPORT, 2, 0,
         2, pio, 2, memmap[SIFIVE_U_DEV_PCIE_PIO].size,
-        1, FDT_PCI_RANGE_MMIO, 2, mmio,
-        2, mmio, 2,
-        memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE,
+        1, FDT_PCI_RANGE_MMIO, 2, cxl_mmio,
+        2, cxl_mmio, 2, SIFIVE_U_CXL_MMIO32_SIZE,
         1, FDT_PCI_RANGE_MMIO_64BIT | FDT_PCI_RANGE_PREFETCHABLE, 2, high,
         2, high, 2, memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size);
     sifive_u_cxl_irq_map(fdt, node, plic_phandle);
@@ -664,7 +665,7 @@ static void sifive_u_create_gpex(SiFiveUState *s)
     memory_region_init_alias(
         mmio_alias, OBJECT(dev), "sifive-u-pcie-mmio", mmio,
         memmap[SIFIVE_U_DEV_PCIE_MMIO].base,
-        memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE);
+        memmap[SIFIVE_U_DEV_PCIE_MMIO].size);
     memory_region_add_subregion(
         get_system_memory(), memmap[SIFIVE_U_DEV_PCIE_MMIO].base, mmio_alias);
 
