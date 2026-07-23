@@ -1,0 +1,213 @@
+/*
+ * SiFive U synthetic CXL firmware table tests
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "qemu/osdep.h"
+#include "hw/nvram/fw_cfg.h"
+#include "libqtest.h"
+#include "qemu/bswap.h"
+#include "qemu/units.h"
+
+#define SIFIVE_U_FW_CFG_DATA     0x10100000ULL
+#define SIFIVE_U_FW_CFG_SELECTOR (SIFIVE_U_FW_CFG_DATA + 8)
+#define SIFIVE_U_CXL_FMW_BASE    0x1000000000ULL
+#define SIFIVE_U_CXL_FMW_SIZE    (4ULL * GiB)
+
+typedef struct QEMU_PACKED TestAcpiHeader {
+    char signature[4];
+    uint32_t length;
+    uint8_t revision;
+    uint8_t checksum;
+    char oem_id[6];
+    char oem_table_id[8];
+    uint32_t oem_revision;
+    char asl_compiler_id[4];
+    uint32_t asl_compiler_revision;
+} TestAcpiHeader;
+
+static void fw_cfg_select(QTestState *qts, uint16_t key)
+{
+    qtest_writew(qts, SIFIVE_U_FW_CFG_SELECTOR, cpu_to_be16(key));
+}
+
+static void fw_cfg_read(QTestState *qts, uint16_t key, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    size_t i;
+
+    fw_cfg_select(qts, key);
+    for (i = 0; i < len; i++) {
+        p[i] = qtest_readb(qts, SIFIVE_U_FW_CFG_DATA);
+    }
+}
+
+static GByteArray *fw_cfg_file(QTestState *qts, const char *name)
+{
+    g_autofree uint8_t *directory = NULL;
+    FWCfgFile *entry;
+    uint32_t count;
+    size_t directory_size;
+    uint32_t i;
+
+    fw_cfg_read(qts, FW_CFG_FILE_DIR, &count, sizeof(count));
+    count = be32_to_cpu(count);
+    directory_size = sizeof(count) + count * sizeof(FWCfgFile);
+    directory = g_malloc(directory_size);
+    fw_cfg_read(qts, FW_CFG_FILE_DIR, directory, directory_size);
+
+    entry = (FWCfgFile *)(directory + sizeof(count));
+    for (i = 0; i < count; i++, entry++) {
+        if (!strcmp(entry->name, name)) {
+            uint32_t size = be32_to_cpu(entry->size);
+            uint16_t selector = be16_to_cpu(entry->select);
+            GByteArray *data = g_byte_array_sized_new(size);
+
+            g_byte_array_set_size(data, size);
+            fw_cfg_read(qts, selector, data->data, data->len);
+            return data;
+        }
+    }
+
+    return NULL;
+}
+
+static bool buffer_contains(const uint8_t *buf, size_t len,
+                            const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    size_t i;
+
+    for (i = 0; i + needle_len <= len; i++) {
+        if (!memcmp(buf + i, needle, needle_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void assert_cedt(const uint8_t *table, size_t length)
+{
+    const uint8_t *entry = table + sizeof(TestAcpiHeader);
+    const uint8_t *end = table + length;
+    bool found_chbs = false;
+    bool found_cfmws = false;
+
+    while (entry + 4 <= end) {
+        uint16_t entry_length = lduw_le_p(entry + 2);
+
+        g_assert_cmpuint(entry_length, >=, 4);
+        g_assert_true(entry + entry_length <= end);
+        if (entry[0] == 0) {
+            found_chbs = true;
+        } else if (entry[0] == 1) {
+            g_assert_cmpuint(entry_length, >=, 36);
+            if (ldq_le_p(entry + 8) == SIFIVE_U_CXL_FMW_BASE &&
+                ldq_le_p(entry + 16) == SIFIVE_U_CXL_FMW_SIZE) {
+                found_cfmws = true;
+            }
+        }
+        entry += entry_length;
+    }
+
+    g_assert_true(found_chbs);
+    g_assert_true(found_cfmws);
+}
+
+static void assert_acpi_tables(GByteArray *tables)
+{
+    const uint8_t *cedt = NULL;
+    size_t cedt_length = 0;
+    size_t offset = 0;
+    unsigned int dsdt = 0;
+    unsigned int fadt = 0;
+    unsigned int madt = 0;
+    unsigned int rhct = 0;
+    unsigned int mcfg = 0;
+    unsigned int cedt_count = 0;
+
+    while (offset + sizeof(TestAcpiHeader) <= tables->len) {
+        const TestAcpiHeader *header =
+            (const TestAcpiHeader *)(tables->data + offset);
+        uint32_t length = le32_to_cpu(header->length);
+
+        if (!memcmp(header->signature, "\0\0\0\0", 4)) {
+            break;
+        }
+        g_assert_cmpuint(length, >=, sizeof(*header));
+        g_assert_cmpuint(offset + length, <=, tables->len);
+
+        if (!memcmp(header->signature, "DSDT", 4)) {
+            dsdt++;
+        } else if (!memcmp(header->signature, "FACP", 4)) {
+            fadt++;
+        } else if (!memcmp(header->signature, "APIC", 4)) {
+            madt++;
+        } else if (!memcmp(header->signature, "RHCT", 4)) {
+            rhct++;
+        } else if (!memcmp(header->signature, "MCFG", 4)) {
+            mcfg++;
+        } else if (!memcmp(header->signature, "CEDT", 4)) {
+            cedt_count++;
+            cedt = tables->data + offset;
+            cedt_length = length;
+        }
+        offset += length;
+    }
+
+    g_assert_cmpuint(dsdt, ==, 1);
+    g_assert_cmpuint(fadt, ==, 1);
+    g_assert_cmpuint(madt, ==, 1);
+    g_assert_cmpuint(rhct, ==, 1);
+    g_assert_cmpuint(mcfg, ==, 1);
+    g_assert_cmpuint(cedt_count, ==, 1);
+    g_assert_true(buffer_contains(tables->data, tables->len, "ACPI0016"));
+    g_assert_true(buffer_contains(tables->data, tables->len, "ACPI0017"));
+    g_assert_true(buffer_contains(tables->data, tables->len, "CXLM"));
+    g_assert_true(buffer_contains(tables->data, tables->len, "_DEP"));
+    assert_cedt(cedt, cedt_length);
+}
+
+static void test_firmware_files(void)
+{
+    g_autoptr(GByteArray) tables = NULL;
+    g_autoptr(GByteArray) loader = NULL;
+    g_autoptr(GByteArray) rsdp = NULL;
+    QTestState *qts;
+
+    qts = qtest_init(
+        "-machine sifive_u,cxl=on "
+        "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G "
+        "-object memory-backend-ram,id=t3mem,size=256M,share=on "
+        "-object memory-backend-ram,id=t3lsa,size=2M,share=on "
+        "-device pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1 "
+        "-device cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0 "
+        "-device cxl-type2,bus=rp-t2,gpu-mode=0,mem-size=256M,"
+        "cache-size=64M,id=t2 "
+        "-device cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1 "
+        "-device cxl-type3,bus=rp-t3,volatile-memdev=t3mem,"
+        "lsa=t3lsa,id=t3");
+
+    tables = fw_cfg_file(qts, "etc/acpi/tables");
+    loader = fw_cfg_file(qts, "etc/table-loader");
+    rsdp = fw_cfg_file(qts, "etc/acpi/rsdp");
+
+    g_assert_nonnull(tables);
+    g_assert_cmpuint(tables->len, >, 0);
+    g_assert_nonnull(loader);
+    g_assert_cmpuint(loader->len, >, 0);
+    g_assert_nonnull(rsdp);
+    g_assert_cmpuint(rsdp->len, >, 0);
+    assert_acpi_tables(tables);
+
+    qtest_quit(qts);
+}
+
+int main(int argc, char **argv)
+{
+    g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/riscv/sifive-u/cxl/firmware-files",
+                   test_firmware_files);
+    return g_test_run();
+}

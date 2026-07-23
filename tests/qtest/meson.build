@@ -282,6 +282,10 @@ qtests_riscv32 = \
   (config_all_devices.has_key('CONFIG_SIFIVE_E_AON') ? ['sifive-e-aon-watchdog-test'] : [])
 
 qtests_riscv64 = ['riscv-csr-test'] + \
+  (config_all_devices.has_key('CONFIG_SIFIVE_U') and \
+   config_all_devices.has_key('CONFIG_CXL') and \
+   config_all_devices.has_key('CONFIG_FW_CFG_DMA') ? \
+     ['sifive-u-cxl-test'] : []) + \
   (unpack_edk2_blobs ? ['bios-tables-test'] : [])
 
 qos_test_ss = ss.source_set()
