@@ -175,7 +175,7 @@ static void sifive_u_cxl_fdt(SiFiveUState *s, uint32_t plic_phandle)
         1, FDT_PCI_RANGE_MMIO, 2, mmio,
         2, mmio, 2,
         memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE,
-        1, FDT_PCI_RANGE_MMIO_64BIT, 2, high,
+        1, FDT_PCI_RANGE_MMIO_64BIT | FDT_PCI_RANGE_PREFETCHABLE, 2, high,
         2, high, 2, memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size);
     sifive_u_cxl_irq_map(fdt, node, plic_phandle);
 
