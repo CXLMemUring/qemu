@@ -53,6 +53,32 @@ These DTBs should have the following requirements:
 * Should contain a node for the CLINT device with a compatible string
   "riscv,clint0" if using with OpenSBI BIOS images
 
+Synthetic PCIe and CXL
+----------------------
+
+``-M sifive_u,cxl=on`` adds a QEMU-only GPEX PCIe root complex and CXL
+platform facilities.  These devices are not present in physical HiFive
+Unleashed hardware.  The default ``cxl=off`` machine remains unchanged.
+
+The following reference topology creates one CXL Type 2 device and one CXL
+Type 3 device behind a CXL host bridge.  It also creates a 4 GiB CXL Fixed
+Memory Window starting at 64 GiB:
+
+.. code-block:: bash
+
+  $ qemu-system-riscv64 -M sifive_u \
+      -machine cxl=on \
+      -machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
+      -smp 5 -m 2G \
+      -object memory-backend-ram,id=t3mem,size=256M,share=on \
+      -object memory-backend-ram,id=t3lsa,size=2M,share=on \
+      -device pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1 \
+      -device cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0 \
+      -device cxl-type2,bus=rp-t2,gpu-mode=0,mem-size=256M,cache-size=64M,id=t2 \
+      -device cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1 \
+      -device cxl-type3,bus=rp-t3,volatile-memdev=t3mem,lsa=t3lsa,id=t3 \
+      -display none -serial stdio
+
 Boot options
 ------------
 
