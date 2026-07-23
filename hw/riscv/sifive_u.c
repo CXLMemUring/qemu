@@ -49,6 +49,7 @@
 #include "hw/ssi/ssi.h"
 #include "target/riscv/cpu.h"
 #include "hw/riscv/riscv_hart.h"
+#include "hw/riscv/numa.h"
 #include "hw/riscv/sifive_u.h"
 #include "hw/riscv/boot.h"
 #include "hw/char/sifive_uart.h"
@@ -699,6 +700,49 @@ static void sifive_u_create_fw_cfg(SiFiveUState *s)
     rom_set_fw(s->fw_cfg);
 }
 
+static void sifive_u_create_cxl_regions(SiFiveUState *s)
+{
+    CXLState *cxl = &s->cxl_devices_state;
+    CXLFixedMemoryWindowOptionsList *it;
+    MemoryRegion *sysmem = get_system_memory();
+    hwaddr fmw_size = sifive_u_memmap[SIFIVE_U_DEV_CXL_FMW].size;
+    hwaddr configured_size = 0;
+
+    if (!cxl->is_enabled) {
+        return;
+    }
+
+    for (it = cxl->cfmw_list; it; it = it->next) {
+        if (uadd64_overflow(configured_size, it->value->size,
+                            &configured_size) ||
+            configured_size > fmw_size) {
+            error_report(
+                "sifive_u CXL: fixed windows exceed 4 GiB aperture");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    memory_region_init(&cxl->host_mr, OBJECT(s), "sifive-u-cxl-host-reg",
+                       sifive_u_memmap[SIFIVE_U_DEV_CXL_HOST_REG].size);
+    memory_region_add_subregion(
+        sysmem, sifive_u_memmap[SIFIVE_U_DEV_CXL_HOST_REG].base,
+        &cxl->host_mr);
+    cxl_fmws_set_memmap(sifive_u_memmap[SIFIVE_U_DEV_CXL_FMW].base,
+                        sifive_u_memmap[SIFIVE_U_DEV_CXL_FMW].base + fmw_size);
+    cxl_fmws_update_mmio();
+}
+
+static void sifive_u_machine_done(Notifier *notifier, void *data)
+{
+    SiFiveUState *s = container_of(notifier, SiFiveUState, machine_done);
+
+    cxl_hook_up_pxb_registers(s->pci_bus, &s->cxl_devices_state,
+                              &error_fatal);
+    if (s->cxl_devices_state.is_enabled) {
+        cxl_fmws_link_targets(&error_fatal);
+    }
+}
+
 static void sifive_u_machine_init(MachineState *machine)
 {
     const MemMapEntry *memmap = sifive_u_memmap;
@@ -734,6 +778,9 @@ static void sifive_u_machine_init(MachineState *machine)
     if (s->cxl_devices_state.is_enabled) {
         sifive_u_create_fw_cfg(s);
         sifive_u_create_gpex(s);
+        sifive_u_create_cxl_regions(s);
+        s->machine_done.notify = sifive_u_machine_done;
+        qemu_add_machine_init_done_notifier(&s->machine_done);
     }
 
     /* register RAM */
@@ -924,6 +971,11 @@ static void sifive_u_machine_class_init(ObjectClass *oc, const void *data)
     mc->min_cpus = SIFIVE_U_MANAGEMENT_CPU_COUNT + 1;
     mc->default_cpu_type = SIFIVE_U_CPU;
     mc->default_cpus = mc->min_cpus;
+    mc->possible_cpu_arch_ids = riscv_numa_possible_cpu_arch_ids;
+    mc->cpu_index_to_instance_props = riscv_numa_cpu_index_to_props;
+    mc->get_default_cpu_node_id = riscv_numa_get_default_cpu_node_id;
+    mc->numa_mem_supported = true;
+    mc->cpu_cluster_has_numa_boundary = true;
     mc->default_ram_id = "riscv.sifive.u.ram";
     mc->auto_create_sdcard = true;
 

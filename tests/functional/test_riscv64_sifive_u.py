@@ -81,6 +81,63 @@ class SifiveU(LinuxKernelTest):
         self.assertIn('qemu,fw-cfg-mmio', dts)
         self.assertIn('qemu,synthetic-cxl-host', dts)
 
+    def _add_dual_cxl_topology(self):
+        self.vm.add_args(
+            '-machine', 'cxl=on',
+            '-machine',
+            'cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G',
+            '-object',
+            'memory-backend-ram,id=t3mem,size=256M,share=on',
+            '-object',
+            'memory-backend-ram,id=t3lsa,size=2M,share=on',
+            '-device', 'pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1',
+            '-device',
+            'cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0',
+            '-device',
+            ('cxl-type2,bus=rp-t2,gpu-mode=0,mem-size=256M,'
+             'cache-size=64M,id=t2'),
+            '-device',
+            'cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1',
+            '-device',
+            ('cxl-type3,bus=rp-t3,volatile-memdev=t3mem,'
+             'lsa=t3lsa,id=t3'))
+
+    def test_sifive_u_cxl_dual_topology_starts(self):
+        self.set_machine('sifive_u')
+        self._add_dual_cxl_topology()
+        self.vm.add_args('-display', 'none', '-S')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        time.sleep(0.5)
+        self.assertTrue(self.vm.is_running(), self.vm.get_log())
+
+    def test_sifive_u_cxl_rejects_oversized_fmw(self):
+        self.set_machine('sifive_u')
+        self.vm.add_args(
+            '-machine', 'cxl=on',
+            '-machine',
+            'cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=8G',
+            '-device', 'pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1',
+            '-display', 'none')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        self.vm.wait(timeout=5)
+        self.assertEqual(self.vm.exitcode(), 1)
+        self.assertIn(
+            'sifive_u CXL: fixed windows exceed 4 GiB aperture',
+            self.vm.get_log())
+
+    def test_sifive_u_cxl_off_rejects_pxb(self):
+        self.set_machine('sifive_u')
+        self.vm.add_args(
+            '-device', 'pxb-cxl,bus=pcie.0',
+            '-display', 'none')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        self.vm.wait(timeout=5)
+        self.assertNotEqual(self.vm.exitcode(), 0)
+        self.assertIn("Bus 'pcie.0' not found", self.vm.get_log())
+
     def do_test_riscv64_sifive_u_mmc_spi(self, connect_card):
         self.set_machine('sifive_u')
         kernel_path = self.ASSET_KERNEL.fetch()

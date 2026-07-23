@@ -105,6 +105,7 @@ config SIFIVE_U
     select PCI_EXPRESS_GENERIC_BRIDGE
     select PXB
     select RISCV_ACLINT
+    select RISCV_NUMA
     select SIFIVE_GPIO
     select SIFIVE_PDMA
     select SIFIVE_PLIC
