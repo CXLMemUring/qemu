@@ -52,6 +52,7 @@
 #include "hw/riscv/sifive_u.h"
 #include "hw/riscv/boot.h"
 #include "hw/char/sifive_uart.h"
+#include "hw/cxl/cxl_host.h"
 #include "hw/intc/riscv_aclint.h"
 #include "hw/intc/sifive_plic.h"
 #include "chardev/char.h"
@@ -87,6 +88,13 @@ static const MemMapEntry sifive_u_memmap[] = {
     [SIFIVE_U_DEV_DMC] =      { 0x100b0000,    0x10000 },
     [SIFIVE_U_DEV_FLASH0] =   { 0x20000000, 0x10000000 },
     [SIFIVE_U_DEV_DRAM] =     { 0x80000000,        0x0 },
+    [SIFIVE_U_DEV_PCIE_ECAM] =      { 0x30000000, 256 * MiB },
+    [SIFIVE_U_DEV_PCIE_PIO] =       { 0x10080000,  64 * KiB },
+    [SIFIVE_U_DEV_PCIE_MMIO] =      { 0x40000000,   1 * GiB },
+    [SIFIVE_U_DEV_FW_CFG] =         { 0x10100000,        0x18 },
+    [SIFIVE_U_DEV_PCIE_MMIO_HIGH] = { 0x400000000ULL, 16 * GiB },
+    [SIFIVE_U_DEV_CXL_HOST_REG] =   { 0x800000000ULL,  1 * MiB },
+    [SIFIVE_U_DEV_CXL_FMW] =        { 0x1000000000ULL, 4 * GiB },
 };
 
 #define OTP_SERIAL          1
@@ -508,6 +516,19 @@ static void sifive_u_machine_reset(void *opaque, int n, int level)
     }
 }
 
+static void sifive_u_validate_cxl_map(SiFiveUState *s)
+{
+    MachineState *ms = MACHINE(s);
+    hwaddr ram_start = sifive_u_memmap[SIFIVE_U_DEV_DRAM].base;
+    hwaddr ram_end;
+
+    if (uadd64_overflow(ram_start, ms->ram_size, &ram_end) ||
+        ram_end > sifive_u_memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base) {
+        error_report("sifive_u CXL: RAM overlaps synthetic PCI MMIO64");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static void sifive_u_machine_init(MachineState *machine)
 {
     const MemMapEntry *memmap = sifive_u_memmap;
@@ -527,6 +548,10 @@ static void sifive_u_machine_init(MachineState *machine)
     DeviceState *flash_dev, *sd_dev, *card_dev;
     qemu_irq flash_cs, sd_cs;
     RISCVBootInfo boot_info;
+
+    if (s->cxl_devices_state.is_enabled) {
+        sifive_u_validate_cxl_map(s);
+    }
 
     /* Initialize SoC */
     object_initialize_child(OBJECT(machine), "soc", &s->soc, TYPE_RISCV_U_SOC);
@@ -702,6 +727,7 @@ static void sifive_u_machine_instance_init(Object *obj)
 
     s->start_in_flash = false;
     s->msel = 0;
+    cxl_machine_init(obj, &s->cxl_devices_state);
     object_property_add_uint32_ptr(obj, "msel", &s->msel,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "msel",

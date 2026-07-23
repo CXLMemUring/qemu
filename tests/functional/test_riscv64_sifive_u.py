@@ -11,6 +11,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import os
+import time
 
 from qemu_test import Asset, LinuxKernelTest
 from qemu_test import skipIfMissingCommands
@@ -26,6 +27,26 @@ class SifiveU(LinuxKernelTest):
          '9819da19e6eef291686fdd7b029ea00e764dc62f/rootfs/riscv64/'
          'rootfs.ext2.gz'),
         'b6ed95610310b7956f9bf20c4c9c0c05fea647900df441da9dfe767d24e8b28b')
+
+    def test_sifive_u_cxl_property(self):
+        self.set_machine('sifive_u')
+        self.vm.add_args('-machine', 'cxl=on', '-display', 'none', '-S')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        time.sleep(0.1)
+        self.assertTrue(self.vm.is_running())
+
+    def test_sifive_u_cxl_rejects_ram_overlap(self):
+        self.set_machine('sifive_u')
+        self.vm.add_args('-machine', 'cxl=on', '-m', '16G',
+                         '-display', 'none')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        self.vm.wait(timeout=5)
+        self.assertEqual(self.vm.exitcode(), 1)
+        self.assertIn(
+            'sifive_u CXL: RAM overlaps synthetic PCI MMIO64',
+            self.vm.get_log())
 
     def do_test_riscv64_sifive_u_mmc_spi(self, connect_card):
         self.set_machine('sifive_u')

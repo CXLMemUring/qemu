@@ -94,9 +94,16 @@ config SIFIVE_U
     bool
     default y
     depends on RISCV32 || RISCV64
+    select ACPI
+    select ACPI_CXL
+    select ACPI_PCI
     select CADENCE
     select CPU_CLUSTER
     select DEVICE_TREE
+    select FW_CFG_DMA
+    select PCI
+    select PCI_EXPRESS_GENERIC_BRIDGE
+    select PXB
     select RISCV_ACLINT
     select SIFIVE_GPIO
     select SIFIVE_PDMA

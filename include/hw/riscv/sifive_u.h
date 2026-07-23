@@ -19,9 +19,14 @@
 #ifndef HW_SIFIVE_U_H
 #define HW_SIFIVE_U_H
 
+#include "qemu/units.h"
 #include "hw/boards.h"
+#include "hw/cxl/cxl.h"
 #include "hw/cpu/cluster.h"
 #include "hw/dma/sifive_pdma.h"
+#include "hw/nvram/fw_cfg.h"
+#include "hw/pci/pci.h"
+#include "hw/pci-host/gpex.h"
 #include "hw/net/cadence_gem.h"
 #include "hw/riscv/riscv_hart.h"
 #include "hw/riscv/sifive_cpu.h"
@@ -73,6 +78,12 @@ typedef struct SiFiveUState {
     bool start_in_flash;
     uint32_t msel;
     uint32_t serial;
+
+    GPEXHost *gpex_host;
+    PCIBus *pci_bus;
+    FWCfgState *fw_cfg;
+    CXLState cxl_devices_state;
+    Notifier machine_done;
 } SiFiveUState;
 
 enum {
@@ -96,7 +107,14 @@ enum {
     SIFIVE_U_DEV_GEM,
     SIFIVE_U_DEV_GEM_MGMT,
     SIFIVE_U_DEV_PWM0,
-    SIFIVE_U_DEV_PWM1
+    SIFIVE_U_DEV_PWM1,
+    SIFIVE_U_DEV_PCIE_ECAM,
+    SIFIVE_U_DEV_PCIE_PIO,
+    SIFIVE_U_DEV_PCIE_MMIO,
+    SIFIVE_U_DEV_FW_CFG,
+    SIFIVE_U_DEV_PCIE_MMIO_HIGH,
+    SIFIVE_U_DEV_CXL_HOST_REG,
+    SIFIVE_U_DEV_CXL_FMW,
 };
 
 enum {
@@ -155,6 +173,10 @@ enum {
 
 #define SIFIVE_U_MANAGEMENT_CPU_COUNT   1
 #define SIFIVE_U_COMPUTE_CPU_COUNT      4
+
+#define SIFIVE_U_CXL_MMIO32_SIZE (256 * MiB)
+#define SIFIVE_U_PCIE_IRQ_BASE 32
+#define SIFIVE_U_PCIE_IRQ_COUNT PCI_NUM_PINS
 
 #define SIFIVE_U_PLIC_NUM_SOURCES 54
 #define SIFIVE_U_PLIC_NUM_PRIORITIES 7
