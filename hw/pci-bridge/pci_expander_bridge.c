@@ -209,6 +209,7 @@ static void pxb_cxl_realize(DeviceState *dev, Error **errp)
 void pxb_cxl_hook_up_registers(CXLState *cxl_state, PCIBus *bus, Error **errp)
 {
     PXBCXLDev *pxb =  PXB_CXL_DEV(pci_bridge_get_device(bus));
+    PCIDevice *pdev = PCI_DEVICE(pxb);
     CXLHost *cxl = pxb->cxl_host_bridge;
     CXLComponentState *cxl_cstate = &cxl->cxl_cstate;
     struct MemoryRegion *mr = &cxl_cstate->crb.component_registers;
@@ -222,6 +223,32 @@ void pxb_cxl_hook_up_registers(CXLState *cxl_state, PCIBus *bus, Error **errp)
 
     memory_region_add_subregion(&cxl_state->host_mr, offset, mr);
     cxl_state->next_mr_idx++;
+
+    pci_set_quad(pdev->config + pxb->firmware_cap_offset +
+                 QEMU_CXL_PXB_CAP_CHBS_BASE_OFF,
+                 cxl_state->host_mr.addr + offset);
+    pci_set_quad(pdev->config + pxb->firmware_cap_offset +
+                 QEMU_CXL_PXB_CAP_CHBS_SIZE_OFF,
+                 memory_region_size(mr));
+}
+
+void pxb_cxl_add_firmware_window(PXBCXLDev *pxb, hwaddr base, hwaddr size,
+                                 Error **errp)
+{
+    PCIDevice *pdev = PCI_DEVICE(pxb);
+    uint8_t *cap = pdev->config + pxb->firmware_cap_offset;
+    uint8_t count = cap[QEMU_CXL_PXB_CAP_FMW_COUNT_OFF];
+
+    if (count >= QEMU_CXL_PXB_CAP_FMW_MAX) {
+        error_setg(errp,
+                   "pxb-cxl firmware capability supports at most %u windows",
+                   QEMU_CXL_PXB_CAP_FMW_MAX);
+        return;
+    }
+
+    pci_set_quad(cap + QEMU_CXL_PXB_CAP_FMW_BASE_OFF(count), base);
+    pci_set_quad(cap + QEMU_CXL_PXB_CAP_FMW_SIZE_OFF(count), size);
+    cap[QEMU_CXL_PXB_CAP_FMW_COUNT_OFF] = count + 1;
 }
 
 static void pxb_cxl_host_class_init(ObjectClass *class, const void *data)
@@ -494,6 +521,7 @@ static const TypeInfo pxb_pcie_dev_info = {
 
 static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
 {
+    PXBCXLDev *cxl_pxb = PXB_CXL_DEV(dev);
     PXBDev *pxb = PXB_DEV(dev);
     int offset;
 
@@ -515,11 +543,13 @@ static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
      */
     offset = pci_add_capability(dev, PCI_CAP_ID_VNDR, 0,
                                 QEMU_CXL_PXB_CAP_LENGTH, &error_abort);
+    cxl_pxb->firmware_cap_offset = offset;
     dev->config[offset + PCI_CAP_FLAGS] = QEMU_CXL_PXB_CAP_LENGTH;
     dev->config[offset + QEMU_CXL_PXB_CAP_TYPE_OFF] =
         QEMU_CXL_PXB_CAP_TYPE;
     memcpy(dev->config + offset + QEMU_CXL_PXB_CAP_SIG_OFF, "CXL", 3);
     dev->config[offset + QEMU_CXL_PXB_CAP_BUS_OFF] = pxb->bus_nr;
+    dev->config[offset + QEMU_CXL_PXB_CAP_VERSION_OFF] = 1;
     pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID,
                  PCI_VENDOR_ID_REDHAT);
     pci_set_word(dev->config + PCI_SUBSYSTEM_ID,

@@ -115,16 +115,24 @@ typedef struct PXBCXLDev {
 
     bool hdm_for_passthrough;
     CXLHost *cxl_host_bridge; /* Pointer to a CXLHost */
+    uint8_t firmware_cap_offset;
 } PXBCXLDev;
 
 #define TYPE_PXB_CXL_DEV "pxb-cxl"
 
 #define QEMU_CXL_PXB_SUBSYSTEM_ID 0xc001
 #define QEMU_CXL_PXB_CAP_TYPE     0xc1
-#define QEMU_CXL_PXB_CAP_LENGTH   8
+#define QEMU_CXL_PXB_CAP_LENGTH   64
 #define QEMU_CXL_PXB_CAP_TYPE_OFF 3
 #define QEMU_CXL_PXB_CAP_SIG_OFF  4
 #define QEMU_CXL_PXB_CAP_BUS_OFF  7
+#define QEMU_CXL_PXB_CAP_VERSION_OFF 8
+#define QEMU_CXL_PXB_CAP_FMW_COUNT_OFF 9
+#define QEMU_CXL_PXB_CAP_CHBS_BASE_OFF 16
+#define QEMU_CXL_PXB_CAP_CHBS_SIZE_OFF 24
+#define QEMU_CXL_PXB_CAP_FMW_BASE_OFF(n) (32 + (n) * 16)
+#define QEMU_CXL_PXB_CAP_FMW_SIZE_OFF(n) (40 + (n) * 16)
+#define QEMU_CXL_PXB_CAP_FMW_MAX 2
 OBJECT_DECLARE_SIMPLE_TYPE(PXBCXLDev, PXB_CXL_DEV)
 
 int pci_bridge_ssvid_init(PCIDevice *dev, uint8_t offset,

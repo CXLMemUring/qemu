@@ -18,6 +18,8 @@
 #define SIFIVE_U_CXL_FMW_SIZE    (4ULL * GiB)
 #define SIFIVE_U_CXL_MMIO64_BASE 0x400000000ULL
 #define SIFIVE_U_CXL_MMIO64_SIZE (4ULL * GiB)
+#define SIFIVE_U_CXL_CHBS_BASE   0x800000000ULL
+#define SIFIVE_U_CXL_CHBS_SIZE   (64 * KiB)
 #define SIFIVE_U_PCIE_ECAM_BASE  0x30000000ULL
 
 typedef struct QEMU_PACKED TestAcpiHeader {
@@ -221,6 +223,24 @@ static void assert_cxl_pxb_firmware_cap(QTestState *qts)
             g_assert_cmpuint(qtest_readb(qts, config + offset +
                                          QEMU_CXL_PXB_CAP_BUS_OFF),
                              ==, 64);
+            g_assert_cmpuint(qtest_readb(qts, config + offset +
+                                         QEMU_CXL_PXB_CAP_VERSION_OFF),
+                             ==, 1);
+            g_assert_cmpuint(qtest_readb(qts, config + offset +
+                                         QEMU_CXL_PXB_CAP_FMW_COUNT_OFF),
+                             ==, 1);
+            g_assert_cmphex(qtest_readq(qts, config + offset +
+                                        QEMU_CXL_PXB_CAP_CHBS_BASE_OFF),
+                            ==, SIFIVE_U_CXL_CHBS_BASE);
+            g_assert_cmphex(qtest_readq(qts, config + offset +
+                                        QEMU_CXL_PXB_CAP_CHBS_SIZE_OFF),
+                            ==, SIFIVE_U_CXL_CHBS_SIZE);
+            g_assert_cmphex(qtest_readq(qts, config + offset +
+                                        QEMU_CXL_PXB_CAP_FMW_BASE_OFF(0)),
+                            ==, SIFIVE_U_CXL_FMW_BASE);
+            g_assert_cmphex(qtest_readq(qts, config + offset +
+                                        QEMU_CXL_PXB_CAP_FMW_SIZE_OFF(0)),
+                            ==, SIFIVE_U_CXL_FMW_SIZE);
             return;
         }
         offset = qtest_readb(qts, config + offset + 1);

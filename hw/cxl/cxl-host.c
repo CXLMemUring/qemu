@@ -98,6 +98,8 @@ static int cxl_fmws_link(Object *obj, void *opaque)
             return 1;
         }
         fw->target_hbs[i] = PXB_CXL_DEV(o);
+        pxb_cxl_add_firmware_window(fw->target_hbs[i], fw->base, fw->size,
+                                    &error_fatal);
     }
     return 0;
 }

@@ -68,7 +68,7 @@ Memory Window starting at 64 GiB:
 
   $ qemu-system-riscv64 -M sifive_u \
       -machine cxl=on \
-      -machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G \
+      -machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,cxl-fmw.0.restrictions=0xe \
       -smp 5 -m 2G \
       -object memory-backend-ram,id=t3mem,size=256M,share=on \
       -object memory-backend-ram,id=t3lsa,size=2M,share=on \
@@ -78,6 +78,12 @@ Memory Window starting at 64 GiB:
       -device cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1 \
       -device cxl-type3,bus=rp-t3,volatile-memdev=t3mem,lsa=t3lsa,id=t3 \
       -display none -serial stdio
+
+The ``0xe`` restrictions select host-only CXL.mem coherency, which is the
+common mode supported by both devices in this mixed topology.  QEMU exposes
+the CXL Host Bridge Component Register Block and fixed-window coordinates in
+a read-only vendor capability on ``pxb-cxl`` so non-ACPI firmware can program
+the HDM decoder path before handing control to an ACPI operating system.
 
 Boot options
 ------------
