@@ -51,6 +51,7 @@
 #include "hw/riscv/riscv_hart.h"
 #include "hw/riscv/numa.h"
 #include "hw/riscv/sifive_u.h"
+#include "hw/riscv/sifive_u-acpi.h"
 #include "hw/riscv/boot.h"
 #include "hw/char/sifive_uart.h"
 #include "hw/cxl/cxl_host.h"
@@ -67,7 +68,7 @@
 /* CLINT timebase frequency */
 #define CLINT_TIMEBASE_FREQ 1000000
 
-static const MemMapEntry sifive_u_memmap[] = {
+const MemMapEntry sifive_u_memmap[] = {
     [SIFIVE_U_DEV_DEBUG] =    {        0x0,      0x100 },
     [SIFIVE_U_DEV_MROM] =     {     0x1000,     0xf000 },
     [SIFIVE_U_DEV_CLINT] =    {  0x2000000,    0x10000 },
@@ -686,7 +687,25 @@ static void sifive_u_create_gpex(SiFiveUState *s)
 
     s->gpex_host = GPEX_HOST(dev);
     s->pci_bus = PCI_HOST_BRIDGE(dev)->bus;
-    s->gpex_host->gpex_cfg.bus = s->pci_bus;
+    s->gpex_host->gpex_cfg = (struct GPEXConfig) {
+        .ecam = memmap[SIFIVE_U_DEV_PCIE_ECAM],
+        .mmio32 = {
+            .base = memmap[SIFIVE_U_DEV_PCIE_MMIO].base,
+            .size = memmap[SIFIVE_U_DEV_PCIE_MMIO].size -
+                    SIFIVE_U_CXL_MMIO32_SIZE,
+        },
+        .cxl_mmio32 = {
+            .base = memmap[SIFIVE_U_DEV_PCIE_MMIO].base +
+                    memmap[SIFIVE_U_DEV_PCIE_MMIO].size -
+                    SIFIVE_U_CXL_MMIO32_SIZE,
+            .size = SIFIVE_U_CXL_MMIO32_SIZE,
+        },
+        .mmio64 = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH],
+        .pio = memmap[SIFIVE_U_DEV_PCIE_PIO],
+        .irq = SIFIVE_U_PCIE_IRQ_BASE,
+        .bus = s->pci_bus,
+        .pci_native_hotplug = true,
+    };
 }
 
 static void sifive_u_create_fw_cfg(SiFiveUState *s)
@@ -740,6 +759,7 @@ static void sifive_u_machine_done(Notifier *notifier, void *data)
                               &error_fatal);
     if (s->cxl_devices_state.is_enabled) {
         cxl_fmws_link_targets(&error_fatal);
+        sifive_u_acpi_setup(s);
     }
 }
 

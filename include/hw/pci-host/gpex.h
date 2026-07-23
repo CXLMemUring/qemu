@@ -41,6 +41,7 @@ struct GPEXRootState {
 struct GPEXConfig {
     MemMapEntry ecam;
     MemMapEntry mmio32;
+    MemMapEntry cxl_mmio32;
     MemMapEntry mmio64;
     MemMapEntry pio;
     int         irq;

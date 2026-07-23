@@ -117,6 +117,8 @@ enum {
     SIFIVE_U_DEV_CXL_FMW,
 };
 
+extern const MemMapEntry sifive_u_memmap[];
+
 enum {
     SIFIVE_U_L2CC_IRQ0 = 1,
     SIFIVE_U_L2CC_IRQ1 = 2,
