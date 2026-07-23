@@ -700,7 +700,16 @@ static void sifive_u_create_gpex(SiFiveUState *s)
                     SIFIVE_U_CXL_MMIO32_SIZE,
             .size = SIFIVE_U_CXL_MMIO32_SIZE,
         },
-        .mmio64 = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH],
+        .mmio64 = {
+            .base = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base +
+                    SIFIVE_U_CXL_MMIO64_SIZE,
+            .size = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size -
+                    SIFIVE_U_CXL_MMIO64_SIZE,
+        },
+        .cxl_mmio64 = {
+            .base = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base,
+            .size = SIFIVE_U_CXL_MMIO64_SIZE,
+        },
         .pio = memmap[SIFIVE_U_DEV_PCIE_PIO],
         .irq = SIFIVE_U_PCIE_IRQ_BASE,
         .bus = s->pci_bus,

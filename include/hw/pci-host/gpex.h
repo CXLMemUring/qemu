@@ -43,6 +43,7 @@ struct GPEXConfig {
     MemMapEntry mmio32;
     MemMapEntry cxl_mmio32;
     MemMapEntry mmio64;
+    MemMapEntry cxl_mmio64;
     MemMapEntry pio;
     int         irq;
     PCIBus      *bus;

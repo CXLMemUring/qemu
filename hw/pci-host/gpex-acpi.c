@@ -144,16 +144,29 @@ void acpi_dsdt_add_gpex(Aml *scope, struct GPEXConfig *cfg)
              * 1. The resources the pci-bridge/pcie-root-port need.
              * 2. The resources the devices behind pxb need.
              */
-            if (is_cxl && cfg->cxl_mmio32.size) {
+            if (is_cxl &&
+                (cfg->cxl_mmio32.size || cfg->cxl_mmio64.size)) {
                 crs = aml_resource_template();
-                aml_append(
-                    crs,
-                    aml_dword_memory(
-                        AML_POS_DECODE, AML_MIN_FIXED, AML_MAX_FIXED,
-                        AML_NON_CACHEABLE, AML_READ_WRITE, 0,
-                        cfg->cxl_mmio32.base,
-                        cfg->cxl_mmio32.base + cfg->cxl_mmio32.size - 1,
-                        0, cfg->cxl_mmio32.size));
+                if (cfg->cxl_mmio32.size) {
+                    aml_append(
+                        crs,
+                        aml_dword_memory(
+                            AML_POS_DECODE, AML_MIN_FIXED, AML_MAX_FIXED,
+                            AML_NON_CACHEABLE, AML_READ_WRITE, 0,
+                            cfg->cxl_mmio32.base,
+                            cfg->cxl_mmio32.base + cfg->cxl_mmio32.size - 1,
+                            0, cfg->cxl_mmio32.size));
+                }
+                if (cfg->cxl_mmio64.size) {
+                    aml_append(
+                        crs,
+                        aml_qword_memory(
+                            AML_POS_DECODE, AML_MIN_FIXED, AML_MAX_FIXED,
+                            AML_PREFETCHABLE, AML_READ_WRITE, 0,
+                            cfg->cxl_mmio64.base,
+                            cfg->cxl_mmio64.base + cfg->cxl_mmio64.size - 1,
+                            0, cfg->cxl_mmio64.size));
+                }
                 aml_append(
                     crs,
                     aml_word_bus_number(

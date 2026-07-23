@@ -16,6 +16,8 @@
 #define SIFIVE_U_FW_CFG_SELECTOR (SIFIVE_U_FW_CFG_DATA + 8)
 #define SIFIVE_U_CXL_FMW_BASE    0x1000000000ULL
 #define SIFIVE_U_CXL_FMW_SIZE    (4ULL * GiB)
+#define SIFIVE_U_CXL_MMIO64_BASE 0x400000000ULL
+#define SIFIVE_U_CXL_MMIO64_SIZE (4ULL * GiB)
 #define SIFIVE_U_PCIE_ECAM_BASE  0x30000000ULL
 
 typedef struct QEMU_PACKED TestAcpiHeader {
@@ -84,6 +86,28 @@ static bool buffer_contains(const uint8_t *buf, size_t len,
 
     for (i = 0; i + needle_len <= len; i++) {
         if (!memcmp(buf + i, needle, needle_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool buffer_contains_cxl_mmio64(const uint8_t *buf, size_t len)
+{
+    uint8_t descriptor[46] = {
+        0x8a, 0x2b, 0x00, 0x00, 0x0c, 0x07,
+    };
+    size_t i;
+
+    stq_le_p(descriptor + 6, 0);
+    stq_le_p(descriptor + 14, SIFIVE_U_CXL_MMIO64_BASE);
+    stq_le_p(descriptor + 22,
+             SIFIVE_U_CXL_MMIO64_BASE + SIFIVE_U_CXL_MMIO64_SIZE - 1);
+    stq_le_p(descriptor + 30, 0);
+    stq_le_p(descriptor + 38, SIFIVE_U_CXL_MMIO64_SIZE);
+
+    for (i = 0; i + sizeof(descriptor) <= len; i++) {
+        if (!memcmp(buf + i, descriptor, sizeof(descriptor))) {
             return true;
         }
     }
@@ -169,6 +193,7 @@ static void assert_acpi_tables(GByteArray *tables)
     g_assert_true(buffer_contains(tables->data, tables->len, "ACPI0017"));
     g_assert_true(buffer_contains(tables->data, tables->len, "CXLM"));
     g_assert_true(buffer_contains(tables->data, tables->len, "_DEP"));
+    g_assert_true(buffer_contains_cxl_mmio64(tables->data, tables->len));
     assert_cedt(cedt, cedt_length);
 }
 
