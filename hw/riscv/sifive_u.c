@@ -99,6 +99,93 @@ static const MemMapEntry sifive_u_memmap[] = {
 
 #define OTP_SERIAL          1
 #define GEM_REVISION        0x10070109
+#define SIFIVE_U_FDT_PCI_ADDR_CELLS 3
+#define SIFIVE_U_FDT_PCI_INT_CELLS 1
+#define SIFIVE_U_FDT_INT_MAP_WIDTH \
+    (SIFIVE_U_FDT_PCI_ADDR_CELLS + SIFIVE_U_FDT_PCI_INT_CELLS + 2)
+
+static void sifive_u_cxl_irq_map(void *fdt, const char *node,
+                                 uint32_t plic_phandle)
+{
+    uint32_t irq_map[PCI_NUM_PINS * PCI_NUM_PINS *
+                     SIFIVE_U_FDT_INT_MAP_WIDTH] = {};
+    uint32_t *entry = irq_map;
+    int dev;
+    int pin;
+
+    for (dev = 0; dev < PCI_NUM_PINS; dev++) {
+        int devfn = dev * PCI_FUNC_MAX;
+
+        for (pin = 0; pin < PCI_NUM_PINS; pin++) {
+            int irq = SIFIVE_U_PCIE_IRQ_BASE +
+                      ((pin + PCI_SLOT(devfn)) % PCI_NUM_PINS);
+
+            entry[0] = cpu_to_be32(devfn << 8);
+            entry[SIFIVE_U_FDT_PCI_ADDR_CELLS] = cpu_to_be32(pin + 1);
+            entry[SIFIVE_U_FDT_PCI_ADDR_CELLS +
+                  SIFIVE_U_FDT_PCI_INT_CELLS] =
+                cpu_to_be32(plic_phandle);
+            entry[SIFIVE_U_FDT_PCI_ADDR_CELLS +
+                  SIFIVE_U_FDT_PCI_INT_CELLS + 1] =
+                cpu_to_be32(irq);
+            entry += SIFIVE_U_FDT_INT_MAP_WIDTH;
+        }
+    }
+
+    qemu_fdt_setprop(fdt, node, "interrupt-map", irq_map,
+                     (entry - irq_map) * sizeof(*irq_map));
+    qemu_fdt_setprop_cells(fdt, node, "interrupt-map-mask",
+                           0x1800, 0, 0, 0x7);
+}
+
+static void sifive_u_cxl_fdt(SiFiveUState *s, uint32_t plic_phandle)
+{
+    const MemMapEntry *memmap = sifive_u_memmap;
+    void *fdt = MACHINE(s)->fdt;
+    g_autofree char *node = NULL;
+    hwaddr ecam = memmap[SIFIVE_U_DEV_PCIE_ECAM].base;
+    hwaddr pio = memmap[SIFIVE_U_DEV_PCIE_PIO].base;
+    hwaddr mmio = memmap[SIFIVE_U_DEV_PCIE_MMIO].base;
+    hwaddr high = memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base;
+    hwaddr fw_cfg = memmap[SIFIVE_U_DEV_FW_CFG].base;
+
+    node = g_strdup_printf("/soc/pci@%" HWADDR_PRIx, ecam);
+    qemu_fdt_add_subnode(fdt, node);
+    qemu_fdt_setprop_cell(fdt, node, "#address-cells",
+                          SIFIVE_U_FDT_PCI_ADDR_CELLS);
+    qemu_fdt_setprop_cell(fdt, node, "#interrupt-cells",
+                          SIFIVE_U_FDT_PCI_INT_CELLS);
+    qemu_fdt_setprop_cell(fdt, node, "#size-cells", 2);
+    qemu_fdt_setprop_string(fdt, node, "compatible",
+                            "pci-host-ecam-generic");
+    qemu_fdt_setprop_string(fdt, node, "device_type", "pci");
+    qemu_fdt_setprop_cell(fdt, node, "linux,pci-domain", 0);
+    qemu_fdt_setprop_cells(fdt, node, "bus-range", 0, 0xff);
+    qemu_fdt_setprop(fdt, node, "dma-coherent", NULL, 0);
+    qemu_fdt_setprop(fdt, node, "qemu,synthetic-cxl-host", NULL, 0);
+    qemu_fdt_setprop_sized_cells(fdt, node, "reg",
+                                 2, ecam,
+                                 2, memmap[SIFIVE_U_DEV_PCIE_ECAM].size);
+    qemu_fdt_setprop_sized_cells(
+        fdt, node, "ranges",
+        1, FDT_PCI_RANGE_IOPORT, 2, 0,
+        2, pio, 2, memmap[SIFIVE_U_DEV_PCIE_PIO].size,
+        1, FDT_PCI_RANGE_MMIO, 2, mmio,
+        2, mmio, 2,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE,
+        1, FDT_PCI_RANGE_MMIO_64BIT, 2, high,
+        2, high, 2, memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size);
+    sifive_u_cxl_irq_map(fdt, node, plic_phandle);
+
+    g_clear_pointer(&node, g_free);
+    node = g_strdup_printf("/soc/fw-cfg@%" HWADDR_PRIx, fw_cfg);
+    qemu_fdt_add_subnode(fdt, node);
+    qemu_fdt_setprop_string(fdt, node, "compatible", "qemu,fw-cfg-mmio");
+    qemu_fdt_setprop_sized_cells(fdt, node, "reg",
+                                 2, fw_cfg, 2, 8,
+                                 2, fw_cfg + 8, 2, 2,
+                                 2, fw_cfg + 16, 2, 8);
+}
 
 static void create_fdt(SiFiveUState *s, const MemMapEntry *memmap,
                        bool is_32_bit)
@@ -506,6 +593,10 @@ static void create_fdt(SiFiveUState *s, const MemMapEntry *memmap,
     qemu_fdt_setprop_string(fdt, "/aliases", "serial0", nodename);
 
     g_free(nodename);
+
+    if (s->cxl_devices_state.is_enabled) {
+        sifive_u_cxl_fdt(s, plic_phandle);
+    }
 }
 
 static void sifive_u_machine_reset(void *opaque, int n, int level)
@@ -527,6 +618,85 @@ static void sifive_u_validate_cxl_map(SiFiveUState *s)
         error_report("sifive_u CXL: RAM overlaps synthetic PCI MMIO64");
         exit(EXIT_FAILURE);
     }
+}
+
+static void sifive_u_create_gpex(SiFiveUState *s)
+{
+    const MemMapEntry *memmap = sifive_u_memmap;
+    DeviceState *dev = qdev_new(TYPE_GPEX_HOST);
+    MemoryRegion *ecam_alias = g_new0(MemoryRegion, 1);
+    MemoryRegion *mmio_alias = g_new0(MemoryRegion, 1);
+    MemoryRegion *high_alias = g_new0(MemoryRegion, 1);
+    MemoryRegion *ecam;
+    MemoryRegion *mmio;
+    int i;
+
+    object_property_set_uint(OBJECT(dev), PCI_HOST_ECAM_BASE,
+                             memmap[SIFIVE_U_DEV_PCIE_ECAM].base, NULL);
+    object_property_set_int(OBJECT(dev), PCI_HOST_ECAM_SIZE,
+                            memmap[SIFIVE_U_DEV_PCIE_ECAM].size, NULL);
+    object_property_set_uint(OBJECT(dev), PCI_HOST_PIO_BASE,
+                             memmap[SIFIVE_U_DEV_PCIE_PIO].base, NULL);
+    object_property_set_int(OBJECT(dev), PCI_HOST_PIO_SIZE,
+                            memmap[SIFIVE_U_DEV_PCIE_PIO].size, NULL);
+    object_property_set_uint(OBJECT(dev), PCI_HOST_BELOW_4G_MMIO_BASE,
+                             memmap[SIFIVE_U_DEV_PCIE_MMIO].base, NULL);
+    object_property_set_int(
+        OBJECT(dev), PCI_HOST_BELOW_4G_MMIO_SIZE,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE,
+        NULL);
+    object_property_set_uint(OBJECT(dev), PCI_HOST_ABOVE_4G_MMIO_BASE,
+                             memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base, NULL);
+    object_property_set_int(OBJECT(dev), PCI_HOST_ABOVE_4G_MMIO_SIZE,
+                            memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+
+    ecam = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+    memory_region_init_alias(ecam_alias, OBJECT(dev), "sifive-u-pcie-ecam",
+                             ecam, 0,
+                             memmap[SIFIVE_U_DEV_PCIE_ECAM].size);
+    memory_region_add_subregion(
+        get_system_memory(), memmap[SIFIVE_U_DEV_PCIE_ECAM].base, ecam_alias);
+
+    mmio = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 1);
+    memory_region_init_alias(
+        mmio_alias, OBJECT(dev), "sifive-u-pcie-mmio", mmio,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO].base,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO].size - SIFIVE_U_CXL_MMIO32_SIZE);
+    memory_region_add_subregion(
+        get_system_memory(), memmap[SIFIVE_U_DEV_PCIE_MMIO].base, mmio_alias);
+
+    memory_region_init_alias(
+        high_alias, OBJECT(dev), "sifive-u-pcie-mmio-high", mmio,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base,
+        memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].size);
+    memory_region_add_subregion(get_system_memory(),
+        memmap[SIFIVE_U_DEV_PCIE_MMIO_HIGH].base, high_alias);
+
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 2,
+                    memmap[SIFIVE_U_DEV_PCIE_PIO].base);
+    for (i = 0; i < SIFIVE_U_PCIE_IRQ_COUNT; i++) {
+        sysbus_connect_irq(
+            SYS_BUS_DEVICE(dev), i,
+            qdev_get_gpio_in(DEVICE(s->soc.plic),
+                             SIFIVE_U_PCIE_IRQ_BASE + i));
+        gpex_set_irq_num(GPEX_HOST(dev), i, SIFIVE_U_PCIE_IRQ_BASE + i);
+    }
+
+    s->gpex_host = GPEX_HOST(dev);
+    s->pci_bus = PCI_HOST_BRIDGE(dev)->bus;
+    s->gpex_host->gpex_cfg.bus = s->pci_bus;
+}
+
+static void sifive_u_create_fw_cfg(SiFiveUState *s)
+{
+    MachineState *ms = MACHINE(s);
+    hwaddr base = sifive_u_memmap[SIFIVE_U_DEV_FW_CFG].base;
+
+    s->fw_cfg = fw_cfg_init_mem_wide(base + 8, base, 8, base + 16,
+                                     &address_space_memory);
+    fw_cfg_add_i16(s->fw_cfg, FW_CFG_NB_CPUS, ms->smp.cpus);
+    rom_set_fw(s->fw_cfg);
 }
 
 static void sifive_u_machine_init(MachineState *machine)
@@ -560,6 +730,11 @@ static void sifive_u_machine_init(MachineState *machine)
     object_property_set_str(OBJECT(&s->soc), "cpu-type", machine->cpu_type,
                              &error_abort);
     qdev_realize(DEVICE(&s->soc), NULL, &error_fatal);
+
+    if (s->cxl_devices_state.is_enabled) {
+        sifive_u_create_fw_cfg(s);
+        sifive_u_create_gpex(s);
+    }
 
     /* register RAM */
     memory_region_add_subregion(system_memory, memmap[SIFIVE_U_DEV_DRAM].base,

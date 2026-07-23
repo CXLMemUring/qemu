@@ -11,6 +11,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import os
+import subprocess
 import time
 
 from qemu_test import Asset, LinuxKernelTest
@@ -47,6 +48,38 @@ class SifiveU(LinuxKernelTest):
         self.assertIn(
             'sifive_u CXL: RAM overlaps synthetic PCI MMIO64',
             self.vm.get_log())
+
+    def _dump_dts(self, cxl):
+        dtb = self.scratch_file('sifive-u.dtb')
+
+        self.set_machine('sifive_u')
+        machine = f'dumpdtb={dtb}'
+        if cxl:
+            machine += ',cxl=on'
+        self.vm.add_args('-machine', machine, '-display', 'none')
+        self.vm.set_qmp_monitor(enabled=False)
+        self.vm.launch()
+        self.vm.wait(timeout=5)
+        self.assertEqual(self.vm.exitcode(), 0)
+        return subprocess.check_output(
+            ['dtc', '-I', 'dtb', '-O', 'dts', dtb],
+            text=True, stderr=subprocess.DEVNULL)
+
+    def test_sifive_u_default_dtb_has_no_synthetic_pcie(self):
+        dts = self._dump_dts(False)
+
+        self.assertNotIn('pci-host-ecam-generic', dts)
+        self.assertNotIn('qemu,fw-cfg-mmio', dts)
+        self.assertNotIn('qemu,synthetic-cxl-host', dts)
+
+    def test_sifive_u_cxl_dtb_has_synthetic_pcie(self):
+        dts = self._dump_dts(True)
+
+        self.assertIn('compatible = "pci-host-ecam-generic"', dts)
+        self.assertIn('reg = <0x00 0x30000000 0x00 0x10000000>', dts)
+        self.assertIn('bus-range = <0x00 0xff>', dts)
+        self.assertIn('qemu,fw-cfg-mmio', dts)
+        self.assertIn('qemu,synthetic-cxl-host', dts)
 
     def do_test_riscv64_sifive_u_mmc_spi(self, connect_card):
         self.set_machine('sifive_u')
