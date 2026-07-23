@@ -494,6 +494,9 @@ static const TypeInfo pxb_pcie_dev_info = {
 
 static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
 {
+    PXBDev *pxb = PXB_DEV(dev);
+    int offset;
+
     /* A CXL PXB's parent bus is still PCIe */
     if (!pci_bus_is_express(pci_get_bus(dev))) {
         error_setg(errp, "pxb-cxl devices cannot reside on a PCI bus");
@@ -503,6 +506,24 @@ static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
     if (!pxb_dev_realize_common(dev, CXL, errp)) {
         return;
     }
+
+    /*
+     * A pxb-cxl represents a separate root bus rather than a transparent
+     * PCI bridge. Expose its firmware-assigned bus number through a
+     * read-only QEMU vendor capability so non-ACPI firmware can enumerate
+     * that root bus without guessing.
+     */
+    offset = pci_add_capability(dev, PCI_CAP_ID_VNDR, 0,
+                                QEMU_CXL_PXB_CAP_LENGTH, &error_abort);
+    dev->config[offset + PCI_CAP_FLAGS] = QEMU_CXL_PXB_CAP_LENGTH;
+    dev->config[offset + QEMU_CXL_PXB_CAP_TYPE_OFF] =
+        QEMU_CXL_PXB_CAP_TYPE;
+    memcpy(dev->config + offset + QEMU_CXL_PXB_CAP_SIG_OFF, "CXL", 3);
+    dev->config[offset + QEMU_CXL_PXB_CAP_BUS_OFF] = pxb->bus_nr;
+    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID,
+                 PCI_VENDOR_ID_REDHAT);
+    pci_set_word(dev->config + PCI_SUBSYSTEM_ID,
+                 QEMU_CXL_PXB_SUBSYSTEM_ID);
     pxb_cxl_dev_reset(DEVICE(dev));
 }
 

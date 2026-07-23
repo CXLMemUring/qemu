@@ -118,6 +118,13 @@ typedef struct PXBCXLDev {
 } PXBCXLDev;
 
 #define TYPE_PXB_CXL_DEV "pxb-cxl"
+
+#define QEMU_CXL_PXB_SUBSYSTEM_ID 0xc001
+#define QEMU_CXL_PXB_CAP_TYPE     0xc1
+#define QEMU_CXL_PXB_CAP_LENGTH   8
+#define QEMU_CXL_PXB_CAP_TYPE_OFF 3
+#define QEMU_CXL_PXB_CAP_SIG_OFF  4
+#define QEMU_CXL_PXB_CAP_BUS_OFF  7
 OBJECT_DECLARE_SIMPLE_TYPE(PXBCXLDev, PXB_CXL_DEV)
 
 int pci_bridge_ssvid_init(PCIDevice *dev, uint8_t offset,

@@ -6,14 +6,17 @@
 
 #include "qemu/osdep.h"
 #include "hw/nvram/fw_cfg.h"
+#include "hw/pci/pci_bridge.h"
 #include "libqtest.h"
 #include "qemu/bswap.h"
 #include "qemu/units.h"
+#include "standard-headers/linux/pci_regs.h"
 
 #define SIFIVE_U_FW_CFG_DATA     0x10100000ULL
 #define SIFIVE_U_FW_CFG_SELECTOR (SIFIVE_U_FW_CFG_DATA + 8)
 #define SIFIVE_U_CXL_FMW_BASE    0x1000000000ULL
 #define SIFIVE_U_CXL_FMW_SIZE    (4ULL * GiB)
+#define SIFIVE_U_PCIE_ECAM_BASE  0x30000000ULL
 
 typedef struct QEMU_PACKED TestAcpiHeader {
     char signature[4];
@@ -169,6 +172,38 @@ static void assert_acpi_tables(GByteArray *tables)
     assert_cedt(cedt, cedt_length);
 }
 
+static void assert_cxl_pxb_firmware_cap(QTestState *qts)
+{
+    uint64_t config = SIFIVE_U_PCIE_ECAM_BASE + (1 << 15);
+    uint8_t offset = qtest_readb(qts, config + PCI_CAPABILITY_LIST);
+    unsigned int ttl = 48;
+
+    while (offset && ttl--) {
+        uint8_t id = qtest_readb(qts, config + offset);
+
+        if (id == PCI_CAP_ID_VNDR &&
+            qtest_readb(qts, config + offset + 2) ==
+                QEMU_CXL_PXB_CAP_LENGTH &&
+            qtest_readb(qts, config + offset +
+                         QEMU_CXL_PXB_CAP_TYPE_OFF) ==
+                QEMU_CXL_PXB_CAP_TYPE &&
+            qtest_readb(qts, config + offset +
+                         QEMU_CXL_PXB_CAP_SIG_OFF) == 'C' &&
+            qtest_readb(qts, config + offset +
+                         QEMU_CXL_PXB_CAP_SIG_OFF + 1) == 'X' &&
+            qtest_readb(qts, config + offset +
+                         QEMU_CXL_PXB_CAP_SIG_OFF + 2) == 'L') {
+            g_assert_cmpuint(qtest_readb(qts, config + offset +
+                                         QEMU_CXL_PXB_CAP_BUS_OFF),
+                             ==, 64);
+            return;
+        }
+        offset = qtest_readb(qts, config + offset + 1);
+    }
+
+    g_assert_not_reached();
+}
+
 static void test_firmware_files(void)
 {
     g_autoptr(GByteArray) tables = NULL;
@@ -200,6 +235,7 @@ static void test_firmware_files(void)
     g_assert_nonnull(rsdp);
     g_assert_cmpuint(rsdp->len, >, 0);
     assert_acpi_tables(tables);
+    assert_cxl_pxb_firmware_cap(qts);
 
     qtest_quit(qts);
 }
