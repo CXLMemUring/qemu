@@ -167,6 +167,14 @@ static void sifive_u_cxl_fdt(SiFiveUState *s, uint32_t plic_phandle)
     qemu_fdt_setprop_cells(fdt, node, "bus-range", 0, 0xff);
     qemu_fdt_setprop(fdt, node, "dma-coherent", NULL, 0);
     qemu_fdt_setprop(fdt, node, "qemu,synthetic-cxl-host", NULL, 0);
+    qemu_fdt_setprop_u64(fdt, node, "qemu,cxl-host-reg-base",
+                         memmap[SIFIVE_U_DEV_CXL_HOST_REG].base);
+    qemu_fdt_setprop_u64(fdt, node, "qemu,cxl-host-reg-size",
+                         memmap[SIFIVE_U_DEV_CXL_HOST_REG].size);
+    qemu_fdt_setprop_u64(fdt, node, "qemu,cxl-fmw-aperture-base",
+                         memmap[SIFIVE_U_DEV_CXL_FMW].base);
+    qemu_fdt_setprop_u64(fdt, node, "qemu,cxl-fmw-aperture-size",
+                         memmap[SIFIVE_U_DEV_CXL_FMW].size);
     qemu_fdt_setprop_sized_cells(fdt, node, "reg",
                                  2, ecam,
                                  2, memmap[SIFIVE_U_DEV_PCIE_ECAM].size);
@@ -740,6 +748,7 @@ static void sifive_u_create_cxl_regions(SiFiveUState *s)
     if (!cxl->is_enabled) {
         return;
     }
+    cxl->firmware_handoff = true;
 
     for (it = cxl->cfmw_list; it; it = it->next) {
         if (uadd64_overflow(configured_size, it->value->size,

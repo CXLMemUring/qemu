@@ -21,6 +21,7 @@
 #define SIFIVE_U_CXL_CHBS_BASE   0x800000000ULL
 #define SIFIVE_U_CXL_CHBS_SIZE   (64 * KiB)
 #define SIFIVE_U_PCIE_ECAM_BASE  0x30000000ULL
+#define SIFIVE_U_RHCT_NODE_ARRAY_OFFSET 56
 
 typedef struct QEMU_PACKED TestAcpiHeader {
     char signature[4];
@@ -144,10 +145,73 @@ static void assert_cedt(const uint8_t *table, size_t length)
     g_assert_true(found_cfmws);
 }
 
+static void assert_madt(const uint8_t *table, size_t length)
+{
+    const uint8_t *entry = table + sizeof(TestAcpiHeader) + 8;
+    const uint8_t *end = table + length;
+    unsigned int rintc = 0;
+
+    while (entry + 2 <= end) {
+        uint8_t entry_length = entry[1];
+
+        g_assert_cmpuint(entry_length, >=, 2);
+        g_assert_true(entry + entry_length <= end);
+        if (entry[0] == 0x18) {
+            uint64_t hart_id;
+
+            g_assert_cmpuint(entry_length, ==, 36);
+            hart_id = ldq_le_p(entry + 8);
+            g_assert_cmpuint(hart_id, ==, rintc + 1);
+            g_assert_cmpuint(ldl_le_p(entry + 16), ==, hart_id);
+            g_assert_cmpuint(ldl_le_p(entry + 20), ==, 2 * hart_id);
+            rintc++;
+        }
+        entry += entry_length;
+    }
+
+    g_assert_cmpuint(rintc, ==, 4);
+}
+
+static void assert_rhct(const uint8_t *table, size_t length)
+{
+    const uint8_t *end = table + length;
+    const uint8_t *node;
+    uint32_t node_count;
+    unsigned int hart_nodes = 0;
+
+    g_assert_cmpuint(length, >=, SIFIVE_U_RHCT_NODE_ARRAY_OFFSET);
+    node_count = ldl_le_p(table + sizeof(TestAcpiHeader) + 12);
+    g_assert_cmpuint(node_count, ==, 5);
+    node = table + ldl_le_p(table + sizeof(TestAcpiHeader) + 16);
+
+    for (uint32_t i = 0; i < node_count; i++) {
+        uint16_t type;
+        uint16_t node_length;
+
+        g_assert_true(node + 4 <= end);
+        type = lduw_le_p(node);
+        node_length = lduw_le_p(node + 2);
+        g_assert_cmpuint(node_length, >=, 4);
+        g_assert_true(node + node_length <= end);
+        if (type == 0xffff) {
+            g_assert_cmpuint(node_length, ==, 16);
+            g_assert_cmpuint(ldl_le_p(node + 8), ==, hart_nodes + 1);
+            hart_nodes++;
+        }
+        node += node_length;
+    }
+
+    g_assert_cmpuint(hart_nodes, ==, 4);
+}
+
 static void assert_acpi_tables(GByteArray *tables)
 {
     const uint8_t *cedt = NULL;
+    const uint8_t *madt_table = NULL;
+    const uint8_t *rhct_table = NULL;
     size_t cedt_length = 0;
+    size_t madt_length = 0;
+    size_t rhct_length = 0;
     size_t offset = 0;
     unsigned int dsdt = 0;
     unsigned int fadt = 0;
@@ -173,8 +237,12 @@ static void assert_acpi_tables(GByteArray *tables)
             fadt++;
         } else if (!memcmp(header->signature, "APIC", 4)) {
             madt++;
+            madt_table = tables->data + offset;
+            madt_length = length;
         } else if (!memcmp(header->signature, "RHCT", 4)) {
             rhct++;
+            rhct_table = tables->data + offset;
+            rhct_length = length;
         } else if (!memcmp(header->signature, "MCFG", 4)) {
             mcfg++;
         } else if (!memcmp(header->signature, "CEDT", 4)) {
@@ -197,6 +265,8 @@ static void assert_acpi_tables(GByteArray *tables)
     g_assert_true(buffer_contains(tables->data, tables->len, "_DEP"));
     g_assert_true(buffer_contains_cxl_mmio64(tables->data, tables->len));
     assert_cedt(cedt, cedt_length);
+    assert_madt(madt_table, madt_length);
+    assert_rhct(rhct_table, rhct_length);
 }
 
 static void assert_cxl_pxb_firmware_cap(QTestState *qts)
@@ -257,8 +327,9 @@ static void test_firmware_files(void)
     QTestState *qts;
 
     qts = qtest_init(
-        "-machine sifive_u,cxl=on "
-        "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G "
+        "-machine sifive_u,cxl=on -smp 5 "
+        "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,"
+        "cxl-fmw.0.restrictions=0xe "
         "-object memory-backend-ram,id=t3mem,size=256M,share=on "
         "-object memory-backend-ram,id=t3lsa,size=2M,share=on "
         "-device pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1 "

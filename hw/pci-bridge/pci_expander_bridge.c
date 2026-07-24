@@ -214,6 +214,29 @@ void pxb_cxl_hook_up_registers(CXLState *cxl_state, PCIBus *bus, Error **errp)
     CXLComponentState *cxl_cstate = &cxl->cxl_cstate;
     struct MemoryRegion *mr = &cxl_cstate->crb.component_registers;
     hwaddr offset;
+    int cap_offset;
+
+    if (cxl_state->firmware_handoff && !pxb->firmware_cap_offset) {
+        cap_offset = pci_add_capability(pdev, PCI_CAP_ID_VNDR, 0,
+                                        QEMU_CXL_PXB_CAP_LENGTH, errp);
+        if (cap_offset < 0) {
+            return;
+        }
+        pxb->firmware_cap_offset = cap_offset;
+        pdev->config[cap_offset + PCI_CAP_FLAGS] =
+            QEMU_CXL_PXB_CAP_LENGTH;
+        pdev->config[cap_offset + QEMU_CXL_PXB_CAP_TYPE_OFF] =
+            QEMU_CXL_PXB_CAP_TYPE;
+        memcpy(pdev->config + cap_offset + QEMU_CXL_PXB_CAP_SIG_OFF,
+               "CXL", 3);
+        pdev->config[cap_offset + QEMU_CXL_PXB_CAP_BUS_OFF] =
+            PXB_DEV(pxb)->bus_nr;
+        pdev->config[cap_offset + QEMU_CXL_PXB_CAP_VERSION_OFF] = 1;
+        pci_set_word(pdev->config + PCI_SUBSYSTEM_VENDOR_ID,
+                     PCI_VENDOR_ID_REDHAT);
+        pci_set_word(pdev->config + PCI_SUBSYSTEM_ID,
+                     QEMU_CXL_PXB_SUBSYSTEM_ID);
+    }
 
     offset = memory_region_size(mr) * cxl_state->next_mr_idx;
     if (offset > memory_region_size(&cxl_state->host_mr)) {
@@ -224,12 +247,14 @@ void pxb_cxl_hook_up_registers(CXLState *cxl_state, PCIBus *bus, Error **errp)
     memory_region_add_subregion(&cxl_state->host_mr, offset, mr);
     cxl_state->next_mr_idx++;
 
-    pci_set_quad(pdev->config + pxb->firmware_cap_offset +
-                 QEMU_CXL_PXB_CAP_CHBS_BASE_OFF,
-                 cxl_state->host_mr.addr + offset);
-    pci_set_quad(pdev->config + pxb->firmware_cap_offset +
-                 QEMU_CXL_PXB_CAP_CHBS_SIZE_OFF,
-                 memory_region_size(mr));
+    if (pxb->firmware_cap_offset) {
+        pci_set_quad(pdev->config + pxb->firmware_cap_offset +
+                     QEMU_CXL_PXB_CAP_CHBS_BASE_OFF,
+                     cxl_state->host_mr.addr + offset);
+        pci_set_quad(pdev->config + pxb->firmware_cap_offset +
+                     QEMU_CXL_PXB_CAP_CHBS_SIZE_OFF,
+                     memory_region_size(mr));
+    }
 }
 
 void pxb_cxl_add_firmware_window(PXBCXLDev *pxb, hwaddr base, hwaddr size,
@@ -237,7 +262,12 @@ void pxb_cxl_add_firmware_window(PXBCXLDev *pxb, hwaddr base, hwaddr size,
 {
     PCIDevice *pdev = PCI_DEVICE(pxb);
     uint8_t *cap = pdev->config + pxb->firmware_cap_offset;
-    uint8_t count = cap[QEMU_CXL_PXB_CAP_FMW_COUNT_OFF];
+    uint8_t count;
+
+    if (!pxb->firmware_cap_offset) {
+        return;
+    }
+    count = cap[QEMU_CXL_PXB_CAP_FMW_COUNT_OFF];
 
     if (count >= QEMU_CXL_PXB_CAP_FMW_MAX) {
         error_setg(errp,
@@ -521,10 +551,6 @@ static const TypeInfo pxb_pcie_dev_info = {
 
 static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
 {
-    PXBCXLDev *cxl_pxb = PXB_CXL_DEV(dev);
-    PXBDev *pxb = PXB_DEV(dev);
-    int offset;
-
     /* A CXL PXB's parent bus is still PCIe */
     if (!pci_bus_is_express(pci_get_bus(dev))) {
         error_setg(errp, "pxb-cxl devices cannot reside on a PCI bus");
@@ -535,25 +561,6 @@ static void pxb_cxl_dev_realize(PCIDevice *dev, Error **errp)
         return;
     }
 
-    /*
-     * A pxb-cxl represents a separate root bus rather than a transparent
-     * PCI bridge. Expose its firmware-assigned bus number through a
-     * read-only QEMU vendor capability so non-ACPI firmware can enumerate
-     * that root bus without guessing.
-     */
-    offset = pci_add_capability(dev, PCI_CAP_ID_VNDR, 0,
-                                QEMU_CXL_PXB_CAP_LENGTH, &error_abort);
-    cxl_pxb->firmware_cap_offset = offset;
-    dev->config[offset + PCI_CAP_FLAGS] = QEMU_CXL_PXB_CAP_LENGTH;
-    dev->config[offset + QEMU_CXL_PXB_CAP_TYPE_OFF] =
-        QEMU_CXL_PXB_CAP_TYPE;
-    memcpy(dev->config + offset + QEMU_CXL_PXB_CAP_SIG_OFF, "CXL", 3);
-    dev->config[offset + QEMU_CXL_PXB_CAP_BUS_OFF] = pxb->bus_nr;
-    dev->config[offset + QEMU_CXL_PXB_CAP_VERSION_OFF] = 1;
-    pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID,
-                 PCI_VENDOR_ID_REDHAT);
-    pci_set_word(dev->config + PCI_SUBSYSTEM_ID,
-                 QEMU_CXL_PXB_SUBSYSTEM_ID);
     pxb_cxl_dev_reset(DEVICE(dev));
 }
 

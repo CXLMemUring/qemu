@@ -49,7 +49,8 @@ static void sifive_u_madt_add_rintc(uint32_t uid, uint64_t hart_id,
     build_append_int_noprefix(entry, 1, 4);
     build_append_int_noprefix(entry, hart_id, 8);
     build_append_int_noprefix(entry, uid, 4);
-    build_append_int_noprefix(entry, 2 * uid + 1, 4);
+    /* hart0 has only an M-mode context; U54 S-mode contexts are 2 * hart. */
+    build_append_int_noprefix(entry, 2 * hart_id, 4);
     build_append_int_noprefix(entry, 0, 8);
     build_append_int_noprefix(entry, 0, 4);
 }
@@ -61,7 +62,7 @@ static void sifive_u_dsdt_add_cpus(Aml *scope, SiFiveUState *s)
     const CPUArchIdList *arch_ids = mc->possible_cpu_arch_ids(ms);
     int i;
 
-    for (i = 0; i < arch_ids->len; i++) {
+    for (i = SIFIVE_U_MANAGEMENT_CPU_COUNT; i < arch_ids->len; i++) {
         g_autoptr(GArray) madt = g_array_new(false, true, 1);
         Aml *dev = aml_device("C%.03X", i);
 
@@ -191,7 +192,7 @@ static void sifive_u_build_madt(GArray *table_data, BIOSLinker *linker,
     build_append_int_noprefix(table_data, 0, 4);
     build_append_int_noprefix(table_data, 0, 4);
 
-    for (i = 0; i < arch_ids->len; i++) {
+    for (i = SIFIVE_U_MANAGEMENT_CPU_COUNT; i < arch_ids->len; i++) {
         sifive_u_madt_add_rintc(i, arch_ids->cpus[i].arch_id,
                                 table_data);
     }
@@ -235,7 +236,8 @@ static void sifive_u_build_rhct(GArray *table_data, BIOSLinker *linker,
     acpi_table_begin(&table, table_data);
     build_append_int_noprefix(table_data, 0, 4);
     build_append_int_noprefix(table_data, 1000000, 8);
-    build_append_int_noprefix(table_data, 1 + ms->smp.cpus, 4);
+    build_append_int_noprefix(
+        table_data, 1 + ms->smp.cpus - SIFIVE_U_MANAGEMENT_CPU_COUNT, 4);
     build_append_int_noprefix(
         table_data, SIFIVE_U_RHCT_NODE_ARRAY_OFFSET, 4);
 
@@ -249,7 +251,7 @@ static void sifive_u_build_rhct(GArray *table_data, BIOSLinker *linker,
         build_append_int_noprefix(table_data, 0, 1);
     }
 
-    for (i = 0; i < ms->smp.cpus; i++) {
+    for (i = SIFIVE_U_MANAGEMENT_CPU_COUNT; i < ms->smp.cpus; i++) {
         build_append_int_noprefix(table_data, 0xffff, 2);
         build_append_int_noprefix(table_data, 16, 2);
         build_append_int_noprefix(table_data, 1, 2);

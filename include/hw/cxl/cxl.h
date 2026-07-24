@@ -46,6 +46,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(CXLFixedWindow, CXL_FMW)
 
 typedef struct CXLState {
     bool is_enabled;
+    bool firmware_handoff;
     MemoryRegion host_mr;
     unsigned int next_mr_idx;
     CXLFixedMemoryWindowOptionsList *cfmw_list;

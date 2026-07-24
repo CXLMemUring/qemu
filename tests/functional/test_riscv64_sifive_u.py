@@ -80,6 +80,10 @@ class SifiveU(LinuxKernelTest):
         self.assertIn('bus-range = <0x00 0xff>', dts)
         self.assertIn('qemu,fw-cfg-mmio', dts)
         self.assertIn('qemu,synthetic-cxl-host', dts)
+        self.assertIn('qemu,cxl-host-reg-base', dts)
+        self.assertIn('qemu,cxl-host-reg-size', dts)
+        self.assertIn('qemu,cxl-fmw-aperture-base', dts)
+        self.assertIn('qemu,cxl-fmw-aperture-size', dts)
         self.assertIn('0x70000000', dts)
         self.assertIn('0x43000000', dts)
 
@@ -87,7 +91,8 @@ class SifiveU(LinuxKernelTest):
         self.vm.add_args(
             '-machine', 'cxl=on',
             '-machine',
-            'cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G',
+            ('cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,'
+             'cxl-fmw.0.restrictions=0xe'),
             '-object',
             'memory-backend-ram,id=t3mem,size=256M,share=on',
             '-object',
