@@ -48,6 +48,10 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-cxl-type2-wire': [
+    meson.project_source_root() / 'hw/cxl/slugarch_type2_protocol.c',
+    io,
+  ],
 }
 
 if have_system or have_tools
