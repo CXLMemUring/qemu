@@ -7,6 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "hw/cxl/cxl_component.h"
 #include "hw/pci/pci_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/crc32c.h"
@@ -40,8 +41,45 @@
     "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
     "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
 
+#define QEMU_T2_CFMWS_BASE \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52," \
+    "hdm_for_passthrough=on " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+
+#define QEMU_T2_CFMWS_TWO_TARGETS \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
+    "-device pxb-cxl,id=cxl.1,bus=pcie.0,bus_nr=53 " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.targets.1=cxl.1," \
+    "cxl-fmw.0.size=256M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+
+#define QEMU_T2_CFMWS_512M \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=512M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+
+#define QEMU_T2_CFMWS_SWITCH \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,addr=0.0,chassis=0,slot=0 " \
+    "-device cxl-upstream,id=us0,bus=rp0,addr=0.0 " \
+    "-device cxl-downstream,id=swport0,bus=us0,addr=0.0,port=0," \
+    "chassis=0,slot=4 "
+
 #define Q35_PCIE_MCFG_BASE UINT64_C(0xb0000000)
+#define Q35_CXL_HOST_REG_BASE UINT64_C(0x100000000)
+#define Q35_CXL_HB_CACHE_MEM_BASE (Q35_CXL_HOST_REG_BASE + 0x1000)
+#define Q35_CFMWS_BASE UINT64_C(0x110000000)
 #define T2_DVSEC_DEVFN (4U << 3)
+#define T2_SENTINEL_DPA (80 * MiB)
+#define T2_SERVER_READ_VALUE UINT64_C(0x1122334455667788)
+#define T2_CLIENT_WRITE_VALUE UINT64_C(0x8877665544332211)
+#define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
 
 /* Dual ports on first pxb */
 #define QEMU_2RP \
@@ -121,6 +159,17 @@ typedef struct T2FakeServer {
     uint64_t ack_latency;
     uint64_t ack_request_id;
     bool bad_crc;
+    bool memory_protocol_valid;
+    bool write_committed;
+    bool write_response_sent;
+    unsigned memory_requests;
+    unsigned read_requests;
+    unsigned write_requests;
+    uint64_t last_read_dpa;
+    uint64_t last_write_dpa;
+    uint64_t last_write_value;
+    uint64_t read_value;
+    uint64_t server_sequence;
 } T2FakeServer;
 
 static bool t2_read_exact(int fd, uint8_t *bytes, size_t length)
@@ -188,6 +237,77 @@ static void t2_encode_ack(const T2FakeServer *server, uint8_t ack[88])
     }
 }
 
+static bool t2_frame_crc_valid(const uint8_t *frame, size_t length)
+{
+    uint8_t copy[128];
+    uint32_t received;
+
+    if (length > sizeof(copy)) {
+        return false;
+    }
+    memcpy(copy, frame, length);
+    received = ldl_le_p(copy + 32);
+    stl_le_p(copy + 32, 0);
+    return received == crc32c(0xffffffffU, copy, length);
+}
+
+static bool t2_decode_memory_request(T2FakeServer *server,
+                                     const uint8_t frame[128],
+                                     uint16_t *type,
+                                     uint64_t *request_id,
+                                     uint64_t *client_id,
+                                     uint32_t *length,
+                                     uint64_t *dpa,
+                                     uint64_t *value)
+{
+    *type = lduw_le_p(frame + 6);
+    *request_id = ldq_le_p(frame + 16);
+    *client_id = ldq_le_p(frame + 24);
+    *length = ldl_le_p(frame + 40);
+    *dpa = ldq_le_p(frame + 48);
+    *value = ldq_le_p(frame + 64);
+
+    return memcmp(frame, "SLT2", 4) == 0 &&
+           lduw_le_p(frame + 4) == 1 &&
+           (*type == 3 || *type == 4) &&
+           ldl_le_p(frame + 8) == 128 &&
+           ldl_le_p(frame + 12) == 0 &&
+           *request_id >= 2 &&
+           *client_id == 1 &&
+           ldl_le_p(frame + 36) == 0 &&
+           *length == 8 &&
+           ldl_le_p(frame + 44) == 0 &&
+           *dpa == T2_SENTINEL_DPA &&
+           t2_frame_crc_valid(frame, 128) &&
+           server->ack_sent;
+}
+
+static void t2_encode_memory_response(T2FakeServer *server,
+                                      uint8_t response[128],
+                                      uint16_t request_type,
+                                      uint64_t request_id,
+                                      uint64_t client_id)
+{
+    uint32_t checksum;
+
+    memset(response, 0, 128);
+    memcpy(response, "SLT2", 4);
+    stw_le_p(response + 4, 1);
+    stw_le_p(response + 6, 5);
+    stl_le_p(response + 8, 128);
+    stq_le_p(response + 16, request_id);
+    stq_le_p(response + 24, client_id);
+    stl_le_p(response + 40, 0);
+    stl_le_p(response + 44, request_type == 3 ? 8 : 0);
+    stq_le_p(response + 48, ++server->server_sequence);
+    stq_le_p(response + 56, server->ack_latency);
+    if (request_type == 3) {
+        stq_le_p(response + 64, server->read_value);
+    }
+    checksum = crc32c(0xffffffffU, response, 128);
+    stl_le_p(response + 32, checksum);
+}
+
 static gpointer t2_fake_server_thread(gpointer opaque)
 {
     T2FakeServer *server = opaque;
@@ -226,14 +346,44 @@ static gpointer t2_fake_server_thread(gpointer opaque)
             .fd = client_fd,
             .events = POLLIN,
         };
-        uint8_t discard[128];
+        uint8_t request[128];
+        uint8_t response[128];
+        uint16_t type;
+        uint64_t request_id;
+        uint64_t client_id;
+        uint64_t dpa;
+        uint64_t value;
+        uint32_t length;
         int ready = poll(&client_pollfd, 1, 50);
 
         if (ready > 0) {
-            ssize_t received = recv(client_fd, discard, sizeof(discard), 0);
-
-            if (received <= 0) {
+            if (!t2_read_exact(client_fd, request, sizeof(request))) {
                 break;
+            }
+            server->memory_protocol_valid =
+                t2_decode_memory_request(server, request, &type,
+                                         &request_id, &client_id,
+                                         &length, &dpa, &value);
+            if (!server->memory_protocol_valid) {
+                break;
+            }
+            server->memory_requests++;
+            if (type == 3) {
+                server->read_requests++;
+                server->last_read_dpa = dpa;
+            } else {
+                server->write_requests++;
+                server->last_write_dpa = dpa;
+                server->last_write_value = value;
+                server->write_committed = true;
+            }
+            t2_encode_memory_response(server, response, type,
+                                      request_id, client_id);
+            if (!t2_write_exact(client_fd, response, sizeof(response))) {
+                break;
+            }
+            if (type == 4) {
+                server->write_response_sent = true;
             }
         } else if (ready < 0 && errno != EINTR) {
             break;
@@ -260,6 +410,7 @@ static T2FakeServer *t2_fake_server_start(uint64_t capacity,
     server->ack_latency = latency;
     server->ack_request_id = request_id;
     server->bad_crc = bad_crc;
+    server->read_value = T2_SERVER_READ_VALUE;
     server->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     g_assert_cmpint(server->listen_fd, >=, 0);
     g_assert_cmpint(setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR,
@@ -460,6 +611,257 @@ static void cxl_t2_sync_bad_request_id(void)
 static void cxl_t2_sync_bad_crc(void)
 {
     t2_sync_handshake_case(256 * MiB, 400, 1, true, false, "CRC32C");
+}
+
+static void t2_program_host_decoder(QTestState *qts)
+{
+    const uint64_t registers = Q35_CXL_HB_CACHE_MEM_BASE;
+    uint32_t control;
+
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_BASE_LO,
+                 Q35_CFMWS_BASE & 0xf0000000U);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_BASE_HI,
+                 Q35_CFMWS_BASE >> 32);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_SIZE_LO,
+                 256 * MiB);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_SIZE_HI, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_TARGET_LIST_LO, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_TARGET_LIST_HI, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER_GLOBAL_CONTROL,
+                 1U << 1);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_CTRL, 1U << 9);
+    control = qtest_readl(qts, registers + A_CXL_HDM_DECODER0_CTRL);
+    g_assert_cmphex(control & (1U << 10), ==, 1U << 10);
+}
+
+static uint32_t t2_pci_config_address(uint8_t bus, uint8_t devfn,
+                                      uint8_t offset)
+{
+    return (1U << 31) | ((uint32_t)bus << 16) |
+           ((uint32_t)devfn << 8) | (offset & ~3U);
+}
+
+static uint16_t t2_pci_config_readw(QTestState *qts, uint8_t bus,
+                                    uint8_t devfn, uint8_t offset)
+{
+    qtest_outl(qts, 0xcf8, t2_pci_config_address(bus, devfn, offset));
+    return qtest_inw(qts, 0xcfc + (offset & 3));
+}
+
+static uint32_t t2_pci_config_readl(QTestState *qts, uint8_t bus,
+                                    uint8_t devfn, uint8_t offset)
+{
+    qtest_outl(qts, 0xcf8, t2_pci_config_address(bus, devfn, offset));
+    return qtest_inl(qts, 0xcfc);
+}
+
+static void t2_pci_config_writew(QTestState *qts, uint8_t bus,
+                                 uint8_t devfn, uint8_t offset,
+                                 uint16_t value)
+{
+    qtest_outl(qts, 0xcf8, t2_pci_config_address(bus, devfn, offset));
+    qtest_outw(qts, 0xcfc + (offset & 3), value);
+}
+
+static void t2_pci_config_writel(QTestState *qts, uint8_t bus,
+                                 uint8_t devfn, uint8_t offset,
+                                 uint32_t value)
+{
+    qtest_outl(qts, 0xcf8, t2_pci_config_address(bus, devfn, offset));
+    qtest_outl(qts, 0xcfc, value);
+}
+
+static void t2_enable_bridge_window(QTestState *qts, uint8_t bus,
+                                    uint8_t devfn)
+{
+    uint16_t command = t2_pci_config_readw(qts, bus, devfn,
+                                           PCI_COMMAND);
+
+    t2_pci_config_writel(qts, bus, devfn, PCI_MEMORY_BASE,
+                         0xd000d000U);
+    t2_pci_config_writew(qts, bus, devfn, PCI_COMMAND,
+                         command | PCI_COMMAND_MEMORY);
+}
+
+static void t2_program_switch_decoder(QTestState *qts)
+{
+    const uint64_t registers = T2_SWITCH_COMPONENT_BAR + 0x1000;
+    uint32_t control;
+
+    t2_pci_config_writel(qts, 52, 0, PCI_PRIMARY_BUS,
+                         52U | (53U << 8) | (55U << 16));
+    g_assert_cmphex(t2_pci_config_readw(qts, 53, 0, PCI_VENDOR_ID),
+                    !=, 0xffff);
+    t2_pci_config_writel(qts, 53, 0, PCI_PRIMARY_BUS,
+                         53U | (54U << 8) | (55U << 16));
+    g_assert_cmphex(t2_pci_config_readw(qts, 54, 0, PCI_VENDOR_ID),
+                    !=, 0xffff);
+    t2_pci_config_writel(qts, 54, 0, PCI_PRIMARY_BUS,
+                         54U | (55U << 8) | (55U << 16));
+    g_assert_cmphex(t2_pci_config_readw(qts, 55, 0, PCI_VENDOR_ID),
+                    ==, 0x8086);
+
+    t2_enable_bridge_window(qts, 52, 0);
+    t2_enable_bridge_window(qts, 53, 0);
+    t2_enable_bridge_window(qts, 54, 0);
+    t2_pci_config_writel(qts, 53, 0, PCI_BASE_ADDRESS_0,
+                         T2_SWITCH_COMPONENT_BAR);
+    t2_pci_config_writel(qts, 53, 0, PCI_BASE_ADDRESS_1, 0);
+    g_assert_cmphex(
+        t2_pci_config_readl(qts, 53, 0, PCI_BASE_ADDRESS_0) &
+        PCI_BASE_ADDRESS_MEM_MASK,
+        ==, T2_SWITCH_COMPONENT_BAR);
+
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_BASE_LO,
+                 Q35_CFMWS_BASE & 0xf0000000U);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_BASE_HI,
+                 Q35_CFMWS_BASE >> 32);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_SIZE_LO,
+                 256 * MiB);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_SIZE_HI, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_TARGET_LIST_LO, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_TARGET_LIST_HI, 0);
+    qtest_writel(qts, registers + A_CXL_HDM_DECODER0_CTRL, 1U << 9);
+    control = qtest_readl(qts, registers + A_CXL_HDM_DECODER0_CTRL);
+    g_assert_cmphex(control & (1U << 10), ==, 1U << 10);
+}
+
+static uint64_t t2_qom_counter(QTestState *qts, const char *property)
+{
+    QDict *response;
+    uint64_t value;
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-get','arguments':{"
+        "'path':'/machine/peripheral/t2','property':%s}}",
+        property);
+    g_assert_false(qdict_haskey(response, "error"));
+    value = qdict_get_int(response, "return");
+    qobject_unref(response);
+    return value;
+}
+
+static void cxl_t2_direct_cfmws(void)
+{
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+    uint64_t read_value;
+
+    run_dir = g_dir_make_tmp("cxl-t2-cfmws-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    qts = qtest_init(QEMU_T2_CFMWS_BASE);
+    response = t2_device_add(qts, "rp0", server->port, event_path);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+
+    t2_program_host_decoder(qts);
+    read_value = qtest_readq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA);
+    g_assert_cmphex(read_value, ==, T2_SERVER_READ_VALUE);
+    qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA,
+                 T2_CLIENT_WRITE_VALUE);
+
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-reads"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-writes"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-read-bytes"),
+                     ==, 8);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-written-bytes"),
+                     ==, 8);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-direct-cfmws"),
+                     ==, 2);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-bar4-overlay"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-local-shadow"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-local-cache"),
+                     ==, 0);
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    g_assert_true(server->memory_protocol_valid);
+    g_assert_cmpuint(server->memory_requests, ==, 2);
+    g_assert_cmpuint(server->read_requests, ==, 1);
+    g_assert_cmpuint(server->write_requests, ==, 1);
+    g_assert_cmphex(server->last_read_dpa, ==, T2_SENTINEL_DPA);
+    g_assert_cmphex(server->last_write_dpa, ==, T2_SENTINEL_DPA);
+    g_assert_cmphex(server->last_read_dpa, !=,
+                    Q35_CFMWS_BASE + T2_SENTINEL_DPA);
+    g_assert_cmphex(server->last_write_dpa, !=,
+                    Q35_CFMWS_BASE + T2_SENTINEL_DPA);
+    g_assert_cmphex(server->last_write_value, ==,
+                    T2_CLIENT_WRITE_VALUE);
+    g_assert_true(server->write_committed);
+    g_assert_true(server->write_response_sent);
+
+    unlink(event_path);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void t2_rejected_cfmws_case(const char *command_line,
+                                   const char *endpoint_bus,
+                                   void (*topology_setup)(QTestState *))
+{
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+
+    run_dir = g_dir_make_tmp("cxl-t2-rejected-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    qts = qtest_init(command_line);
+    response = t2_device_add(qts, endpoint_bus, server->port, event_path);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+    if (topology_setup) {
+        topology_setup(qts);
+    }
+
+    g_assert_cmphex(qtest_readq(qts,
+                                Q35_CFMWS_BASE + T2_SENTINEL_DPA),
+                    ==, 0);
+    qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA,
+                 T2_CLIENT_WRITE_VALUE);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-direct-cfmws"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-reads"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-writes"),
+                     ==, 0);
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    g_assert_cmpuint(server->memory_requests, ==, 0);
+
+    unlink(event_path);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void cxl_t2_cfmws_reject_two_targets(void)
+{
+    t2_rejected_cfmws_case(QEMU_T2_CFMWS_TWO_TARGETS, "rp0", NULL);
+}
+
+static void cxl_t2_cfmws_reject_512m(void)
+{
+    t2_rejected_cfmws_case(QEMU_T2_CFMWS_512M, "rp0", NULL);
+}
+
+static void cxl_t2_cfmws_reject_switch(void)
+{
+    t2_rejected_cfmws_case(QEMU_T2_CFMWS_SWITCH, "swport0",
+                           t2_program_switch_decoder);
 }
 
 static uint16_t t2_find_device_dvsec(QTestState *qts,
@@ -757,6 +1159,14 @@ int main(int argc, char **argv)
                        cxl_t2_sync_bad_request_id);
         qtest_add_func("/pci/cxl/type2_sync_bad_crc",
                        cxl_t2_sync_bad_crc);
+        qtest_add_func("/pci/cxl/type2_direct_cfmws",
+                       cxl_t2_direct_cfmws);
+        qtest_add_func("/pci/cxl/type2_cfmws_reject_two_targets",
+                       cxl_t2_cfmws_reject_two_targets);
+        qtest_add_func("/pci/cxl/type2_cfmws_reject_512m",
+                       cxl_t2_cfmws_reject_512m);
+        qtest_add_func("/pci/cxl/type2_cfmws_reject_switch",
+                       cxl_t2_cfmws_reject_switch);
         qtest_add_func("/pci/cxl/type2_dvsec", cxl_t2_dvsec);
         qtest_add_func("/pci/cxl/type2_dvsec_bad_fractional_cache",
                        cxl_t2_dvsec_bad_fractional_cache);

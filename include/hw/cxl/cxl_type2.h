@@ -20,6 +20,7 @@
 #include "hw/cxl/cxl_p2p_dma.h"
 #include "exec/memattrs.h"
 #include "qemu/thread.h"
+#include "qemu/units.h"
 #include "io/channel-socket.h"
 
 #define TYPE_CXL_TYPE2 "cxl-type2"
@@ -296,5 +297,24 @@ MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
 MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
                                   uint64_t value, unsigned size,
                                   MemTxAttrs attrs);
+static inline bool cxl_type2_cfmws_shape_valid(unsigned total_windows,
+                                               unsigned num_targets,
+                                               uint8_t encoded_ways,
+                                               uint64_t window_size,
+                                               uint64_t dpa_base,
+                                               uint64_t device_size,
+                                               uint64_t access_offset,
+                                               unsigned access_size)
+{
+    return total_windows == 1 &&
+           num_targets == 1 &&
+           encoded_ways == 0 &&
+           window_size == 256 * MiB &&
+           dpa_base == 0 &&
+           device_size == 256 * MiB &&
+           access_size > 0 &&
+           access_offset <= window_size &&
+           access_size <= window_size - access_offset;
+}
 
 #endif /* CXL_TYPE2_H */

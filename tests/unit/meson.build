@@ -52,6 +52,7 @@ tests = {
     meson.project_source_root() / 'hw/cxl/slugarch_type2_protocol.c',
     io,
   ],
+  'test-cxl-type2-route': [],
 }
 
 if have_system or have_tools
