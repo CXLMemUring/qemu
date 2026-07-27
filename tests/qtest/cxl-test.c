@@ -7,6 +7,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "hw/pci/pci_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/crc32c.h"
 #include "qemu/units.h"
@@ -38,6 +39,9 @@
     "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
     "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
     "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+
+#define Q35_PCIE_MCFG_BASE UINT64_C(0xb0000000)
+#define T2_DVSEC_DEVFN (4U << 3)
 
 /* Dual ports on first pxb */
 #define QEMU_2RP \
@@ -281,14 +285,14 @@ static void t2_fake_server_stop(T2FakeServer *server)
     g_thread_join(server->thread);
 }
 
-static QDict *t2_device_add(QTestState *qts, uint16_t port,
-                            const char *event_path)
+static QDict *t2_device_add(QTestState *qts, const char *bus,
+                            uint16_t port, const char *event_path)
 {
     QDict *arguments = qdict_new();
 
     qdict_put_str(arguments, "driver", "cxl-type2");
     qdict_put_str(arguments, "id", "t2");
-    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_str(arguments, "bus", bus);
     qdict_put_int(arguments, "gpu-mode", 0);
     qdict_put_bool(arguments, "coherency-enabled", false);
     qdict_put_int(arguments, "cache-size", 128 * MiB);
@@ -389,7 +393,7 @@ static void t2_sync_handshake_case(uint64_t capacity,
     event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
     server = t2_fake_server_start(capacity, latency, request_id, bad_crc);
     qts = qtest_init(QEMU_T2_SYNC_BASE);
-    response = t2_device_add(qts, server->port, event_path);
+    response = t2_device_add(qts, "rp0", server->port, event_path);
     success = !qdict_haskey(response, "error");
     if (!success) {
         error_description = g_strdup(qdict_get_str(
@@ -456,6 +460,137 @@ static void cxl_t2_sync_bad_request_id(void)
 static void cxl_t2_sync_bad_crc(void)
 {
     t2_sync_handshake_case(256 * MiB, 400, 1, true, false, "CRC32C");
+}
+
+static uint16_t t2_find_device_dvsec(QTestState *qts,
+                                     uint64_t config_base)
+{
+    uint16_t offset = 0x100;
+    unsigned hops;
+
+    for (hops = 0; hops < 256 && offset; hops++) {
+        uint32_t header = qtest_readl(qts, config_base + offset);
+
+        if (header == 0 || header == UINT32_MAX) {
+            break;
+        }
+        if (PCI_EXT_CAP_ID(header) == PCI_EXT_CAP_ID_DVSEC &&
+            qtest_readw(qts, config_base + offset + PCI_DVSEC_HEADER2) ==
+            0) {
+            return offset;
+        }
+        offset = PCI_EXT_CAP_NEXT(header);
+    }
+
+    g_assert_not_reached();
+}
+
+static void cxl_t2_dvsec(void)
+{
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    g_autoptr(GString) cmdline = g_string_new(NULL);
+    T2FakeServer *server;
+    QTestState *qts;
+    uint64_t config_base =
+        Q35_PCIE_MCFG_BASE + ((uint64_t)T2_DVSEC_DEVFN << 12);
+    uint16_t dvsec;
+    uint16_t cap;
+    uint16_t cap2;
+    uint32_t range1_size_hi;
+    uint32_t range1_size_lo;
+
+    run_dir = g_dir_make_tmp("cxl-t2-dvsec-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    g_string_printf(
+        cmdline,
+        "-machine q35,cxl=on "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=128M,mem-size=256M,"
+        "sync-type2-wire=on,type2-wire-version=1,"
+        "slugarch-event-log=%s,cxlmemsim-addr=127.0.0.1,"
+        "cxlmemsim-port=%u",
+        event_path, server->port);
+    qts = qtest_init(cmdline->str);
+
+    qtest_outl(qts, 0xcf8, (1U << 31) | 0x64);
+    qtest_outl(qts, 0xcfc, 0);
+    qtest_outl(qts, 0xcf8, (1U << 31) | 0x60);
+    qtest_outl(qts, 0xcfc, Q35_PCIE_MCFG_BASE | 1);
+    g_assert_cmphex(qtest_readw(qts, config_base), ==, 0x8086);
+
+    dvsec = t2_find_device_dvsec(qts, config_base);
+    cap = qtest_readw(qts, config_base + dvsec + 0x0a);
+    cap2 = qtest_readw(qts, config_base + dvsec + 0x16);
+    range1_size_hi = qtest_readl(qts, config_base + dvsec + 0x18);
+    range1_size_lo = qtest_readl(qts, config_base + dvsec + 0x1c);
+
+    g_assert_cmphex(cap & 0xf, ==, 0xf);
+    g_assert_cmpuint((cap >> 4) & 0x3, ==, 1);
+    g_assert_cmpuint(cap2 & 0xf, ==, 2);
+    g_assert_cmpuint((cap2 >> 8) & 0xff, ==, 128);
+    g_assert_cmpuint(range1_size_lo & 0x3, ==, 0x3);
+    g_assert_cmpuint(((uint64_t)range1_size_hi << 32) |
+                     (range1_size_lo & 0xf0000000U), ==, 256 * MiB);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x20),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x24),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x28),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x2c),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x30),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x34),
+                    ==, 0);
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    unlink(event_path);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void t2_bad_cache_size_case(uint64_t cache_size)
+{
+    QTestState *qts = qtest_init(QEMU_T2_SYNC_BASE);
+    QDict *arguments = qdict_new();
+    QDict *response;
+    const char *description;
+
+    qdict_put_str(arguments, "driver", "cxl-type2");
+    qdict_put_str(arguments, "id", "t2-bad-cache");
+    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_int(arguments, "gpu-mode", 0);
+    qdict_put_bool(arguments, "coherency-enabled", false);
+    qdict_put_int(arguments, "cache-size", cache_size);
+    qdict_put_int(arguments, "mem-size", 256 * MiB);
+    qdict_put_str(arguments, "cxlmemsim-addr", "127.0.0.1");
+    qdict_put_int(arguments, "cxlmemsim-port", 1);
+    response = qtest_qmp(
+        qts, "{'execute':'device_add','arguments':%p}", arguments);
+
+    g_assert_true(qdict_haskey(response, "error"));
+    description = qdict_get_str(qdict_get_qdict(response, "error"),
+                                "desc");
+    g_assert_nonnull(strstr(
+        description,
+        "cache-size must be an integral value from 1 MiB through 255 MiB"));
+    qobject_unref(response);
+    qtest_quit(qts);
+}
+
+static void cxl_t2_dvsec_bad_fractional_cache(void)
+{
+    t2_bad_cache_size_case(128 * MiB + 1);
+}
+
+static void cxl_t2_dvsec_bad_oversized_cache(void)
+{
+    t2_bad_cache_size_case(256 * MiB);
 }
 #endif /* CONFIG_POSIX */
 
@@ -622,6 +757,11 @@ int main(int argc, char **argv)
                        cxl_t2_sync_bad_request_id);
         qtest_add_func("/pci/cxl/type2_sync_bad_crc",
                        cxl_t2_sync_bad_crc);
+        qtest_add_func("/pci/cxl/type2_dvsec", cxl_t2_dvsec);
+        qtest_add_func("/pci/cxl/type2_dvsec_bad_fractional_cache",
+                       cxl_t2_dvsec_bad_fractional_cache);
+        qtest_add_func("/pci/cxl/type2_dvsec_bad_oversized_cache",
+                       cxl_t2_dvsec_bad_oversized_cache);
         qtest_add_func("/pci/cxl/type3_device", cxl_t3d_deprecated);
         qtest_add_func("/pci/cxl/type3_device_pmem", cxl_t3d_persistent);
         qtest_add_func("/pci/cxl/type3_device_vmem", cxl_t3d_volatile);

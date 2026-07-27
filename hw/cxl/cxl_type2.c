@@ -3142,13 +3142,14 @@ static void build_dvsecs(CXLType2State *ct2d)
         .ctrl2 = 0,
         .status2 = 0x2,
         .lock = 0,
-        .cap2 = (ct2d->cache_size >> 20) & 0xFFFF,  /* Cache size in MB */
-        .range1_size_hi = ct2d->cache_size >> 32,
-        .range1_size_lo = (ct2d->cache_size & 0xFFFFFFF0) | 0x3,  /* Cache: Valid, Active */
+        .cap2 = ((((ct2d->cache_size / MiB) & 0xff) << 8) | 2),
+        .range1_size_hi = ct2d->device_mem_size >> 32,
+        .range1_size_lo = (2U << 5) | (2U << 2) | 0x3U |
+                          (ct2d->device_mem_size & 0xf0000000U),
         .range1_base_hi = 0,
         .range1_base_lo = 0,
-        .range2_size_hi = ct2d->device_mem_size >> 32,
-        .range2_size_lo = (ct2d->device_mem_size & 0xFFFFFFF0) | 0x1,  /* Mem: Valid */
+        .range2_size_hi = 0,
+        .range2_size_lo = 0,
         .range2_base_hi = 0,
         .range2_base_lo = 0,
     };
@@ -3228,6 +3229,14 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     }
     if (ct2d->device_mem_size == 0) {
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
+    }
+    if (ct2d->cache_size < MiB ||
+        ct2d->cache_size > 255 * MiB ||
+        ct2d->cache_size % MiB != 0) {
+        error_setg(errp,
+                   "cache-size must be an integral value from "
+                   "1 MiB through 255 MiB");
+        return;
     }
 
     /* Initialize coherency protocol */
