@@ -20,12 +20,14 @@
 #include "qemu/sockets.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "crypto/hash.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_cdat.h"
 #include "hw/cxl/cxl_pci.h"
 #include "hw/cxl/cxl_type2.h"
+#include "hw/cxl/slugarch_type2_protocol.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
@@ -61,7 +63,6 @@ void cxl_type2_coherency_init(CXLType2State *ct2d)
     ct2d->coherency.cache_misses = 0;
     ct2d->coherency.coherency_ops = 0;
     ct2d->coherency.snoops = 0;
-    ct2d->coherency.coherency_enabled = true;
 
     qemu_log("CXL Type2: Coherency protocol initialized\n");
 }
@@ -155,7 +156,7 @@ void cxl_type2_cache_writeback(CXLType2State *ct2d, uint64_t addr)
         }
 
         /* Send writeback to CXLMemSim */
-        if (ct2d->memsim.connected) {
+        if (ct2d->memsim.connected && !ct2d->slugarch.enabled) {
             CXLType2Message msg = {
                 .type = CXL_T2_MSG_WRITEBACK,
                 .size = 64,
@@ -1096,7 +1097,7 @@ int cxl_type2_gpu_write(CXLType2State *ct2d, uint64_t offset, const void *buf, s
         cxl_type2_cache_invalidate(ct2d, offset);
 
         /* Notify CXLMemSim of GPU write for coherency protocol */
-        if (ct2d->memsim.connected) {
+        if (ct2d->memsim.connected && !ct2d->slugarch.enabled) {
             CXLType2Message msg = {
                 .type = CXL_T2_MSG_GPU_ACCESS,
                 .size = size,
@@ -1134,6 +1135,244 @@ int cxl_type2_gpu_write(CXLType2State *ct2d, uint64_t offset, const void *buf, s
 /* ========================================================================
  * CXLMemSim Communication
  * ======================================================================== */
+
+static void cxl_type2_close_memsim_socket(CXLType2State *ct2d)
+{
+    ct2d->memsim.connected = false;
+    if (ct2d->memsim.socket) {
+        qio_channel_close(QIO_CHANNEL(ct2d->memsim.socket), NULL);
+        object_unref(OBJECT(ct2d->memsim.socket));
+        ct2d->memsim.socket = NULL;
+    }
+}
+
+static void cxl_type2_slugarch_close_event_log(CXLType2State *ct2d)
+{
+    if (ct2d->slugarch.event_log) {
+        fclose(ct2d->slugarch.event_log);
+        ct2d->slugarch.event_log = NULL;
+    }
+}
+
+static bool cxl_type2_slugarch_write_line(CXLType2State *ct2d,
+                                          const char *line,
+                                          Error **errp)
+{
+    if (!ct2d->slugarch.event_log) {
+        error_setg(errp, "SlugArch Type-2 event log is not open");
+        return false;
+    }
+    if (fputs(line, ct2d->slugarch.event_log) == EOF ||
+        fflush(ct2d->slugarch.event_log) != 0) {
+        error_setg_errno(errp, errno,
+                         "SlugArch Type-2 event log write failed");
+        return false;
+    }
+    return true;
+}
+
+static bool cxl_type2_slugarch_open_event_log(CXLType2State *ct2d,
+                                               Error **errp)
+{
+    int fd;
+
+    fd = open(ct2d->slugarch.event_log_path,
+              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno,
+                         "cannot create SlugArch Type-2 event log '%s'",
+                         ct2d->slugarch.event_log_path);
+        return false;
+    }
+    ct2d->slugarch.event_log = fdopen(fd, "w");
+    if (!ct2d->slugarch.event_log) {
+        error_setg_errno(errp, errno,
+                         "cannot open SlugArch Type-2 event stream '%s'",
+                         ct2d->slugarch.event_log_path);
+        close(fd);
+        return false;
+    }
+    return true;
+}
+
+static char *cxl_type2_slugarch_uuid_hex(const uint8_t uuid[16])
+{
+    char *hex = g_malloc(33);
+    size_t i;
+
+    for (i = 0; i < 16; i++) {
+        snprintf(hex + i * 2, 3, "%02x", uuid[i]);
+    }
+    hex[32] = '\0';
+    return hex;
+}
+
+static bool cxl_type2_slugarch_emit_handshake(CXLType2State *ct2d,
+                                               Error **errp)
+{
+    g_autofree char *uuid = cxl_type2_slugarch_uuid_hex(
+        ct2d->slugarch.server_uuid);
+    g_autofree char *line = g_strdup_printf(
+        "{\"event\":\"handshake\",\"client_id\":%" PRIu64
+        ",\"server_instance_id\":\"%s\",\"capacity_bytes\":%" PRIu64
+        ",\"configured_latency_ns\":%" PRIu64
+        ",\"protocol_version\":%u}\n",
+        ct2d->slugarch.client_id, uuid,
+        ct2d->slugarch.server_capacity,
+        ct2d->slugarch.configured_base_latency,
+        ct2d->slugarch.wire_version);
+
+    return cxl_type2_slugarch_write_line(ct2d, line, errp);
+}
+
+static bool cxl_type2_slugarch_handshake(CXLType2State *ct2d,
+                                         Error **errp)
+{
+    const char *transport_mode = getenv("CXL_TRANSPORT_MODE");
+    SocketAddress address = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+    };
+    SlugArchT2Hello hello = {
+        .request_id = 1,
+        .role = SLUGARCH_T2_ROLE_QEMU,
+    };
+    SlugArchT2Frame request = { 0 };
+    SlugArchT2Frame response = { 0 };
+    SlugArchT2Ack ack = { 0 };
+    Error *local_err = NULL;
+    char *port = NULL;
+    uint64_t deadline_ns;
+    size_t i;
+
+    if (!transport_mode || !transport_mode[0]) {
+        transport_mode = getenv("CXL_MEMSIM_TRANSPORT");
+    }
+    if (transport_mode &&
+        (!strcmp(transport_mode, "shm") ||
+         !strcmp(transport_mode, "pgas") ||
+         !strcmp(transport_mode, "pgas-shm"))) {
+        error_setg(&local_err,
+                   "synchronous wire mode requires TCP, not %s",
+                   transport_mode);
+        goto fail;
+    }
+    if (ct2d->slugarch.wire_version != SLUGARCH_T2_VERSION) {
+        error_setg(&local_err, "wire version %u is not supported",
+                   ct2d->slugarch.wire_version);
+        goto fail;
+    }
+    if (!ct2d->slugarch.event_log_path ||
+        !g_path_is_absolute(ct2d->slugarch.event_log_path)) {
+        error_setg(&local_err,
+                   "slugarch-event-log must be a nonempty absolute path");
+        goto fail;
+    }
+    if (ct2d->device_mem_size != 256 * MiB) {
+        error_setg(&local_err,
+                   "mem-size must be exactly 268435456 bytes");
+        goto fail;
+    }
+    if (ct2d->coherency.coherency_enabled) {
+        error_setg(&local_err,
+                   "coherency-enabled must be false in synchronous wire mode");
+        goto fail;
+    }
+    if (!ct2d->memsim.server_addr || !ct2d->memsim.server_addr[0] ||
+        !ct2d->memsim.server_port) {
+        error_setg(&local_err,
+                   "CXLMemSim TCP address and port must be nonempty");
+        goto fail;
+    }
+    if (!cxl_type2_slugarch_open_event_log(ct2d, &local_err)) {
+        goto fail;
+    }
+
+    address.u.inet.host = ct2d->memsim.server_addr;
+    port = g_strdup_printf("%u", ct2d->memsim.server_port);
+    address.u.inet.port = port;
+    ct2d->memsim.socket = qio_channel_socket_new();
+    if (qio_channel_socket_connect_sync(ct2d->memsim.socket,
+                                        &address, &local_err) < 0) {
+        goto fail;
+    }
+
+    for (i = 0; i < sizeof(hello.client_nonce); i++) {
+        hello.client_nonce[i] = i;
+    }
+    if (!slugarch_t2_encode_hello(&hello, &request)) {
+        error_setg(&local_err, "cannot encode HELLO");
+        goto fail;
+    }
+    deadline_ns = slugarch_t2_monotonic_ns() +
+                  SLUGARCH_T2_REQUEST_TIMEOUT_NS;
+    if (slugarch_t2_exchange_until(ct2d->memsim.socket, &request,
+                                   deadline_ns, &response,
+                                   &local_err) != SLUGARCH_T2_IO_OK) {
+        goto fail;
+    }
+    if (!slugarch_t2_decode_ack(&response, &ack, &local_err)) {
+        goto fail;
+    }
+    if (ack.request_id != 1) {
+        error_setg(&local_err,
+                   "ACK request ID %" PRIu64 " is not 1",
+                   ack.request_id);
+        goto fail;
+    }
+    if (!ack.client_id) {
+        error_setg(&local_err, "ACK client ID is zero");
+        goto fail;
+    }
+    if (ack.status != SLUGARCH_T2_STATUS_SUCCESS) {
+        error_setg(&local_err, "ACK status %u is not success",
+                   ack.status);
+        goto fail;
+    }
+    if (ack.maximum_frame != SLUGARCH_T2_MAX_FRAME) {
+        error_setg(&local_err, "ACK maximum frame %u is not 128",
+                   ack.maximum_frame);
+        goto fail;
+    }
+    if (ack.capacity != 256 * MiB) {
+        error_setg(&local_err,
+                   "ACK capacity %" PRIu64 " is not 268435456",
+                   ack.capacity);
+        goto fail;
+    }
+    if (ack.configured_base_latency > 1000000ULL) {
+        error_setg(&local_err,
+                   "ACK latency %" PRIu64 " exceeds 1000000 ns",
+                   ack.configured_base_latency);
+        goto fail;
+    }
+
+    ct2d->slugarch.client_id = ack.client_id;
+    memcpy(ct2d->slugarch.server_uuid, ack.server_uuid,
+           sizeof(ct2d->slugarch.server_uuid));
+    ct2d->slugarch.server_capacity = ack.capacity;
+    ct2d->slugarch.configured_base_latency =
+        ack.configured_base_latency;
+    ct2d->slugarch.next_request_id = 2;
+    ct2d->slugarch.connection_failed = false;
+    ct2d->memsim.connected = true;
+    if (!cxl_type2_slugarch_emit_handshake(ct2d, &local_err)) {
+        goto fail;
+    }
+
+    g_free(port);
+    return true;
+
+fail:
+    g_free(port);
+    cxl_type2_close_memsim_socket(ct2d);
+    cxl_type2_slugarch_close_event_log(ct2d);
+    if (!local_err) {
+        error_setg(&local_err, "unknown handshake failure");
+    }
+    error_prepend(&local_err, "SlugArch Type-2 handshake failed: ");
+    error_propagate(errp, local_err);
+    return false;
+}
 
 static void cxlmemsim_connect(CXLType2State *ct2d)
 {
@@ -1187,17 +1426,7 @@ static void cxlmemsim_connect(CXLType2State *ct2d)
 
 static void cxlmemsim_disconnect(CXLType2State *ct2d)
 {
-    if (!ct2d->memsim.connected) {
-        return;
-    }
-
-    ct2d->memsim.connected = false;
-
-    if (ct2d->memsim.socket) {
-        qio_channel_close(QIO_CHANNEL(ct2d->memsim.socket), NULL);
-        object_unref(OBJECT(ct2d->memsim.socket));
-        ct2d->memsim.socket = NULL;
-    }
+    cxl_type2_close_memsim_socket(ct2d);
 
     if (ct2d->memsim.use_shm && ct2d->memsim.shm_base) {
         munmap(ct2d->memsim.shm_base, ct2d->memsim.shm_size);
@@ -1250,6 +1479,293 @@ static void *cxlmemsim_recv_thread(void *opaque)
     return NULL;
 }
 
+static char *cxl_type2_slugarch_sha256_hex(const uint8_t *bytes,
+                                            size_t length,
+                                            Error **errp)
+{
+    uint8_t *digest = NULL;
+    size_t digest_length = 0;
+    char *hex;
+    size_t i;
+
+    if (qcrypto_hash_bytes(QCRYPTO_HASH_ALGO_SHA256,
+                           (const char *)bytes, length,
+                           &digest, &digest_length, errp) < 0) {
+        return NULL;
+    }
+    if (digest_length != 32) {
+        error_setg(errp,
+                   "SlugArch Type-2 SHA-256 length %zu is not 32",
+                   digest_length);
+        g_free(digest);
+        return NULL;
+    }
+
+    hex = g_malloc(65);
+    for (i = 0; i < digest_length; i++) {
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    }
+    hex[64] = '\0';
+    g_free(digest);
+    return hex;
+}
+
+static bool cxl_type2_slugarch_emit_path_counters_locked(
+    CXLType2State *ct2d,
+    Error **errp)
+{
+    g_autofree char *line = g_strdup_printf(
+        "{\"event\":\"path_counters\",\"phase_id\":\"%s\""
+        ",\"direct_cfmws\":%" PRIu64
+        ",\"bar4_overlay\":%" PRIu64
+        ",\"local_shadow\":%" PRIu64
+        ",\"local_cache\":%" PRIu64
+        ",\"bulk_overlay\":%" PRIu64
+        ",\"coherent_pool\":%" PRIu64 "}\n",
+        ct2d->slugarch.phase_id,
+        ct2d->slugarch.direct_cfmws_completions,
+        ct2d->slugarch.bar4_overlay_completions,
+        ct2d->slugarch.local_shadow_completions,
+        ct2d->slugarch.local_cache_completions,
+        ct2d->slugarch.bulk_overlay_completions,
+        ct2d->slugarch.coherent_pool_completions);
+
+    return cxl_type2_slugarch_write_line(ct2d, line, errp);
+}
+
+static bool cxl_type2_slugarch_emit_completion_locked(
+    CXLType2State *ct2d,
+    bool is_write,
+    hwaddr dpa,
+    unsigned size,
+    uint64_t request_id,
+    uint64_t server_sequence,
+    uint64_t modeled_latency,
+    const uint8_t *payload,
+    const SlugArchT2DelayResult *delay,
+    Error **errp)
+{
+    g_autofree char *digest =
+        cxl_type2_slugarch_sha256_hex(payload, size, errp);
+    g_autofree char *line = NULL;
+
+    if (!digest) {
+        return false;
+    }
+    line = g_strdup_printf(
+        "{\"event\":\"completion\",\"client_id\":%" PRIu64
+        ",\"request_id\":%" PRIu64
+        ",\"server_sequence\":%" PRIu64
+        ",\"operation\":\"%s\",\"dpa\":%" HWADDR_PRIu
+        ",\"length\":%u,\"payload_sha256\":\"%s\",\"status\":0"
+        ",\"returned_modeled_latency_ns\":%" PRIu64
+        ",\"requested_delay_ns\":%" PRIu64
+        ",\"applied_delay_ns\":%" PRIu64
+        ",\"delay_overshoot_ns\":%" PRIu64
+        ",\"delay_undershot\":%s,\"path\":\"direct_cfmws\""
+        ",\"phase_id\":\"%s\"}\n",
+        ct2d->slugarch.client_id, request_id, server_sequence,
+        is_write ? "write" : "read", dpa, size, digest,
+        modeled_latency, delay->requested_ns, delay->actual_ns,
+        delay->overshoot_ns, delay->undershot ? "true" : "false",
+        ct2d->slugarch.phase_id);
+    return cxl_type2_slugarch_write_line(ct2d, line, errp);
+}
+
+static MemTxResult cxl_type2_slugarch_fail_locked(
+    CXLType2State *ct2d,
+    SlugArchT2IOResult io_result,
+    bool mismatched_response,
+    Error *error)
+{
+    ct2d->slugarch.failed_requests++;
+    if (io_result == SLUGARCH_T2_IO_TIMEOUT) {
+        ct2d->slugarch.timed_out_requests++;
+    } else if (io_result == SLUGARCH_T2_IO_EOF ||
+               io_result == SLUGARCH_T2_IO_SYSTEM_ERROR) {
+        ct2d->slugarch.partial_io_failures++;
+    }
+    if (mismatched_response ||
+        io_result == SLUGARCH_T2_IO_PROTOCOL_ERROR) {
+        ct2d->slugarch.mismatched_responses++;
+    }
+    ct2d->slugarch.connection_failed = true;
+    cxl_type2_close_memsim_socket(ct2d);
+    if (error) {
+        error_report_err(error);
+    }
+    return MEMTX_ERROR;
+}
+
+static MemTxResult cxl_type2_slugarch_access(CXLType2State *ct2d,
+                                             bool is_write,
+                                             hwaddr dpa,
+                                             uint64_t *value,
+                                             unsigned size,
+                                             MemTxAttrs attrs)
+{
+    SlugArchT2MemoryRequest request = {
+        .type = is_write ? SLUGARCH_T2_FRAME_WRITE :
+                           SLUGARCH_T2_FRAME_READ,
+    };
+    SlugArchT2MemoryResponse response = { 0 };
+    SlugArchT2Frame request_frame = { 0 };
+    SlugArchT2Frame response_frame = { 0 };
+    SlugArchT2DelayResult delay = { 0 };
+    SlugArchT2IOResult io_result;
+    Error *local_err = NULL;
+    uint64_t request_id;
+    uint64_t deadline_ns;
+    uint8_t *shadow;
+    const uint8_t *payload;
+    MemTxResult result = MEMTX_ERROR;
+
+    (void)attrs;
+    if (!value || !size || size > sizeof(*value)) {
+        return MEMTX_ERROR;
+    }
+
+    qemu_mutex_lock(&ct2d->memsim.lock);
+    if (!ct2d->slugarch.enabled ||
+        ct2d->slugarch.connection_failed ||
+        !ct2d->memsim.connected || !ct2d->memsim.socket) {
+        error_setg(&local_err,
+                   "SlugArch Type-2 connection is unavailable");
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_SYSTEM_ERROR, false, local_err);
+        goto out;
+    }
+    if (dpa > ct2d->device_mem_size ||
+        size > ct2d->device_mem_size - dpa) {
+        error_setg(&local_err,
+                   "SlugArch Type-2 DPA range 0x%" HWADDR_PRIx
+                   "+%u exceeds device memory", dpa, size);
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+    if (!ct2d->slugarch.next_request_id ||
+        ct2d->slugarch.next_request_id == UINT64_MAX) {
+        error_setg(&local_err,
+                   "SlugArch Type-2 request ID space is exhausted");
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+
+    request_id = ct2d->slugarch.next_request_id++;
+    request.request_id = request_id;
+    request.client_id = ct2d->slugarch.client_id;
+    request.length = size;
+    request.dpa = dpa;
+    request.client_monotonic_ns = slugarch_t2_monotonic_ns();
+    if (is_write) {
+        stn_le_p(request.data, size, *value);
+    }
+    if (!slugarch_t2_encode_memory_request(&request, &request_frame)) {
+        error_setg(&local_err,
+                   "SlugArch Type-2 memory request encoding failed");
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+
+    deadline_ns = slugarch_t2_monotonic_ns() +
+                  SLUGARCH_T2_REQUEST_TIMEOUT_NS;
+    io_result = slugarch_t2_exchange_until(
+        ct2d->memsim.socket, &request_frame, deadline_ns,
+        &response_frame, &local_err);
+    if (io_result != SLUGARCH_T2_IO_OK) {
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, io_result, false, local_err);
+        goto out;
+    }
+    if (!slugarch_t2_decode_memory_response(
+            &response_frame, &response, &local_err)) {
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+    if (response.request_id != request_id ||
+        response.client_id != ct2d->slugarch.client_id ||
+        response.status != SLUGARCH_T2_STATUS_SUCCESS ||
+        response.returned_length != (is_write ? 0 : size) ||
+        !response.server_sequence ||
+        response.modeled_latency > 1000000ULL) {
+        error_setg(&local_err,
+                   "SlugArch Type-2 memory response does not match request");
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+    if (!slugarch_t2_apply_delay(response.modeled_latency,
+                                 &delay, &local_err)) {
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_PROTOCOL_ERROR, true, local_err);
+        goto out;
+    }
+
+    if (!is_write) {
+        *value = ldn_le_p(response.data, size);
+    }
+    payload = is_write ? request.data : response.data;
+    if (!cxl_type2_slugarch_emit_completion_locked(
+            ct2d, is_write, dpa, size, request_id,
+            response.server_sequence, response.modeled_latency,
+            payload, &delay, &local_err)) {
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_SYSTEM_ERROR, false, local_err);
+        goto out;
+    }
+
+    if (is_write) {
+        ct2d->slugarch.completed_writes++;
+        ct2d->slugarch.written_bytes += size;
+    } else {
+        ct2d->slugarch.completed_reads++;
+        ct2d->slugarch.read_bytes += size;
+    }
+    ct2d->slugarch.direct_cfmws_completions++;
+    ct2d->slugarch.delay_events++;
+    if (delay.undershot) {
+        ct2d->slugarch.delay_undershoots++;
+    }
+    if (!cxl_type2_slugarch_emit_path_counters_locked(ct2d,
+                                                       &local_err)) {
+        result = cxl_type2_slugarch_fail_locked(
+            ct2d, SLUGARCH_T2_IO_SYSTEM_ERROR, false, local_err);
+        goto out;
+    }
+
+    if (is_write && ct2d->slugarch.shadow_after_write) {
+        shadow = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (shadow) {
+            stn_le_p(shadow + dpa, size, *value);
+        }
+    }
+    result = MEMTX_OK;
+
+out:
+    qemu_mutex_unlock(&ct2d->memsim.lock);
+    return result;
+}
+
+MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
+                                 uint64_t *value, unsigned size,
+                                 MemTxAttrs attrs)
+{
+    return cxl_type2_slugarch_access(CXL_TYPE2(pdev), false, dpa,
+                                     value, size, attrs);
+}
+
+MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
+                                  uint64_t value, unsigned size,
+                                  MemTxAttrs attrs)
+{
+    return cxl_type2_slugarch_access(CXL_TYPE2(pdev), true, dpa,
+                                     &value, size, attrs);
+}
+
 /* ========================================================================
  * Memory Access Handlers with Coherency
  * ======================================================================== */
@@ -1287,6 +1803,9 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
     if (line && line->state != CXL_COHERENCY_INVALID) {
         /* Cache hit */
         memcpy(&value, &line->data[offset], MIN(size, 64 - offset));
+        if (!ct2d->slugarch.enabled) {
+            ct2d->slugarch.local_cache_completions++;
+        }
 
         qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read hit at 0x%lx = 0x%lx\n",
                      addr, value);
@@ -1303,7 +1822,7 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
         }
 
         /* Notify CXLMemSim of cache miss */
-        if (ct2d->memsim.connected) {
+        if (ct2d->memsim.connected && !ct2d->slugarch.enabled) {
             CXLType2Message msg = {
                 .type = CXL_T2_MSG_READ,
                 .size = size,
@@ -1379,7 +1898,7 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
         }
 
         /* Notify CXLMemSim of write */
-        if (ct2d->memsim.connected) {
+        if (ct2d->memsim.connected && !ct2d->slugarch.enabled) {
             CXLType2Message msg = {
                 .type = CXL_T2_MSG_WRITE,
                 .size = size,
@@ -1404,6 +1923,14 @@ static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned si
     CXLType2State *ct2d = opaque;
     uint64_t value = 0;
 
+    if (ct2d->slugarch.enabled) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "CXL Type2: synchronous BAR4 access outside "
+                      "an explicit overlay at 0x%" HWADDR_PRIx "\n",
+                      addr);
+        return 0;
+    }
+
     /* Fast path: bulk staging region and coherent pool bypass coherency.
      * These regions are used for direct CPU<->GPU pointer sharing
      * and high-throughput data staging — coherency is tracked in commands. */
@@ -1424,6 +1951,14 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr,
                                         uint64_t value, unsigned size)
 {
     CXLType2State *ct2d = opaque;
+
+    if (ct2d->slugarch.enabled) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "CXL Type2: synchronous BAR4 write outside "
+                      "an explicit overlay at 0x%" HWADDR_PRIx "\n",
+                      addr);
+        return;
+    }
 
     /* Fast path: bulk staging region and coherent pool bypass coherency */
     if (addr < ct2d->bulk_transfer_size ||
@@ -1500,6 +2035,115 @@ static const MemoryRegionOps cxl_type2_cache_ops = {
 static const MemoryRegionOps cxl_type2_device_mem_ops = {
     .read = cxl_type2_device_mem_read,
     .write = cxl_type2_device_mem_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+static void cxl_type2_slugarch_overlay_complete(CXLType2State *ct2d,
+                                                 bool coherent_pool)
+{
+    Error *local_err = NULL;
+
+    qemu_mutex_lock(&ct2d->memsim.lock);
+    ct2d->slugarch.bar4_overlay_completions++;
+    if (coherent_pool) {
+        ct2d->slugarch.coherent_pool_completions++;
+    } else {
+        ct2d->slugarch.bulk_overlay_completions++;
+    }
+    if (!cxl_type2_slugarch_emit_path_counters_locked(
+            ct2d, &local_err)) {
+        ct2d->slugarch.connection_failed = true;
+        cxl_type2_close_memsim_socket(ct2d);
+        error_report_err(local_err);
+    }
+    qemu_mutex_unlock(&ct2d->memsim.lock);
+}
+
+static uint64_t cxl_type2_bulk_proxy_read(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+    uint64_t value = 0;
+
+    if (ct2d->bulk_transfer_ptr &&
+        addr <= ct2d->bulk_transfer_size &&
+        size <= ct2d->bulk_transfer_size - addr) {
+        value = ldn_le_p((uint8_t *)ct2d->bulk_transfer_ptr + addr,
+                         size);
+        cxl_type2_slugarch_overlay_complete(ct2d, false);
+    }
+    return value;
+}
+
+static void cxl_type2_bulk_proxy_write(void *opaque, hwaddr addr,
+                                       uint64_t value, unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+
+    if (ct2d->bulk_transfer_ptr &&
+        addr <= ct2d->bulk_transfer_size &&
+        size <= ct2d->bulk_transfer_size - addr) {
+        stn_le_p((uint8_t *)ct2d->bulk_transfer_ptr + addr,
+                 size, value);
+        cxl_type2_slugarch_overlay_complete(ct2d, false);
+    }
+}
+
+static const MemoryRegionOps cxl_type2_bulk_proxy_ops = {
+    .read = cxl_type2_bulk_proxy_read,
+    .write = cxl_type2_bulk_proxy_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+static uint64_t cxl_type2_coherent_proxy_read(void *opaque, hwaddr addr,
+                                              unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+    uint64_t value = 0;
+
+    if (ct2d->coherent_pool_ptr &&
+        addr <= ct2d->coherent_pool.size &&
+        size <= ct2d->coherent_pool.size - addr) {
+        value = ldn_le_p((uint8_t *)ct2d->coherent_pool_ptr + addr,
+                         size);
+        cxl_type2_slugarch_overlay_complete(ct2d, true);
+    }
+    return value;
+}
+
+static void cxl_type2_coherent_proxy_write(void *opaque, hwaddr addr,
+                                           uint64_t value, unsigned size)
+{
+    CXLType2State *ct2d = opaque;
+
+    if (ct2d->coherent_pool_ptr &&
+        addr <= ct2d->coherent_pool.size &&
+        size <= ct2d->coherent_pool.size - addr) {
+        stn_le_p((uint8_t *)ct2d->coherent_pool_ptr + addr,
+                 size, value);
+        cxl_type2_slugarch_overlay_complete(ct2d, true);
+    }
+}
+
+static const MemoryRegionOps cxl_type2_coherent_proxy_ops = {
+    .read = cxl_type2_coherent_proxy_read,
+    .write = cxl_type2_coherent_proxy_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -2038,7 +2682,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->coherency.coherency_ops++;
 
                 /* Notify CXLMemSim if connected */
-                if (ct2d->memsim.connected) {
+                if (ct2d->memsim.connected &&
+                    !ct2d->slugarch.enabled) {
                     CXLType2Message msg;
                     msg.type = CXL_T2_MSG_INVALIDATE;
                     msg.addr = inv_addr;
@@ -2071,7 +2716,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 ct2d->coherency.coherency_ops++;
 
                 /* Notify CXLMemSim if connected */
-                if (ct2d->memsim.connected) {
+                if (ct2d->memsim.connected &&
+                    !ct2d->slugarch.enabled) {
                     CXLType2Message msg;
                     msg.type = CXL_T2_MSG_WRITEBACK;
                     msg.addr = wb_addr;
@@ -2595,6 +3241,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Initialize CXLMemSim connection */
     qemu_mutex_init(&ct2d->memsim.lock);
+    ct2d->slugarch.lock_initialized = true;
 
     /* Setup PCIe capabilities */
     pcie_endpoint_cap_init(pci_dev, 0x80);
@@ -2667,17 +3314,26 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     ct2d->bulk_transfer_size = MIN(CXL_GPU_BULK_TRANSFER_SIZE, ct2d->device_mem_size);
 
-    /* Add bulk staging RAM subregion at priority 2 to physically bypass the
-     * I/O overlay (priority 1).  Guest writes here go directly to RAM without
-     * causing KVM vmexits, making large memcpy-to-BAR4 feasible. */
-    memory_region_init_ram(&ct2d->bulk_transfer_region, OBJECT(ct2d),
-                           "cxl-type2-bulk-staging",
-                           ct2d->bulk_transfer_size, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        return;
+    if (ct2d->slugarch.enabled) {
+        ct2d->bulk_transfer_ptr = g_malloc0(ct2d->bulk_transfer_size);
+        memory_region_init_io(&ct2d->bulk_transfer_region, OBJECT(ct2d),
+                              &cxl_type2_bulk_proxy_ops, ct2d,
+                              "cxl-type2-bulk-staging-proxy",
+                              ct2d->bulk_transfer_size);
+    } else {
+        /*
+         * Legacy mode keeps the priority-2 RAM fast path with no vmexits.
+         */
+        memory_region_init_ram(&ct2d->bulk_transfer_region, OBJECT(ct2d),
+                               "cxl-type2-bulk-staging",
+                               ct2d->bulk_transfer_size, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
+        ct2d->bulk_transfer_ptr =
+            memory_region_get_ram_ptr(&ct2d->bulk_transfer_region);
     }
-    ct2d->bulk_transfer_ptr = memory_region_get_ram_ptr(&ct2d->bulk_transfer_region);
     memory_region_add_subregion_overlap(&ct2d->device_mem, 0,
                                         &ct2d->bulk_transfer_region, 2);
 
@@ -2737,24 +3393,36 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         ct2d->coherent_pool.free_list = initial;
         qemu_mutex_init(&ct2d->coherent_pool.lock);
 
-        /* Add coherent pool RAM subregion at priority 2 to physically bypass
-         * the I/O overlay.  Guest pointer-sharing and coherent alloc/free
-         * go directly to RAM without KVM vmexits. */
-        memory_region_init_ram(&ct2d->coherent_pool_region, OBJECT(ct2d),
-                               "cxl-type2-coh-pool-ram",
-                               coh_pool_size, &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
+        if (ct2d->slugarch.enabled) {
+            ct2d->coherent_pool_ptr = g_malloc0(coh_pool_size);
+            memory_region_init_io(&ct2d->coherent_pool_region,
+                                  OBJECT(ct2d),
+                                  &cxl_type2_coherent_proxy_ops, ct2d,
+                                  "cxl-type2-coh-pool-proxy",
+                                  coh_pool_size);
+        } else {
+            /*
+             * Legacy mode retains the direct priority-2 RAM subregion.
+             */
+            memory_region_init_ram(&ct2d->coherent_pool_region,
+                                   OBJECT(ct2d),
+                                   "cxl-type2-coh-pool-ram",
+                                   coh_pool_size, &local_err);
+            if (local_err) {
+                error_propagate(errp, local_err);
+                return;
+            }
         }
         memory_region_add_subregion_overlap(&ct2d->device_mem,
                                             ct2d->coherent_pool.base_offset,
                                             &ct2d->coherent_pool_region, 2);
 
-        qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx size=%lu MB"
-                 " (RAM bypass at priority 2)\n",
+        qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx "
+                 "size=%lu MB (%s at priority 2)\n",
                  (unsigned long)ct2d->coherent_pool.base_offset,
-                 (unsigned long)(coh_pool_size / MiB));
+                 (unsigned long)(coh_pool_size / MiB),
+                 ct2d->slugarch.enabled ?
+                 "observable I/O proxy" : "RAM bypass");
     }
 
     qemu_log("CXL Type2: GPU command interface enabled at BAR2 offset 0\n");
@@ -2775,11 +3443,19 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         }
     }
 
-    /* Connect to CXLMemSim */
-    cxlmemsim_connect(ct2d);
-    if (ct2d->memsim.connected && !ct2d->memsim.use_shm) {
-        qemu_thread_create(&ct2d->memsim.recv_thread, "cxlmemsim-recv",
-                          cxlmemsim_recv_thread, ct2d, QEMU_THREAD_JOINABLE);
+    /* Connect to CXLMemSim. Synchronous mode owns every response inline. */
+    if (ct2d->slugarch.enabled) {
+        if (!cxl_type2_slugarch_handshake(ct2d, errp)) {
+            return;
+        }
+    } else {
+        cxlmemsim_connect(ct2d);
+        if (ct2d->memsim.connected && !ct2d->memsim.use_shm) {
+            qemu_thread_create(&ct2d->memsim.recv_thread,
+                               "cxlmemsim-recv",
+                               cxlmemsim_recv_thread, ct2d,
+                               QEMU_THREAD_JOINABLE);
+        }
     }
 
     qemu_log("CXL Type2: Device realized - Cache: %zu MB, DevMem: %zu MB\n",
@@ -2789,13 +3465,24 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 static void cxl_type2_exit(PCIDevice *pci_dev)
 {
     CXLType2State *ct2d = CXL_TYPE2(pci_dev);
+    Error *local_err = NULL;
 
+    if (ct2d->slugarch.enabled && ct2d->slugarch.event_log) {
+        qemu_mutex_lock(&ct2d->memsim.lock);
+        if (!cxl_type2_slugarch_emit_path_counters_locked(
+                ct2d, &local_err)) {
+            error_report_err(local_err);
+        }
+        qemu_mutex_unlock(&ct2d->memsim.lock);
+    }
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
     if (ct2d->memsim.recv_thread.thread) {
         qemu_thread_join(&ct2d->memsim.recv_thread);
     }
+    cxl_type2_slugarch_close_event_log(ct2d);
     qemu_mutex_destroy(&ct2d->memsim.lock);
+    ct2d->slugarch.lock_initialized = false;
 
     /* Cleanup GPU passthrough */
     cxl_type2_gpu_cleanup(ct2d);
@@ -2831,10 +3518,16 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         ct2d->gpu_cmd.data = NULL;
     }
 
-    /* Bulk staging and coherent pool RAM subregions are cleaned up
-     * automatically when the parent device_mem region is destroyed.
-     * bulk_transfer_ptr is managed by QEMU's memory subsystem, not g_malloc. */
-    ct2d->bulk_transfer_ptr = NULL;
+    if (ct2d->slugarch.enabled) {
+        g_clear_pointer(&ct2d->bulk_transfer_ptr, g_free);
+        g_clear_pointer(&ct2d->coherent_pool_ptr, g_free);
+    } else {
+        /*
+         * Legacy pointers belong to QEMU RAM regions and are not g_malloc().
+         */
+        ct2d->bulk_transfer_ptr = NULL;
+        ct2d->coherent_pool_ptr = NULL;
+    }
 
     qemu_log("CXL Type2: Device exit complete\n");
 }
@@ -2847,6 +3540,14 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType2State, memsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType2State, memsim.server_port, 9999),
+    DEFINE_PROP_BOOL("sync-type2-wire", CXLType2State,
+                     slugarch.enabled, false),
+    DEFINE_PROP_UINT16("type2-wire-version", CXLType2State,
+                       slugarch.wire_version, SLUGARCH_T2_VERSION),
+    DEFINE_PROP_STRING("slugarch-event-log", CXLType2State,
+                       slugarch.event_log_path),
+    DEFINE_PROP_BOOL("slugarch-shadow-after-write", CXLType2State,
+                     slugarch.shadow_after_write, false),
     DEFINE_PROP_STRING("gpu-device", CXLType2State, gpu_info.vfio_device),
     DEFINE_PROP_BOOL("coherency-enabled", CXLType2State,
                      coherency.coherency_enabled, true),
@@ -2858,6 +3559,133 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_UINT32("hetgpu-backend", CXLType2State, gpu_info.hetgpu_backend,
                        HETGPU_BACKEND_AUTO),
 };
+
+static bool cxl_type2_slugarch_phase_valid(const char *phase)
+{
+    size_t length;
+    size_t i;
+
+    if (!phase) {
+        return false;
+    }
+    length = strlen(phase);
+    if (length < 1 || length > 96) {
+        return false;
+    }
+    for (i = 0; i < length; i++) {
+        if (!g_ascii_isalnum(phase[i]) &&
+            phase[i] != '_' && phase[i] != '.' &&
+            phase[i] != ':' && phase[i] != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *cxl_type2_slugarch_get_phase(Object *obj, Error **errp)
+{
+    CXLType2State *ct2d = CXL_TYPE2(obj);
+    char *phase;
+
+    if (ct2d->slugarch.lock_initialized) {
+        qemu_mutex_lock(&ct2d->memsim.lock);
+    }
+    phase = g_strdup(ct2d->slugarch.phase_id ?
+                     ct2d->slugarch.phase_id : "idle");
+    if (ct2d->slugarch.lock_initialized) {
+        qemu_mutex_unlock(&ct2d->memsim.lock);
+    }
+    return phase;
+}
+
+static void cxl_type2_slugarch_set_phase(Object *obj, const char *value,
+                                          Error **errp)
+{
+    CXLType2State *ct2d = CXL_TYPE2(obj);
+    Error *local_err = NULL;
+
+    if (!cxl_type2_slugarch_phase_valid(value)) {
+        error_setg(errp,
+                   "slugarch-phase-id must match [A-Za-z0-9_.:-]{1,96}");
+        return;
+    }
+    if (ct2d->slugarch.lock_initialized) {
+        qemu_mutex_lock(&ct2d->memsim.lock);
+    }
+    g_free(ct2d->slugarch.phase_id);
+    ct2d->slugarch.phase_id = g_strdup(value);
+    if (ct2d->slugarch.event_log &&
+        !cxl_type2_slugarch_emit_path_counters_locked(
+            ct2d, &local_err)) {
+        ct2d->slugarch.connection_failed = true;
+        cxl_type2_close_memsim_socket(ct2d);
+        error_propagate(errp, local_err);
+    }
+    if (ct2d->slugarch.lock_initialized) {
+        qemu_mutex_unlock(&ct2d->memsim.lock);
+    }
+}
+
+static void cxl_type2_instance_init(Object *obj)
+{
+    CXLType2State *ct2d = CXL_TYPE2(obj);
+
+    ct2d->slugarch.phase_id = g_strdup("idle");
+    object_property_add_str(obj, "slugarch-phase-id",
+                            cxl_type2_slugarch_get_phase,
+                            cxl_type2_slugarch_set_phase);
+    object_property_add_uint64_ptr(obj, "slugarch-client-id",
+        &ct2d->slugarch.client_id, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-completed-reads",
+        &ct2d->slugarch.completed_reads, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-completed-writes",
+        &ct2d->slugarch.completed_writes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-read-bytes",
+        &ct2d->slugarch.read_bytes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-written-bytes",
+        &ct2d->slugarch.written_bytes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-failed-requests",
+        &ct2d->slugarch.failed_requests, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-timed-out-requests",
+        &ct2d->slugarch.timed_out_requests, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-partial-io-failures",
+        &ct2d->slugarch.partial_io_failures, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-mismatched-responses",
+        &ct2d->slugarch.mismatched_responses, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-direct-cfmws",
+        &ct2d->slugarch.direct_cfmws_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-bar4-overlay",
+        &ct2d->slugarch.bar4_overlay_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-bulk-overlay",
+        &ct2d->slugarch.bulk_overlay_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-coherent-pool",
+        &ct2d->slugarch.coherent_pool_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-local-shadow",
+        &ct2d->slugarch.local_shadow_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-local-cache",
+        &ct2d->slugarch.local_cache_completions, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-delay-events",
+        &ct2d->slugarch.delay_events, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-delay-undershoots",
+        &ct2d->slugarch.delay_undershoots, OBJ_PROP_FLAG_READ);
+}
+
+static void cxl_type2_instance_finalize(Object *obj)
+{
+    CXLType2State *ct2d = CXL_TYPE2(obj);
+
+    cxl_type2_slugarch_close_event_log(ct2d);
+    cxl_type2_close_memsim_socket(ct2d);
+    if (ct2d->slugarch.lock_initialized) {
+        qemu_mutex_destroy(&ct2d->memsim.lock);
+        ct2d->slugarch.lock_initialized = false;
+    }
+    if (ct2d->slugarch.enabled) {
+        g_clear_pointer(&ct2d->bulk_transfer_ptr, g_free);
+        g_clear_pointer(&ct2d->coherent_pool_ptr, g_free);
+    }
+    g_clear_pointer(&ct2d->slugarch.phase_id, g_free);
+}
 
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)
 {
@@ -2880,6 +3708,8 @@ static const TypeInfo cxl_type2_info = {
     .name = TYPE_CXL_TYPE2,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(CXLType2State),
+    .instance_init = cxl_type2_instance_init,
+    .instance_finalize = cxl_type2_instance_finalize,
     .class_init = cxl_type2_class_init,
     .interfaces = (InterfaceInfo[]) {
         { INTERFACE_PCIE_DEVICE },

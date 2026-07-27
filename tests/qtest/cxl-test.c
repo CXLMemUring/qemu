@@ -7,6 +7,11 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "qemu/bswap.h"
+#include "qemu/crc32c.h"
+#include "qemu/units.h"
+
+#include <poll.h>
 
 #define QEMU_PXB_CMD \
     "-machine q35,cxl=on " \
@@ -26,6 +31,12 @@
     "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.targets.1=cxl.1,cxl-fmw.0.size=4G "
 
 #define QEMU_RP \
+    "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
+
+#define QEMU_T2_SYNC_BASE \
+    "-machine q35,cxl=on " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
     "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
 
 /* Dual ports on first pxb */
@@ -80,6 +91,373 @@
     "-object memory-backend-file,id=cxl-mem3,mem-path=%s,size=256M " \
     "-object memory-backend-file,id=lsa3,mem-path=%s,size=256M " \
     "-device cxl-type3,bus=rp3,persistent-memdev=cxl-mem3,lsa=lsa3,id=pmem3 "
+
+#ifdef CONFIG_POSIX
+static const uint8_t t2_hello_golden[] = {
+    0x53, 0x4c, 0x54, 0x32, 0x01, 0x00, 0x01, 0x00,
+    0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xcf, 0x70, 0x20, 0xd2, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+typedef struct T2FakeServer {
+    int listen_fd;
+    uint16_t port;
+    GThread *thread;
+    gint stop;
+    bool accepted;
+    bool hello_valid;
+    bool ack_sent;
+    uint64_t ack_capacity;
+    uint64_t ack_latency;
+    uint64_t ack_request_id;
+    bool bad_crc;
+} T2FakeServer;
+
+static bool t2_read_exact(int fd, uint8_t *bytes, size_t length)
+{
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t received = recv(fd, bytes + offset, length - offset, 0);
+
+        if (received > 0) {
+            offset += received;
+            continue;
+        }
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool t2_write_exact(int fd, const uint8_t *bytes, size_t length)
+{
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t sent = send(fd, bytes + offset, length - offset,
+                            MSG_NOSIGNAL);
+
+        if (sent > 0) {
+            offset += sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static void t2_encode_ack(const T2FakeServer *server, uint8_t ack[88])
+{
+    uint32_t checksum;
+    size_t i;
+
+    memset(ack, 0, 88);
+    memcpy(ack, "SLT2", 4);
+    stw_le_p(ack + 4, 1);
+    stw_le_p(ack + 6, 2);
+    stl_le_p(ack + 8, 88);
+    stq_le_p(ack + 16, server->ack_request_id);
+    stq_le_p(ack + 24, 1);
+    stl_le_p(ack + 40, 0);
+    stl_le_p(ack + 44, 128);
+    for (i = 0; i < 16; i++) {
+        ack[48 + i] = 0xa0 + i;
+    }
+    stq_le_p(ack + 64, server->ack_capacity);
+    stq_le_p(ack + 72, server->ack_latency);
+    checksum = crc32c(0xffffffffU, ack, 88);
+    stl_le_p(ack + 32, checksum);
+    if (server->bad_crc) {
+        ack[32] ^= 1;
+    }
+}
+
+static gpointer t2_fake_server_thread(gpointer opaque)
+{
+    T2FakeServer *server = opaque;
+    struct pollfd pollfd = {
+        .fd = server->listen_fd,
+        .events = POLLIN,
+    };
+    int client_fd = -1;
+    uint8_t hello[sizeof(t2_hello_golden)];
+    uint8_t ack[88];
+
+    while (!g_atomic_int_get(&server->stop)) {
+        int ready = poll(&pollfd, 1, 50);
+
+        if (ready > 0) {
+            client_fd = accept(server->listen_fd, NULL, NULL);
+            break;
+        }
+        if (ready < 0 && errno != EINTR) {
+            return NULL;
+        }
+    }
+    if (client_fd < 0) {
+        return NULL;
+    }
+
+    server->accepted = true;
+    server->hello_valid =
+        t2_read_exact(client_fd, hello, sizeof(hello)) &&
+        memcmp(hello, t2_hello_golden, sizeof(hello)) == 0;
+    t2_encode_ack(server, ack);
+    server->ack_sent = t2_write_exact(client_fd, ack, sizeof(ack));
+
+    while (!g_atomic_int_get(&server->stop)) {
+        struct pollfd client_pollfd = {
+            .fd = client_fd,
+            .events = POLLIN,
+        };
+        uint8_t discard[128];
+        int ready = poll(&client_pollfd, 1, 50);
+
+        if (ready > 0) {
+            ssize_t received = recv(client_fd, discard, sizeof(discard), 0);
+
+            if (received <= 0) {
+                break;
+            }
+        } else if (ready < 0 && errno != EINTR) {
+            break;
+        }
+    }
+    close(client_fd);
+    return NULL;
+}
+
+static T2FakeServer *t2_fake_server_start(uint64_t capacity,
+                                          uint64_t latency,
+                                          uint64_t request_id,
+                                          bool bad_crc)
+{
+    T2FakeServer *server = g_new0(T2FakeServer, 1);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t address_length = sizeof(address);
+    int reuse = 1;
+
+    server->ack_capacity = capacity;
+    server->ack_latency = latency;
+    server->ack_request_id = request_id;
+    server->bad_crc = bad_crc;
+    server->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    g_assert_cmpint(server->listen_fd, >=, 0);
+    g_assert_cmpint(setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR,
+                              &reuse, sizeof(reuse)), ==, 0);
+    g_assert_cmpint(bind(server->listen_fd, (struct sockaddr *)&address,
+                         sizeof(address)), ==, 0);
+    g_assert_cmpint(getsockname(server->listen_fd,
+                               (struct sockaddr *)&address,
+                               &address_length), ==, 0);
+    server->port = ntohs(address.sin_port);
+    g_assert_cmpuint(server->port, >, 0);
+    g_assert_cmpint(listen(server->listen_fd, 1), ==, 0);
+    server->thread = g_thread_new("cxl-t2-fake-server",
+                                  t2_fake_server_thread, server);
+    return server;
+}
+
+static void t2_fake_server_stop(T2FakeServer *server)
+{
+    g_atomic_int_set(&server->stop, 1);
+    shutdown(server->listen_fd, SHUT_RDWR);
+    close(server->listen_fd);
+    g_thread_join(server->thread);
+}
+
+static QDict *t2_device_add(QTestState *qts, uint16_t port,
+                            const char *event_path)
+{
+    QDict *arguments = qdict_new();
+
+    qdict_put_str(arguments, "driver", "cxl-type2");
+    qdict_put_str(arguments, "id", "t2");
+    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_int(arguments, "gpu-mode", 0);
+    qdict_put_bool(arguments, "coherency-enabled", false);
+    qdict_put_int(arguments, "cache-size", 128 * MiB);
+    qdict_put_int(arguments, "mem-size", 256 * MiB);
+    qdict_put_bool(arguments, "sync-type2-wire", true);
+    qdict_put_int(arguments, "type2-wire-version", 1);
+    qdict_put_str(arguments, "slugarch-event-log", event_path);
+    qdict_put_str(arguments, "cxlmemsim-addr", "127.0.0.1");
+    qdict_put_int(arguments, "cxlmemsim-port", port);
+    return qtest_qmp(qts,
+                     "{'execute': 'device_add', 'arguments': %p}",
+                     arguments);
+}
+
+static void t2_assert_observability(QTestState *qts)
+{
+    static const char *zero_counters[] = {
+        "slugarch-completed-reads",
+        "slugarch-completed-writes",
+        "slugarch-read-bytes",
+        "slugarch-written-bytes",
+        "slugarch-failed-requests",
+        "slugarch-timed-out-requests",
+        "slugarch-partial-io-failures",
+        "slugarch-mismatched-responses",
+        "slugarch-direct-cfmws",
+        "slugarch-bar4-overlay",
+        "slugarch-bulk-overlay",
+        "slugarch-coherent-pool",
+        "slugarch-local-shadow",
+        "slugarch-local-cache",
+        "slugarch-delay-events",
+        "slugarch-delay-undershoots",
+    };
+    QDict *response;
+    size_t i;
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/t2',"
+        "'property':'slugarch-phase-id','value':'phase:test'}}");
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-get','arguments':{"
+        "'path':'/machine/peripheral/t2',"
+        "'property':'slugarch-phase-id'}}");
+    g_assert_cmpstr(qdict_get_str(response, "return"), ==, "phase:test");
+    qobject_unref(response);
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/t2',"
+        "'property':'slugarch-phase-id','value':'bad phase'}}");
+    g_assert_true(qdict_haskey(response, "error"));
+    qobject_unref(response);
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-get','arguments':{"
+        "'path':'/machine/peripheral/t2',"
+        "'property':'slugarch-client-id'}}");
+    g_assert_cmpuint(qdict_get_int(response, "return"), ==, 1);
+    qobject_unref(response);
+
+    for (i = 0; i < G_N_ELEMENTS(zero_counters); i++) {
+        response = qtest_qmp(
+            qts,
+            "{'execute':'qom-get','arguments':{"
+            "'path':'/machine/peripheral/t2','property':%s}}",
+            zero_counters[i]);
+        g_assert_cmpuint(qdict_get_int(response, "return"), ==, 0);
+        qobject_unref(response);
+    }
+}
+
+static void t2_sync_handshake_case(uint64_t capacity,
+                                   uint64_t latency,
+                                   uint64_t request_id,
+                                   bool bad_crc,
+                                   bool expect_success,
+                                   const char *expected_error)
+{
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    g_autofree char *error_description = NULL;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+    bool success;
+
+    run_dir = g_dir_make_tmp("cxl-t2-sync-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    server = t2_fake_server_start(capacity, latency, request_id, bad_crc);
+    qts = qtest_init(QEMU_T2_SYNC_BASE);
+    response = t2_device_add(qts, server->port, event_path);
+    success = !qdict_haskey(response, "error");
+    if (!success) {
+        error_description = g_strdup(qdict_get_str(
+            qdict_get_qdict(response, "error"), "desc"));
+    }
+    qobject_unref(response);
+
+    if (success) {
+        t2_assert_observability(qts);
+    }
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+
+    g_assert_true(server->accepted);
+    g_assert_true(server->hello_valid);
+    g_assert_true(server->ack_sent);
+    if (expect_success) {
+        g_assert_true(success);
+        g_assert_true(g_file_test(event_path, G_FILE_TEST_IS_REGULAR));
+        {
+            g_autofree char *events = NULL;
+
+            g_assert_true(g_file_get_contents(event_path, &events,
+                                              NULL, NULL));
+            g_assert_nonnull(strstr(events, "\"event\":\"handshake\""));
+            g_assert_nonnull(strstr(events,
+                                    "\"phase_id\":\"phase:test\""));
+        }
+    } else {
+        g_assert_false(success);
+        g_assert_nonnull(error_description);
+        g_assert_nonnull(strstr(error_description,
+                                "SlugArch Type-2 handshake failed:"));
+        g_assert_nonnull(strstr(error_description, expected_error));
+    }
+
+    unlink(event_path);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void cxl_t2_sync_handshake(void)
+{
+    t2_sync_handshake_case(256 * MiB, 400, 1, false, true, NULL);
+}
+
+static void cxl_t2_sync_bad_capacity(void)
+{
+    t2_sync_handshake_case(64 * MiB, 400, 1, false, false, "capacity");
+}
+
+static void cxl_t2_sync_bad_latency(void)
+{
+    t2_sync_handshake_case(256 * MiB, 1000001, 1, false, false,
+                           "latency");
+}
+
+static void cxl_t2_sync_bad_request_id(void)
+{
+    t2_sync_handshake_case(256 * MiB, 400, 2, false, false,
+                           "request ID");
+}
+
+static void cxl_t2_sync_bad_crc(void)
+{
+    t2_sync_handshake_case(256 * MiB, 400, 1, true, false, "CRC32C");
+}
+#endif /* CONFIG_POSIX */
 
 static void cxl_basic_hb(void)
 {
@@ -234,6 +612,16 @@ int main(int argc, char **argv)
         qtest_add_func("/pci/cxl/rp", cxl_root_port);
         qtest_add_func("/pci/cxl/rp_x2", cxl_2root_port);
 #ifdef CONFIG_POSIX
+        qtest_add_func("/pci/cxl/type2_sync_handshake",
+                       cxl_t2_sync_handshake);
+        qtest_add_func("/pci/cxl/type2_sync_bad_capacity",
+                       cxl_t2_sync_bad_capacity);
+        qtest_add_func("/pci/cxl/type2_sync_bad_latency",
+                       cxl_t2_sync_bad_latency);
+        qtest_add_func("/pci/cxl/type2_sync_bad_request_id",
+                       cxl_t2_sync_bad_request_id);
+        qtest_add_func("/pci/cxl/type2_sync_bad_crc",
+                       cxl_t2_sync_bad_crc);
         qtest_add_func("/pci/cxl/type3_device", cxl_t3d_deprecated);
         qtest_add_func("/pci/cxl/type3_device_pmem", cxl_t3d_persistent);
         qtest_add_func("/pci/cxl/type3_device_vmem", cxl_t3d_volatile);

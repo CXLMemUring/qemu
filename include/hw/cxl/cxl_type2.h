@@ -18,6 +18,7 @@
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
+#include "exec/memattrs.h"
 #include "qemu/thread.h"
 #include "io/channel-socket.h"
 
@@ -101,6 +102,38 @@ typedef struct CXLType2MemSimConn {
     char *shm_name;
 } CXLType2MemSimConn;
 
+typedef struct CXLType2SlugArchState {
+    bool enabled;
+    bool connection_failed;
+    bool shadow_after_write;
+    bool lock_initialized;
+    uint16_t wire_version;
+    char *event_log_path;
+    char *phase_id;
+    FILE *event_log;
+    uint64_t next_request_id;
+    uint64_t client_id;
+    uint8_t server_uuid[16];
+    uint64_t server_capacity;
+    uint64_t configured_base_latency;
+    uint64_t completed_reads;
+    uint64_t completed_writes;
+    uint64_t read_bytes;
+    uint64_t written_bytes;
+    uint64_t failed_requests;
+    uint64_t timed_out_requests;
+    uint64_t partial_io_failures;
+    uint64_t mismatched_responses;
+    uint64_t direct_cfmws_completions;
+    uint64_t bar4_overlay_completions;
+    uint64_t bulk_overlay_completions;
+    uint64_t coherent_pool_completions;
+    uint64_t local_shadow_completions;
+    uint64_t local_cache_completions;
+    uint64_t delay_events;
+    uint64_t delay_undershoots;
+} CXLType2SlugArchState;
+
 /* Free block for coherent pool allocator */
 typedef struct CXLCohFreeBlock {
     uint64_t offset;            /* Offset within BAR4 */
@@ -165,6 +198,7 @@ typedef struct CXLType2State {
 
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;
+    CXLType2SlugArchState slugarch;
 
     /* Memory backend for device memory */
     HostMemoryBackend *hostmem;
@@ -179,6 +213,7 @@ typedef struct CXLType2State {
         QemuMutex lock;
     } coherent_pool;
     MemoryRegion coherent_pool_region;  /* RAM window bypassing I/O overlay */
+    void *coherent_pool_ptr;
 
     /* Statistics and monitoring */
     struct {
@@ -254,5 +289,12 @@ int cxl_type2_hetgpu_free(CXLType2State *ct2d, uint64_t dev_ptr);
 int cxl_type2_hetgpu_memcpy_htod(CXLType2State *ct2d, uint64_t dst, const void *src, size_t size);
 int cxl_type2_hetgpu_memcpy_dtoh(CXLType2State *ct2d, void *dst, uint64_t src, size_t size);
 int cxl_type2_hetgpu_sync(CXLType2State *ct2d);
+
+MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
+                                 uint64_t *value, unsigned size,
+                                 MemTxAttrs attrs);
+MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
+                                  uint64_t value, unsigned size,
+                                  MemTxAttrs attrs);
 
 #endif /* CXL_TYPE2_H */
