@@ -13,6 +13,7 @@ system_ss.add(when: 'CONFIG_CXL',
                    'cxl_p2p_dma.c',
                    'cxl_hetgpu.c',
                    'slugarch_type2_protocol.c',
+                   'slugarch_jit.c',
                ),
                if_false: files(
                    'cxl-host-stubs.c',
