@@ -18,6 +18,7 @@
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
+#include "hw/cxl/slugarch_jit.h"
 #include "exec/memattrs.h"
 #include "qemu/thread.h"
 #include "qemu/units.h"
@@ -30,6 +31,7 @@
 /* Type 2 combines Type 1 (accelerator/cache) + Type 3 (memory) */
 #define CXL_TYPE2_DEFAULT_CACHE_SIZE (128 * MiB)
 #define CXL_TYPE2_DEFAULT_MEM_SIZE (4 * GiB)
+#define CXL_TYPE2_JIT_DIAGNOSTIC_SIZE (16 * KiB)
 
 /* Coherency states for cache lines */
 typedef enum {
@@ -135,6 +137,18 @@ typedef struct CXLType2SlugArchState {
     uint64_t delay_undershoots;
 } CXLType2SlugArchState;
 
+typedef struct CXLType2JitConfig {
+    CXLType2JitState runtime;
+    char *mode;
+    char *library_path;
+    char *policy_path;
+    char *log_path;
+    bool strict;
+    bool advertised;
+    uint32_t diagnostic_length;
+    uint8_t diagnostic[CXL_TYPE2_JIT_DIAGNOSTIC_SIZE];
+} CXLType2JitConfig;
+
 /* Free block for coherent pool allocator */
 typedef struct CXLCohFreeBlock {
     uint64_t offset;            /* Offset within BAR4 */
@@ -200,6 +214,7 @@ typedef struct CXLType2State {
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;
     CXLType2SlugArchState slugarch;
+    CXLType2JitConfig jit;
 
     /* Memory backend for device memory */
     HostMemoryBackend *hostmem;

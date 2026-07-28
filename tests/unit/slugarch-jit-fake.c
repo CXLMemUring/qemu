@@ -22,6 +22,7 @@ struct SlugJitHandle {
     FakePolicyMode mode;
     SlugJitStats stats;
     uint64_t last_event_id;
+    uint8_t digest_byte;
     char diagnostic[128];
 };
 
@@ -116,8 +117,12 @@ int32_t slugarch_jit_load_policy(SlugJitHandle *handle,
         return SLUG_JIT_ERR_PARSE;
     }
 
+    handle->digest_byte = 0xa5;
     if (strcmp(text, "valid") == 0 || strcmp(text, "bad-digest") == 0) {
         handle->mode = FAKE_POLICY_VALID;
+    } else if (strcmp(text, "valid-b") == 0) {
+        handle->mode = FAKE_POLICY_VALID;
+        handle->digest_byte = 0x5a;
     } else if (strcmp(text, "reject") == 0) {
         handle->mode = FAKE_POLICY_REJECT;
     } else if (strcmp(text, "drop") == 0) {
@@ -144,7 +149,7 @@ int32_t slugarch_jit_load_policy(SlugJitHandle *handle,
         SLUG_JIT_BACKEND_GPU : handle->backend;
     out->canonical_bytes = policy_len;
     if (strcmp(text, "bad-digest") != 0) {
-        memset(out->digest, 0xa5, sizeof(out->digest));
+        memset(out->digest, handle->digest_byte, sizeof(out->digest));
     }
     out->instruction_count = 4;
     out->range_count = 1;

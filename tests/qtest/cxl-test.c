@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
 #include "hw/cxl/cxl_component.h"
+#include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/pci/pci_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/crc32c.h"
@@ -80,6 +81,7 @@
 #define T2_SERVER_READ_VALUE UINT64_C(0x1122334455667788)
 #define T2_CLIENT_WRITE_VALUE UINT64_C(0x8877665544332211)
 #define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
+#define T2_JEXT_BAR2_BASE UINT64_C(0x80000000)
 
 /* Dual ports on first pxb */
 #define QEMU_2RP \
@@ -671,6 +673,23 @@ static void t2_pci_config_writel(QTestState *qts, uint8_t bus,
     qtest_outl(qts, 0xcfc, value);
 }
 
+static void t2_program_endpoint_bar2(QTestState *qts, uint8_t devfn,
+                                     uint64_t base)
+{
+    uint16_t command;
+
+    g_assert_cmphex(base & ((128 * MiB) - 1), ==, 0);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_3, base >> 32);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_2, base);
+    command = t2_pci_config_readw(qts, 0, devfn, PCI_COMMAND);
+    t2_pci_config_writew(qts, 0, devfn, PCI_COMMAND,
+                         command | PCI_COMMAND_MEMORY);
+    g_assert_cmphex(t2_pci_config_readl(
+                        qts, 0, devfn, PCI_BASE_ADDRESS_2) &
+                    PCI_BASE_ADDRESS_MEM_MASK,
+                    ==, base);
+}
+
 static void t2_enable_bridge_window(QTestState *qts, uint8_t bus,
                                     uint8_t devfn)
 {
@@ -726,20 +745,465 @@ static void t2_program_switch_decoder(QTestState *qts)
     g_assert_cmphex(control & (1U << 10), ==, 1U << 10);
 }
 
-static uint64_t t2_qom_counter(QTestState *qts, const char *property)
+static uint64_t t2_qom_uint_at(QTestState *qts, const char *id,
+                               const char *property)
 {
+    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", id);
     QDict *response;
     uint64_t value;
 
     response = qtest_qmp(
         qts,
         "{'execute':'qom-get','arguments':{"
-        "'path':'/machine/peripheral/t2','property':%s}}",
-        property);
+        "'path':%s,'property':%s}}",
+        path, property);
     g_assert_false(qdict_haskey(response, "error"));
     value = qdict_get_int(response, "return");
     qobject_unref(response);
     return value;
+}
+
+static uint64_t t2_qom_counter(QTestState *qts, const char *property)
+{
+    return t2_qom_uint_at(qts, "t2", property);
+}
+
+static char *t2_qom_string_at(QTestState *qts, const char *id,
+                              const char *property)
+{
+    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", id);
+    QDict *response;
+    char *value;
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-get','arguments':{"
+        "'path':%s,'property':%s}}",
+        path, property);
+    g_assert_false(qdict_haskey(response, "error"));
+    value = g_strdup(qdict_get_str(response, "return"));
+    qobject_unref(response);
+    return value;
+}
+
+static char *t2_qom_string(QTestState *qts, const char *property)
+{
+    return t2_qom_string_at(qts, "t2", property);
+}
+
+static char *t2_jit_fake_path(void)
+{
+    const char *build_dir = g_getenv("G_TEST_BUILDDIR");
+    g_autofree char *current_dir = NULL;
+    g_autofree char *filename = NULL;
+    g_autofree char *relative = NULL;
+
+    filename = g_strdup_printf("slugarch-jit-fake%s",
+                               CONFIG_HOST_DSOSUF);
+    if (build_dir) {
+        relative = g_build_filename(
+            build_dir, "..", "unit", filename, NULL);
+    } else {
+        current_dir = g_get_current_dir();
+        relative = g_build_filename(
+            current_dir, "tests", "unit", filename, NULL);
+    }
+    return g_canonicalize_filename(relative, NULL);
+}
+
+static QDict *t2_jext_hotplug(QTestState *qts, const char *id,
+                              const char *mode, const char *library,
+                              const char *policy)
+{
+    QDict *arguments = qdict_new();
+
+    qdict_put_str(arguments, "driver", "cxl-type2");
+    qdict_put_str(arguments, "id", id);
+    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_int(arguments, "gpu-mode", 0);
+    qdict_put_bool(arguments, "coherency-enabled", false);
+    qdict_put_int(arguments, "cache-size", 2 * MiB);
+    qdict_put_int(arguments, "mem-size", 16 * MiB);
+    qdict_put_int(arguments, "cxlmemsim-port", 1);
+    qdict_put_str(arguments, "slugarch-j-ext", mode);
+    qdict_put_str(arguments, "slugarch-jit-lib", library);
+    qdict_put_str(arguments, "slugarch-jit-policy", policy);
+    qdict_put_bool(arguments, "slugarch-jit-strict", true);
+    return qtest_qmp(qts,
+                     "{'execute':'device_add','arguments':%p}",
+                     arguments);
+}
+
+static void t2_assert_qmp_error_contains(QDict *response,
+                                         const char *expected)
+{
+    const char *description;
+
+    g_assert_true(qdict_haskey(response, "error"));
+    description = qdict_get_str(qdict_get_qdict(response, "error"), "desc");
+    g_assert_nonnull(strstr(description, expected));
+}
+
+static void cxl_t2_jext_capability(void)
+{
+    g_autofree char *directory = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    g_autofree char *log = NULL;
+    g_autofree char *digest = NULL;
+    g_autoptr(GString) command = g_string_new(NULL);
+    QTestState *qts;
+    uint64_t bar2 = T2_JEXT_BAR2_BASE;
+    uint32_t caps;
+    size_t i;
+
+    qts = qtest_init(
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-port=1");
+    t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, bar2);
+    caps = qtest_readl(qts, bar2 + CXL_GPU_REG_CAPS);
+    g_assert_cmphex(caps & CXL_GPU_CAP_SLUGARCH_J_EXT, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, bar2 + CXL_GPU_REG_J_MAGIC),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, bar2 + CXL_GPU_REG_J_STATUS),
+                    ==, 0);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD, CXL_GPU_CMD_J_QUERY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_ERROR);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_J_ERR_UNSUPPORTED);
+    qtest_quit(qts);
+
+    directory = g_dir_make_tmp("cxl-t2-jext-XXXXXX", NULL);
+    g_assert_nonnull(directory);
+    library = t2_jit_fake_path();
+    policy = g_build_filename(directory, "policy.json", NULL);
+    log = g_build_filename(directory, "jit.jsonl", NULL);
+    g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+
+    g_string_printf(
+        command,
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-port=1,slugarch-j-ext=rust,"
+        "slugarch-jit-lib=%s,slugarch-jit-policy=%s,"
+        "slugarch-jit-log=%s,slugarch-jit-strict=on",
+        library, policy, log);
+    qts = qtest_init(command->str);
+    t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, bar2);
+
+    caps = qtest_readl(qts, bar2 + CXL_GPU_REG_CAPS);
+    g_assert_cmphex(caps & CXL_GPU_CAP_SLUGARCH_J_EXT,
+                    ==, CXL_GPU_CAP_SLUGARCH_J_EXT);
+    g_assert_cmphex(qtest_readl(qts, bar2 + CXL_GPU_REG_J_MAGIC),
+                    ==, CXL_GPU_J_MAGIC);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_ABI_VERSION),
+                     ==, CXL_GPU_J_ABI_VERSION);
+    g_assert_cmphex(qtest_readl(qts, bar2 + CXL_GPU_REG_J_CAPS) & 3,
+                    ==, 3);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_STATUS),
+                     ==, CXL_GPU_J_STATUS_READY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_BACKEND),
+                     ==, CXL_GPU_J_BACKEND_RUST);
+    g_assert_cmpuint(qtest_readl(
+                         qts, bar2 + CXL_GPU_REG_J_POLICY_BYTES),
+                     ==, 5);
+    g_assert_cmpuint(qtest_readl(
+                         qts, bar2 + CXL_GPU_REG_J_LAST_ERROR),
+                     ==, 0);
+    for (i = 0; i < 4; i++) {
+        g_assert_cmphex(qtest_readq(
+                            qts, bar2 + CXL_GPU_REG_J_POLICY_DIGEST + i * 8),
+                        ==, UINT64_C(0xa5a5a5a5a5a5a5a5));
+    }
+
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-status"),
+                     ==, CXL_GPU_J_STATUS_READY);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-backend"),
+                     ==, CXL_GPU_J_BACKEND_RUST);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-event-count"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-record-count"),
+                     ==, 0);
+    digest = t2_qom_string(qts, "slugarch-jit-policy-digest");
+    g_assert_cmpstr(
+        digest, ==,
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+    qtest_quit(qts);
+
+    g_assert_true(g_file_test(log, G_FILE_TEST_IS_REGULAR));
+    unlink(log);
+    unlink(policy);
+    rmdir(directory);
+}
+
+static void cxl_t2_jext_commands(void)
+{
+    const char replacement[] = "valid-b";
+    const char invalid[] = "invalid";
+    uint8_t cleared[sizeof(replacement) - 1];
+    uint8_t diagnostic[128] = { 0 };
+    g_autofree char *directory = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    g_autofree char *log = NULL;
+    g_autoptr(GString) command = g_string_new(NULL);
+    QTestState *qts;
+    uint64_t bar2 = T2_JEXT_BAR2_BASE;
+    uint64_t required;
+    uint64_t written;
+
+    directory = g_dir_make_tmp("cxl-t2-jext-cmd-XXXXXX", NULL);
+    g_assert_nonnull(directory);
+    library = t2_jit_fake_path();
+    policy = g_build_filename(directory, "policy.json", NULL);
+    log = g_build_filename(directory, "jit.jsonl", NULL);
+    g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+    g_string_printf(
+        command,
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-port=1,slugarch-j-ext=rust,"
+        "slugarch-jit-lib=%s,slugarch-jit-policy=%s,"
+        "slugarch-jit-log=%s,slugarch-jit-strict=on",
+        library, policy, log);
+    qts = qtest_init(command->str);
+    t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, bar2);
+
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD, CXL_GPU_CMD_J_QUERY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_J_OK);
+    g_assert_cmpuint(qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT0),
+                     ==, CXL_GPU_J_ABI_VERSION);
+    g_assert_cmpuint(qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT2),
+                     ==, CXL_GPU_J_BACKEND_RUST);
+    g_assert_cmpuint(qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT3),
+                     ==, 5);
+
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0, 0);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_LOAD_POLICY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_ERROR);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_J_ERR_STRUCT_SIZE);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_LAST_ERROR),
+                     ==, CXL_GPU_J_ERR_STRUCT_SIZE);
+
+    qtest_memwrite(qts, bar2 + CXL_GPU_DATA_OFFSET,
+                   replacement, sizeof(replacement) - 1);
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0,
+                 sizeof(replacement) - 1);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_LOAD_POLICY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_J_OK);
+    g_assert_cmphex(qtest_readq(
+                        qts, bar2 + CXL_GPU_REG_J_POLICY_DIGEST),
+                    ==, UINT64_C(0x5a5a5a5a5a5a5a5a));
+    qtest_memread(qts, bar2 + CXL_GPU_DATA_OFFSET,
+                  cleared, sizeof(cleared));
+    for (size_t i = 0; i < sizeof(cleared); i++) {
+        g_assert_cmpuint(cleared[i], ==, 0);
+    }
+
+    qtest_memwrite(qts, bar2 + CXL_GPU_DATA_OFFSET,
+                   invalid, sizeof(invalid) - 1);
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0,
+                 sizeof(invalid) - 1);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_LOAD_POLICY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_ERROR);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_J_ERR_PARSE);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_STATUS),
+                     ==, CXL_GPU_J_STATUS_READY);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_J_LAST_ERROR),
+                     ==, CXL_GPU_J_ERR_PARSE);
+    g_assert_cmphex(qtest_readq(
+                        qts, bar2 + CXL_GPU_REG_J_POLICY_DIGEST),
+                    ==, UINT64_C(0x5a5a5a5a5a5a5a5a));
+
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0, 4);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_GET_DIAGNOSTIC);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    required = qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT0);
+    written = qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT1);
+    g_assert_cmpuint(required, >, written);
+    g_assert_cmpuint(written, ==, 4);
+    qtest_memread(qts, bar2 + CXL_GPU_DATA_OFFSET,
+                  diagnostic, written);
+    g_assert_cmpmem(diagnostic, written, "fake", 4);
+
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0, sizeof(diagnostic));
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_GET_DIAGNOSTIC);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    required = qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT0);
+    written = qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT1);
+    g_assert_cmpuint(required, >, 0);
+    g_assert_cmpuint(written, ==, required);
+    g_assert_cmpuint(written, <=, sizeof(diagnostic));
+    qtest_memread(qts, bar2 + CXL_GPU_DATA_OFFSET,
+                  diagnostic, written);
+    g_assert_nonnull(g_strstr_len((const char *)diagnostic, written,
+                                  "parse error"));
+
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD,
+                 CXL_GPU_CMD_J_GET_STATS);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    g_assert_cmpuint(qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT0),
+                     ==, 0);
+    g_assert_cmpuint(qtest_readq(qts, bar2 + CXL_GPU_REG_RESULT1),
+                     ==, 0);
+
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD, CXL_GPU_CMD_J_RESET);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    g_assert_cmphex(qtest_readq(
+                        qts, bar2 + CXL_GPU_REG_J_POLICY_DIGEST),
+                    ==, UINT64_C(0xa5a5a5a5a5a5a5a5));
+    qtest_quit(qts);
+
+    unlink(log);
+    unlink(policy);
+    rmdir(directory);
+}
+
+static void cxl_t2_jext_no_fallback(void)
+{
+    g_autofree char *directory = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    QTestState *qts;
+    QDict *response;
+
+    directory = g_dir_make_tmp("cxl-t2-jext-fail-XXXXXX", NULL);
+    g_assert_nonnull(directory);
+    library = t2_jit_fake_path();
+    policy = g_build_filename(directory, "policy.json", NULL);
+    g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+
+    qts = qtest_init(QEMU_T2_SYNC_BASE);
+    response = t2_jext_hotplug(qts, "t2-auto", "auto",
+                               library, policy);
+    t2_assert_qmp_error_contains(response, "no eligible probed backend");
+    qobject_unref(response);
+    qtest_quit(qts);
+
+    g_setenv("SLUGARCH_JIT_FAKE_NO_FPGA", "1", true);
+    qts = qtest_init(QEMU_T2_SYNC_BASE);
+    response = t2_jext_hotplug(qts, "t2-fpga", "fpga-verilator",
+                               library, policy);
+    t2_assert_qmp_error_contains(response,
+                                 "lacks required capabilities");
+    qobject_unref(response);
+    qtest_quit(qts);
+    g_unsetenv("SLUGARCH_JIT_FAKE_NO_FPGA");
+
+    g_assert_true(g_file_set_contents(
+        policy, "wrong-backend", -1, NULL));
+    qts = qtest_init(QEMU_T2_SYNC_BASE);
+    response = t2_jext_hotplug(qts, "t2-rust", "rust",
+                               library, policy);
+    t2_assert_qmp_error_contains(response,
+                                 "differs from requested");
+    qobject_unref(response);
+    qtest_quit(qts);
+
+    unlink(policy);
+    rmdir(directory);
+}
+
+static void cxl_t2_jext_per_tile_state(void)
+{
+    const uint64_t bar2_a = T2_JEXT_BAR2_BASE;
+    const uint64_t bar2_b = T2_JEXT_BAR2_BASE + 128 * MiB;
+    g_autofree char *directory = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy_a = NULL;
+    g_autofree char *policy_b = NULL;
+    g_autofree char *log_a = NULL;
+    g_autofree char *log_b = NULL;
+    g_autofree char *digest_a = NULL;
+    g_autofree char *digest_b = NULL;
+    g_autoptr(GString) command = g_string_new(NULL);
+    QTestState *qts;
+
+    directory = g_dir_make_tmp("cxl-t2-jext-tiles-XXXXXX", NULL);
+    g_assert_nonnull(directory);
+    library = t2_jit_fake_path();
+    policy_a = g_build_filename(directory, "policy-a.json", NULL);
+    policy_b = g_build_filename(directory, "policy-b.json", NULL);
+    log_a = g_build_filename(directory, "jit-a.jsonl", NULL);
+    log_b = g_build_filename(directory, "jit-b.jsonl", NULL);
+    g_assert_true(g_file_set_contents(policy_a, "valid", -1, NULL));
+    g_assert_true(g_file_set_contents(policy_b, "valid-b", -1, NULL));
+
+    g_string_printf(
+        command,
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=tile0,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=2M,mem-size=16M,"
+        "cxlmemsim-port=1,slugarch-j-ext=rust,slugarch-jit-lib=%s,"
+        "slugarch-jit-policy=%s,slugarch-jit-log=%s,"
+        "slugarch-jit-strict=on "
+        "-device cxl-type2,id=tile1,bus=pcie.0,addr=5.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=2M,mem-size=16M,"
+        "cxlmemsim-port=1,slugarch-j-ext=rust,slugarch-jit-lib=%s,"
+        "slugarch-jit-policy=%s,slugarch-jit-log=%s,"
+        "slugarch-jit-strict=on",
+        library, policy_a, log_a, library, policy_b, log_b);
+    qts = qtest_init(command->str);
+    t2_program_endpoint_bar2(qts, 4U << 3, bar2_a);
+    t2_program_endpoint_bar2(qts, 5U << 3, bar2_b);
+
+    g_assert_cmphex(qtest_readl(qts, bar2_a + CXL_GPU_REG_CAPS) &
+                    CXL_GPU_CAP_SLUGARCH_J_EXT,
+                    ==, CXL_GPU_CAP_SLUGARCH_J_EXT);
+    g_assert_cmphex(qtest_readl(qts, bar2_b + CXL_GPU_REG_CAPS) &
+                    CXL_GPU_CAP_SLUGARCH_J_EXT,
+                    ==, CXL_GPU_CAP_SLUGARCH_J_EXT);
+    g_assert_cmphex(qtest_readq(
+                        qts, bar2_a + CXL_GPU_REG_J_POLICY_DIGEST),
+                    ==, UINT64_C(0xa5a5a5a5a5a5a5a5));
+    g_assert_cmphex(qtest_readq(
+                        qts, bar2_b + CXL_GPU_REG_J_POLICY_DIGEST),
+                    ==, UINT64_C(0x5a5a5a5a5a5a5a5a));
+    g_assert_cmpuint(t2_qom_uint_at(
+                         qts, "tile0", "slugarch-jit-event-count"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_uint_at(
+                         qts, "tile1", "slugarch-jit-event-count"),
+                     ==, 0);
+    digest_a = t2_qom_string_at(
+        qts, "tile0", "slugarch-jit-policy-digest");
+    digest_b = t2_qom_string_at(
+        qts, "tile1", "slugarch-jit-policy-digest");
+    g_assert_cmpstr(digest_a, !=, digest_b);
+    qtest_quit(qts);
+
+    g_assert_true(g_file_test(log_a, G_FILE_TEST_IS_REGULAR));
+    g_assert_true(g_file_test(log_b, G_FILE_TEST_IS_REGULAR));
+    unlink(log_a);
+    unlink(log_b);
+    unlink(policy_a);
+    unlink(policy_b);
+    rmdir(directory);
 }
 
 static void cxl_t2_direct_cfmws(void)
@@ -1172,6 +1636,14 @@ int main(int argc, char **argv)
                        cxl_t2_dvsec_bad_fractional_cache);
         qtest_add_func("/pci/cxl/type2_dvsec_bad_oversized_cache",
                        cxl_t2_dvsec_bad_oversized_cache);
+        qtest_add_func("/pci/cxl/type2_jext_capability",
+                       cxl_t2_jext_capability);
+        qtest_add_func("/pci/cxl/type2_jext_commands",
+                       cxl_t2_jext_commands);
+        qtest_add_func("/pci/cxl/type2_jext_no_fallback",
+                       cxl_t2_jext_no_fallback);
+        qtest_add_func("/pci/cxl/type2_jext_per_tile_state",
+                       cxl_t2_jext_per_tile_state);
         qtest_add_func("/pci/cxl/type3_device", cxl_t3d_deprecated);
         qtest_add_func("/pci/cxl/type3_device_pmem", cxl_t3d_persistent);
         qtest_add_func("/pci/cxl/type3_device_vmem", cxl_t3d_volatile);

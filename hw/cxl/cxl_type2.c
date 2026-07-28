@@ -2276,12 +2276,153 @@ static int cxl_coherent_pool_free(CXLType2State *ct2d, uint64_t offset)
  * GPU Command Interface
  * ======================================================================== */
 
+static void cxl_type2_jit_capture_diagnostic(
+    CXLType2State *ct2d, CXLType2JitState *runtime)
+{
+    Error *local_error = NULL;
+    uint32_t required = 0;
+    uint32_t written = 0;
+
+    ct2d->jit.diagnostic_length = 0;
+    memset(ct2d->jit.diagnostic, 0, sizeof(ct2d->jit.diagnostic));
+    if (!cxl_type2_jit_copy_diagnostic(
+            runtime, NULL, 0, &required, &local_error)) {
+        error_free(local_error);
+        return;
+    }
+    if (!required || required > sizeof(ct2d->jit.diagnostic)) {
+        return;
+    }
+    if (!cxl_type2_jit_copy_diagnostic(
+            runtime, ct2d->jit.diagnostic, required,
+            &written, &local_error)) {
+        error_free(local_error);
+        return;
+    }
+    ct2d->jit.diagnostic_length = written;
+}
+
+static uint32_t cxl_type2_jit_replace_policy(CXLType2State *ct2d,
+                                              const uint8_t *policy,
+                                              size_t policy_len)
+{
+    CXLType2JitState candidate;
+    CXLType2JitState *runtime = &ct2d->jit.runtime;
+    Error *local_error = NULL;
+    uint32_t failure;
+
+    cxl_type2_jit_state_init(
+        &candidate, runtime->requested_backend, ct2d->jit.strict,
+        CXL_TYPE2_JIT_DIAGNOSTIC_SIZE);
+    if (!cxl_type2_jit_open(
+            &candidate, ct2d->jit.library_path, &local_error) ||
+        !cxl_type2_jit_load_policy(
+            &candidate, policy, policy_len, &local_error) ||
+        (ct2d->jit.log_path &&
+         !cxl_type2_jit_open_log(
+             &candidate, ct2d->jit.log_path, &local_error))) {
+        failure = candidate.last_error;
+        if (failure == SLUG_JIT_OK) {
+            failure = candidate.library ?
+                SLUG_JIT_ERR_IO : SLUG_JIT_ERR_BACKEND;
+        }
+        cxl_type2_jit_capture_diagnostic(ct2d, &candidate);
+        runtime->last_error = failure;
+        if (local_error) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "CXL GPU JIT policy replacement failed: %s\n",
+                          error_get_pretty(local_error));
+        }
+        error_free(local_error);
+        cxl_type2_jit_close(&candidate);
+        return failure;
+    }
+
+    cxl_type2_jit_close(runtime);
+    *runtime = candidate;
+    ct2d->jit.diagnostic_length = 0;
+    memset(ct2d->jit.diagnostic, 0, sizeof(ct2d->jit.diagnostic));
+    return SLUG_JIT_OK;
+}
+
+static uint32_t cxl_type2_jit_replace_policy_file(CXLType2State *ct2d)
+{
+    g_autofree char *contents = NULL;
+    g_autoptr(GError) local_error = NULL;
+    gsize length = 0;
+
+    if (!g_file_get_contents(ct2d->jit.policy_path, &contents,
+                             &length, &local_error)) {
+        size_t diagnostic_length =
+            MIN(strlen(local_error->message),
+                sizeof(ct2d->jit.diagnostic));
+
+        memcpy(ct2d->jit.diagnostic, local_error->message,
+               diagnostic_length);
+        ct2d->jit.diagnostic_length = diagnostic_length;
+        ct2d->jit.runtime.last_error = SLUG_JIT_ERR_IO;
+        return SLUG_JIT_ERR_IO;
+    }
+    return cxl_type2_jit_replace_policy(
+        ct2d, (const uint8_t *)contents, length);
+}
+
+static uint32_t cxl_type2_jit_get_diagnostic(CXLType2State *ct2d,
+                                              uint32_t capacity,
+                                              uint32_t *required,
+                                              uint32_t *written)
+{
+    CXLType2JitState *runtime = &ct2d->jit.runtime;
+    g_autofree uint8_t *live = NULL;
+    Error *local_error = NULL;
+    const uint8_t *source = ct2d->jit.diagnostic;
+    uint32_t source_length = ct2d->jit.diagnostic_length;
+    uint32_t live_length = 0;
+    uint32_t live_written = 0;
+
+    if (!source_length &&
+        !cxl_type2_jit_copy_diagnostic(
+            runtime, NULL, 0, &live_length, &local_error)) {
+        error_free(local_error);
+        return runtime->last_error ?
+            runtime->last_error : SLUG_JIT_ERR_BACKEND;
+    }
+    if (!source_length && live_length) {
+        if (live_length > CXL_TYPE2_JIT_DIAGNOSTIC_SIZE) {
+            return SLUG_JIT_ERR_BUDGET_EXCEEDED;
+        }
+        live = g_malloc(live_length);
+        if (!cxl_type2_jit_copy_diagnostic(
+                runtime, live, live_length,
+                &live_written, &local_error)) {
+            error_free(local_error);
+            return runtime->last_error ?
+                runtime->last_error : SLUG_JIT_ERR_BACKEND;
+        }
+        source = live;
+        source_length = live_written;
+    }
+
+    *required = source_length;
+    *written = MIN(capacity, source_length);
+    if (capacity) {
+        memset(ct2d->gpu_cmd.data, 0, capacity);
+    }
+    if (*written) {
+        memcpy(ct2d->gpu_cmd.data, source, *written);
+    }
+    return SLUG_JIT_OK;
+}
+
 static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
     HetGPUError err;
     uint64_t dev_ptr;
     size_t size;
+    bool jit_command =
+        cmd >= CXL_GPU_CMD_J_QUERY &&
+        cmd <= CXL_GPU_CMD_J_GET_DIAGNOSTIC;
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
@@ -2289,6 +2430,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+    if (jit_command) {
+        memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
+    }
 
     switch (cmd) {
     case CXL_GPU_CMD_NOP:
@@ -2949,12 +3093,128 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_J_QUERY:
+        if (!ct2d->jit.advertised) {
+            ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_UNSUPPORTED;
+            break;
+        }
+        ct2d->gpu_cmd.results[0] = ct2d->jit.runtime.abi_version;
+        ct2d->gpu_cmd.results[1] = ct2d->jit.runtime.capabilities;
+        ct2d->gpu_cmd.results[2] = ct2d->jit.runtime.selected_backend;
+        ct2d->gpu_cmd.results[3] = ct2d->jit.runtime.policy_bytes;
+        break;
+
+    case CXL_GPU_CMD_J_LOAD_POLICY:
+        {
+            uint64_t policy_len = ct2d->gpu_cmd.params[0];
+            g_autofree uint8_t *policy = NULL;
+
+            if (!ct2d->jit.advertised ||
+                !ct2d->jit.runtime.ready || !ct2d->jit.strict) {
+                ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_UNSUPPORTED;
+                if (ct2d->jit.advertised) {
+                    ct2d->jit.runtime.last_error =
+                        SLUG_JIT_ERR_UNSUPPORTED;
+                }
+                break;
+            }
+            if (!policy_len || policy_len > CXL_GPU_DATA_SIZE ||
+                policy_len > SLUG_JIT_MAX_POLICY_BYTES) {
+                ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_STRUCT_SIZE;
+                ct2d->jit.runtime.last_error =
+                    SLUG_JIT_ERR_STRUCT_SIZE;
+                break;
+            }
+            policy = g_memdup2(ct2d->gpu_cmd.data, policy_len);
+            ct2d->gpu_cmd.cmd_result =
+                cxl_type2_jit_replace_policy(
+                    ct2d, policy, policy_len);
+            if (ct2d->gpu_cmd.cmd_result == SLUG_JIT_OK) {
+                memset(ct2d->gpu_cmd.data, 0, policy_len);
+                ct2d->gpu_cmd.results[0] =
+                    ct2d->jit.runtime.policy_bytes;
+                ct2d->gpu_cmd.results[1] =
+                    ct2d->jit.runtime.selected_backend;
+                ct2d->gpu_cmd.results[2] =
+                    ct2d->jit.runtime.stats.epoch;
+                memcpy(&ct2d->gpu_cmd.results[3],
+                       ct2d->jit.runtime.policy_digest,
+                       sizeof(ct2d->gpu_cmd.results[3]));
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_J_RESET:
+        if (!ct2d->jit.advertised || !ct2d->jit.runtime.ready ||
+            !ct2d->jit.strict || !ct2d->jit.policy_path) {
+            ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_UNSUPPORTED;
+            if (ct2d->jit.advertised) {
+                ct2d->jit.runtime.last_error =
+                    SLUG_JIT_ERR_UNSUPPORTED;
+            }
+            break;
+        }
+        ct2d->gpu_cmd.cmd_result =
+            cxl_type2_jit_replace_policy_file(ct2d);
+        break;
+
+    case CXL_GPU_CMD_J_GET_STATS:
+        {
+            Error *local_error = NULL;
+
+            if (!ct2d->jit.advertised ||
+                !cxl_type2_jit_refresh_stats(
+                    &ct2d->jit.runtime, &local_error)) {
+                ct2d->gpu_cmd.cmd_result =
+                    ct2d->jit.runtime.last_error ?
+                    ct2d->jit.runtime.last_error :
+                    SLUG_JIT_ERR_UNSUPPORTED;
+                error_free(local_error);
+                break;
+            }
+            ct2d->gpu_cmd.results[0] =
+                ct2d->jit.runtime.stats.event_count;
+            ct2d->gpu_cmd.results[1] =
+                ct2d->jit.runtime.stats.record_count;
+            ct2d->gpu_cmd.results[2] =
+                ct2d->jit.runtime.stats.metadata_bytes;
+            ct2d->gpu_cmd.results[3] =
+                ct2d->jit.runtime.stats.epoch;
+        }
+        break;
+
+    case CXL_GPU_CMD_J_GET_DIAGNOSTIC:
+        {
+            uint64_t capacity = ct2d->gpu_cmd.params[0];
+            uint32_t required = 0;
+            uint32_t written = 0;
+
+            if (!ct2d->jit.advertised) {
+                ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_UNSUPPORTED;
+                break;
+            }
+            if (capacity > CXL_GPU_DATA_SIZE) {
+                ct2d->gpu_cmd.cmd_result = SLUG_JIT_ERR_STRUCT_SIZE;
+                ct2d->jit.runtime.last_error =
+                    SLUG_JIT_ERR_STRUCT_SIZE;
+                break;
+            }
+            ct2d->gpu_cmd.cmd_result =
+                cxl_type2_jit_get_diagnostic(
+                    ct2d, capacity, &required, &written);
+            ct2d->gpu_cmd.results[0] = required;
+            ct2d->gpu_cmd.results[1] = written;
+        }
+        break;
+
     default:
         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
         break;
     }
 
-    ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_COMPLETE;
+    ct2d->gpu_cmd.cmd_status =
+        jit_command && ct2d->gpu_cmd.cmd_result != SLUG_JIT_OK ?
+        CXL_GPU_CMD_STATUS_ERROR : CXL_GPU_CMD_STATUS_COMPLETE;
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: cmd 0x%x done, result=%u results[0]=0x%lx\n",
                   cmd, ct2d->gpu_cmd.cmd_result,
@@ -2966,6 +3226,50 @@ static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size)
     CXLType2State *ct2d = opaque;
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
     uint64_t value = 0;
+
+    if (ct2d->jit.advertised &&
+        addr >= CXL_GPU_REG_J_MAGIC && addr < CXL_GPU_REG_J_END) {
+        if (addr >= CXL_GPU_REG_J_POLICY_DIGEST &&
+            addr < CXL_GPU_REG_J_POLICY_DIGEST + SLUG_JIT_DIGEST_BYTES) {
+            size_t offset = addr - CXL_GPU_REG_J_POLICY_DIGEST;
+            size_t available = SLUG_JIT_DIGEST_BYTES - offset;
+
+            memcpy(&value, ct2d->jit.runtime.policy_digest + offset,
+                   MIN((size_t)size, MIN(available, sizeof(value))));
+            return value;
+        }
+
+        switch (addr) {
+        case CXL_GPU_REG_J_MAGIC:
+            return CXL_GPU_J_MAGIC;
+        case CXL_GPU_REG_J_ABI_VERSION:
+            return ct2d->jit.runtime.abi_version;
+        case CXL_GPU_REG_J_CAPS:
+            return ct2d->jit.runtime.capabilities;
+        case CXL_GPU_REG_J_STATUS:
+            return ct2d->jit.runtime.status;
+        case CXL_GPU_REG_J_BACKEND:
+            return ct2d->jit.runtime.selected_backend;
+        case CXL_GPU_REG_J_POLICY_BYTES:
+            return ct2d->jit.runtime.policy_bytes;
+        case CXL_GPU_REG_J_LAST_ERROR:
+            return ct2d->jit.runtime.last_error;
+        case CXL_GPU_REG_J_RECORD_COUNT:
+            return ct2d->jit.runtime.stats.record_count;
+        case CXL_GPU_REG_J_METADATA_BYTES:
+            return ct2d->jit.runtime.stats.metadata_bytes;
+        case CXL_GPU_REG_J_EVENT_COUNT:
+            return ct2d->jit.runtime.stats.event_count;
+        case CXL_GPU_REG_J_REJECT_COUNT:
+            return ct2d->jit.runtime.stats.reject_count;
+        case CXL_GPU_REG_J_DROP_COUNT:
+            return ct2d->jit.runtime.stats.drop_count;
+        case CXL_GPU_REG_J_EPOCH:
+            return ct2d->jit.runtime.stats.epoch;
+        default:
+            return 0;
+        }
+    }
 
     switch (addr) {
     case CXL_GPU_REG_MAGIC:
@@ -3194,6 +3498,76 @@ static void build_dvsecs(CXLType2State *ct2d)
  * Device Lifecycle
  * ======================================================================== */
 
+static bool cxl_type2_jit_backend(CXLType2State *ct2d, uint32_t *backend,
+                                  Error **errp)
+{
+    const char *mode = ct2d->jit.mode ?: "off";
+
+    if (strcmp(mode, "off") == 0) {
+        *backend = SLUG_JIT_BACKEND_NONE;
+        return true;
+    }
+    if (strcmp(mode, "rust") == 0) {
+        *backend = SLUG_JIT_BACKEND_RUST;
+        return true;
+    }
+    if (strcmp(mode, "gpu") == 0) {
+        *backend = SLUG_JIT_BACKEND_GPU;
+        return true;
+    }
+    if (strcmp(mode, "fpga-verilator") == 0) {
+        *backend = SLUG_JIT_BACKEND_FPGA_VERILATOR;
+        return true;
+    }
+    if (strcmp(mode, "auto") == 0) {
+        error_setg(errp,
+                   "slugarch-j-ext=auto has no eligible probed backend; "
+                   "select rust or fpga-verilator explicitly");
+        return false;
+    }
+
+    error_setg(errp,
+               "slugarch-j-ext must be off, auto, rust, gpu, "
+               "or fpga-verilator");
+    return false;
+}
+
+static bool cxl_type2_jit_realize(CXLType2State *ct2d, Error **errp)
+{
+    CXLType2JitState *runtime = &ct2d->jit.runtime;
+    uint32_t backend;
+
+    ct2d->jit.advertised = false;
+    if (!cxl_type2_jit_backend(ct2d, &backend, errp)) {
+        return false;
+    }
+
+    cxl_type2_jit_close(runtime);
+    cxl_type2_jit_state_init(runtime, backend, ct2d->jit.strict,
+                             16 * KiB);
+    if (backend == SLUG_JIT_BACKEND_NONE) {
+        return true;
+    }
+    if (!ct2d->jit.library_path || !ct2d->jit.policy_path) {
+        error_setg(errp,
+                   "slugarch-jit-lib and slugarch-jit-policy are required "
+                   "when the J-extension is enabled");
+        return false;
+    }
+    if (!cxl_type2_jit_open(runtime, ct2d->jit.library_path, errp) ||
+        !cxl_type2_jit_load_policy_file(
+            runtime, ct2d->jit.policy_path, errp) ||
+        (ct2d->jit.log_path &&
+         !cxl_type2_jit_open_log(runtime, ct2d->jit.log_path, errp))) {
+        error_prepend(errp, "SlugArch J-extension initialization failed: ");
+        cxl_type2_jit_close(runtime);
+        return false;
+    }
+
+    ct2d->jit.advertised = true;
+    return true;
+}
+
 static void cxl_type2_reset(DeviceState *dev)
 {
     CXLType2State *ct2d = CXL_TYPE2(dev);
@@ -3236,6 +3610,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         error_setg(errp,
                    "cache-size must be an integral value from "
                    "1 MiB through 255 MiB");
+        return;
+    }
+    if (!cxl_type2_jit_realize(ct2d, errp)) {
         return;
     }
 
@@ -3382,6 +3759,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                                  CXL_GPU_CAP_CACHE_COHERENT |
                                  CXL_GPU_CAP_COHERENT_POOL |
                                  CXL_GPU_CAP_DEVICE_BIAS;
+    if (ct2d->jit.advertised) {
+        ct2d->gpu_cmd.capabilities |= CXL_GPU_CAP_SLUGARCH_J_EXT;
+    }
 
     /* Initialize coherent shared memory pool at top of BAR4 */
     {
@@ -3495,6 +3875,8 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 
     /* Cleanup GPU passthrough */
     cxl_type2_gpu_cleanup(ct2d);
+    cxl_type2_jit_close(&ct2d->jit.runtime);
+    ct2d->jit.advertised = false;
 
     /* Cleanup coherency protocol */
     cxl_type2_coherency_cleanup(ct2d);
@@ -3557,6 +3939,14 @@ static const Property cxl_type2_props[] = {
                        slugarch.event_log_path),
     DEFINE_PROP_BOOL("slugarch-shadow-after-write", CXLType2State,
                      slugarch.shadow_after_write, false),
+    DEFINE_PROP_STRING("slugarch-j-ext", CXLType2State, jit.mode),
+    DEFINE_PROP_STRING("slugarch-jit-lib", CXLType2State,
+                       jit.library_path),
+    DEFINE_PROP_STRING("slugarch-jit-policy", CXLType2State,
+                       jit.policy_path),
+    DEFINE_PROP_STRING("slugarch-jit-log", CXLType2State, jit.log_path),
+    DEFINE_PROP_BOOL("slugarch-jit-strict", CXLType2State,
+                     jit.strict, true),
     DEFINE_PROP_STRING("gpu-device", CXLType2State, gpu_info.vfio_device),
     DEFINE_PROP_BOOL("coherency-enabled", CXLType2State,
                      coherency.coherency_enabled, true),
@@ -3635,10 +4025,28 @@ static void cxl_type2_slugarch_set_phase(Object *obj, const char *value,
     }
 }
 
+static char *cxl_type2_jit_get_digest(Object *obj, Error **errp)
+{
+    static const char hex[] = "0123456789abcdef";
+    CXLType2State *ct2d = CXL_TYPE2(obj);
+    char *digest = g_malloc(SLUG_JIT_DIGEST_BYTES * 2 + 1);
+    size_t i;
+
+    for (i = 0; i < SLUG_JIT_DIGEST_BYTES; i++) {
+        digest[i * 2] = hex[ct2d->jit.runtime.policy_digest[i] >> 4];
+        digest[i * 2 + 1] =
+            hex[ct2d->jit.runtime.policy_digest[i] & 0xf];
+    }
+    digest[SLUG_JIT_DIGEST_BYTES * 2] = '\0';
+    return digest;
+}
+
 static void cxl_type2_instance_init(Object *obj)
 {
     CXLType2State *ct2d = CXL_TYPE2(obj);
 
+    cxl_type2_jit_state_init(&ct2d->jit.runtime,
+                             SLUG_JIT_BACKEND_NONE, true, 16 * KiB);
     ct2d->slugarch.phase_id = g_strdup("idle");
     object_property_add_str(obj, "slugarch-phase-id",
                             cxl_type2_slugarch_get_phase,
@@ -3677,6 +4085,26 @@ static void cxl_type2_instance_init(Object *obj)
         &ct2d->slugarch.delay_events, OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-delay-undershoots",
         &ct2d->slugarch.delay_undershoots, OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "slugarch-jit-status",
+        &ct2d->jit.runtime.status, OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "slugarch-jit-backend",
+        &ct2d->jit.runtime.selected_backend, OBJ_PROP_FLAG_READ);
+    object_property_add_str(obj, "slugarch-jit-policy-digest",
+                            cxl_type2_jit_get_digest, NULL);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-event-count",
+        &ct2d->jit.runtime.stats.event_count, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-record-count",
+        &ct2d->jit.runtime.stats.record_count, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-metadata-bytes",
+        &ct2d->jit.runtime.stats.metadata_bytes, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-reject-count",
+        &ct2d->jit.runtime.stats.reject_count, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-drop-count",
+        &ct2d->jit.runtime.stats.drop_count, OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "slugarch-jit-epoch",
+        &ct2d->jit.runtime.stats.epoch, OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "slugarch-jit-last-error",
+        &ct2d->jit.runtime.last_error, OBJ_PROP_FLAG_READ);
 }
 
 static void cxl_type2_instance_finalize(Object *obj)
@@ -3693,6 +4121,8 @@ static void cxl_type2_instance_finalize(Object *obj)
         g_clear_pointer(&ct2d->bulk_transfer_ptr, g_free);
         g_clear_pointer(&ct2d->coherent_pool_ptr, g_free);
     }
+    cxl_type2_jit_close(&ct2d->jit.runtime);
+    ct2d->jit.advertised = false;
     g_clear_pointer(&ct2d->slugarch.phase_id, g_free);
 }
 

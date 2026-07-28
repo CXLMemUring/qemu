@@ -457,9 +457,14 @@ foreach dir : target_dirs
       test_args += ['--full']
     endif
 
+    current_test_deps = test_deps
+    if test == 'cxl-test'
+      current_test_deps += [slugarch_jit_fake]
+    endif
+
     test('qtest-@0@/@1@'.format(target_base, test),
          qtest_executables[test],
-         depends: [test_deps, qtest_emulator, emulator_modules],
+         depends: [current_test_deps, qtest_emulator, emulator_modules],
          env: qtest_env,
          args: test_args,
          protocol: 'tap',

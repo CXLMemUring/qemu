@@ -393,7 +393,7 @@ bool cxl_type2_jit_load_policy(CXLType2JitState *state,
     }
 
     state->selected_backend = info.backend;
-    state->policy_bytes = (uint32_t)policy_len;
+    state->policy_bytes = info.canonical_bytes;
     memcpy(state->policy_digest, info.digest, sizeof(state->policy_digest));
     state->next_event_id = 0;
     memset(&state->last_event, 0, sizeof(state->last_event));
