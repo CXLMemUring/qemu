@@ -12,6 +12,7 @@
 #include "hw/pci/pci_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/crc32c.h"
+#include "qemu/cutils.h"
 #include "qemu/units.h"
 #include "qobject/qjson.h"
 #include "qobject/qnum.h"
@@ -82,6 +83,8 @@
 #define T2_SENTINEL_DPA (80 * MiB)
 #define T2_SERVER_READ_VALUE UINT64_C(0x1122334455667788)
 #define T2_CLIENT_WRITE_VALUE UINT64_C(0x8877665544332211)
+#define T2_CFMWS_DEFAULT_LATENCY_NS UINT64_C(400)
+#define T2_CFMWS_MAX_LATENCY_NS UINT64_C(1000000)
 #define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
 #define T2_JEXT_BAR2_BASE UINT64_C(0x80000000)
 #define T2_FAKE_POLICY_DIGEST \
@@ -1384,7 +1387,8 @@ static void t2_assert_jit_event_log(
     g_assert_cmpuint(join_count, ==, expected_join_count);
 }
 
-static char *t2_cfmws_run_directory(const char *mode, bool *preserve)
+static char *t2_cfmws_run_directory(const char *mode, const char *scenario,
+                                    bool *preserve)
 {
     const char *evidence_root =
         g_getenv("SLUGARCH_QTEST_CFMWS_EVIDENCE_DIR");
@@ -1399,7 +1403,9 @@ static char *t2_cfmws_run_directory(const char *mode, bool *preserve)
 
     g_assert_true(g_path_is_absolute(evidence_root));
     g_assert_nonnull(mode);
+    g_assert_nonnull(scenario);
     g_assert_null(strchr(mode, '/'));
+    g_assert_null(strchr(scenario, '/'));
     iteration = iteration ?: "1";
     for (const char *character = iteration; *character; character++) {
         g_assert_true(g_ascii_isdigit(*character));
@@ -1407,8 +1413,29 @@ static char *t2_cfmws_run_directory(const char *mode, bool *preserve)
     g_assert_cmpint(g_mkdir_with_parents(evidence_root, 0700), ==, 0);
     name = g_strdup_printf("%s-run-%s", mode, iteration);
     directory = g_build_filename(evidence_root, name, NULL);
-    g_assert_cmpint(g_mkdir(directory, 0700), ==, 0);
+    if (g_mkdir(directory, 0700) < 0) {
+        g_assert_cmpint(errno, ==, EEXIST);
+        g_clear_pointer(&directory, g_free);
+        g_clear_pointer(&name, g_free);
+        name = g_strdup_printf("%s-%s-run-%s", mode, scenario, iteration);
+        directory = g_build_filename(evidence_root, name, NULL);
+        g_assert_cmpint(g_mkdir(directory, 0700), ==, 0);
+    }
     return directory;
+}
+
+static uint64_t t2_cfmws_configured_latency_ns(void)
+{
+    const char *text = g_getenv("SLUGARCH_QTEST_CFMWS_LATENCY_NS");
+    uint64_t latency = T2_CFMWS_DEFAULT_LATENCY_NS;
+
+    if (!text) {
+        return latency;
+    }
+    g_assert_cmpint(parse_uint_full(text, 10, &latency), ==, 0);
+    g_assert_cmpuint(latency, >, 0);
+    g_assert_cmpuint(latency, <=, T2_CFMWS_MAX_LATENCY_NS);
+    return latency;
 }
 
 static void cxl_t2_jext_cfmws_records(void)
@@ -1439,6 +1466,7 @@ static void cxl_t2_jext_cfmws_records(void)
     T2FakeServer *server;
     QTestState *qts;
     QDict *response;
+    uint64_t configured_latency_ns;
     uint64_t read_value;
 
     g_assert_true((configured_library == NULL) ==
@@ -1447,7 +1475,7 @@ static void cxl_t2_jext_cfmws_records(void)
     mode = mode ?: "rust";
     g_assert_true(strcmp(mode, "rust") == 0 ||
                   strcmp(mode, "fpga-verilator") == 0);
-    run_dir = t2_cfmws_run_directory(mode, &preserve);
+    run_dir = t2_cfmws_run_directory(mode, "records", &preserve);
     g_assert_nonnull(run_dir);
     event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
     jit_path = g_build_filename(run_dir, "jit-events.jsonl", NULL);
@@ -1460,7 +1488,9 @@ static void cxl_t2_jext_cfmws_records(void)
         g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
     }
 
-    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    configured_latency_ns = t2_cfmws_configured_latency_ns();
+    server = t2_fake_server_start(
+        256 * MiB, configured_latency_ns, 1, false);
     qts = qtest_init(QEMU_T2_CFMWS_BASE);
     response = t2_device_add_with_jit(
         qts, "rp0", server->port, event_path, mode,
@@ -1506,6 +1536,146 @@ static void cxl_t2_jext_cfmws_records(void)
         if (!external_policy) {
             unlink(policy);
         }
+        rmdir(run_dir);
+    }
+    g_free(server);
+}
+
+static void cxl_t2_jext_cfmws_external_reject(void)
+{
+    static const T2ExpectedJitEvent expected[] = {
+        { 0, 1, 3, 2, 0, "" },
+    };
+    static const T2ExpectedJitJoin expected_joins[] = {
+        { 1, 0, 2, 0, false, CXL_GPU_J_ERR_REJECTED },
+    };
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    g_autofree char *jit_path = NULL;
+    g_autofree char *outcome_path = NULL;
+    g_autofree char *outcome = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    g_autofree char *digest = NULL;
+    const char *configured_library =
+        g_getenv("SLUGARCH_QTEST_CFMWS_JIT_LIBRARY");
+    const char *configured_policy =
+        g_getenv("SLUGARCH_QTEST_CFMWS_JIT_POLICY");
+    const char *mode = g_getenv("SLUGARCH_QTEST_CFMWS_JIT_MODE");
+    const char *evidence_root =
+        g_getenv("SLUGARCH_QTEST_CFMWS_EVIDENCE_DIR");
+    uint64_t configured_latency_ns;
+    uint64_t expected_backend;
+    uint64_t actual_backend;
+    uint64_t jit_status;
+    uint64_t last_error;
+    uint64_t event_count;
+    uint64_t record_count;
+    uint64_t reject_count;
+    uint64_t drop_count;
+    uint64_t completed_reads;
+    uint64_t completed_writes;
+    uint64_t direct_cfmws;
+    bool preserve;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+
+    if (!configured_library && !configured_policy && !mode) {
+        g_test_skip("external SlugArch JIT backend is not configured");
+        return;
+    }
+    g_assert_nonnull(configured_library);
+    g_assert_nonnull(configured_policy);
+    g_assert_nonnull(mode);
+    g_assert_nonnull(evidence_root);
+    g_assert_true(strcmp(mode, "rust") == 0 ||
+                  strcmp(mode, "fpga-verilator") == 0);
+    expected_backend = strcmp(mode, "rust") == 0 ?
+        CXL_GPU_J_BACKEND_RUST : CXL_GPU_J_BACKEND_FPGA_VERILATOR;
+
+    run_dir = t2_cfmws_run_directory(mode, "external-reject", &preserve);
+    g_assert_nonnull(run_dir);
+    g_assert_true(preserve);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    jit_path = g_build_filename(run_dir, "jit-events.jsonl", NULL);
+    outcome_path = g_build_filename(run_dir, "failstop-outcome.json", NULL);
+    library = g_canonicalize_filename(configured_library, NULL);
+    policy = g_canonicalize_filename(configured_policy, NULL);
+
+    configured_latency_ns = t2_cfmws_configured_latency_ns();
+    server = t2_fake_server_start(
+        256 * MiB, configured_latency_ns, 1, false);
+    qts = qtest_init(QEMU_T2_CFMWS_BASE);
+    response = t2_device_add_with_jit(
+        qts, "rp0", server->port, event_path, mode,
+        library, policy, jit_path);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+    t2_set_phase(qts, "phase:reject");
+    t2_program_host_decoder(qts);
+
+    g_assert_cmphex(
+        qtest_readq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA),
+        ==, 0);
+    jit_status = t2_qom_counter(qts, "slugarch-jit-status");
+    actual_backend = t2_qom_counter(qts, "slugarch-jit-backend");
+    last_error = t2_qom_counter(qts, "slugarch-jit-last-error");
+    event_count = t2_qom_counter(qts, "slugarch-jit-event-count");
+    record_count = t2_qom_counter(qts, "slugarch-jit-record-count");
+    reject_count = t2_qom_counter(qts, "slugarch-jit-reject-count");
+    drop_count = t2_qom_counter(qts, "slugarch-jit-drop-count");
+    completed_reads = t2_qom_counter(qts, "slugarch-completed-reads");
+    completed_writes = t2_qom_counter(qts, "slugarch-completed-writes");
+    direct_cfmws = t2_qom_counter(qts, "slugarch-direct-cfmws");
+    g_assert_cmpuint(jit_status, ==, CXL_GPU_J_STATUS_ERROR);
+    g_assert_cmpuint(actual_backend, ==, expected_backend);
+    g_assert_cmpuint(last_error, ==, CXL_GPU_J_ERR_REJECTED);
+    g_assert_cmpuint(event_count, ==, 1);
+    g_assert_cmpuint(record_count, ==, 0);
+    g_assert_cmpuint(reject_count, ==, 1);
+    g_assert_cmpuint(drop_count, ==, 0);
+    g_assert_cmpuint(completed_reads, ==, 0);
+    g_assert_cmpuint(completed_writes, ==, 0);
+    g_assert_cmpuint(direct_cfmws, ==, 0);
+    digest = t2_qom_string(qts, "slugarch-jit-policy-digest");
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    g_assert_cmpuint(server->memory_requests, ==, 0);
+    g_assert_cmpuint(server->read_requests, ==, 0);
+    g_assert_cmpuint(server->write_requests, ==, 0);
+    g_assert_cmpuint(server->server_sequence, ==, 0);
+    g_assert_false(server->write_committed);
+    t2_assert_jit_event_log(
+        jit_path, expected, G_N_ELEMENTS(expected),
+        expected_joins, G_N_ELEMENTS(expected_joins), digest);
+    outcome = g_strdup_printf(
+        "{\"schema\":\"slugarch.qemu-cfmws-failstop.v1\","
+        "\"backend\":\"%s\",\"configured_latency_ns\":%" PRIu64 ","
+        "\"jit_status\":%" PRIu64 ",\"jit_backend\":%" PRIu64 ","
+        "\"last_error\":%" PRIu64 ",\"event_count\":%" PRIu64 ","
+        "\"record_count\":%" PRIu64 ",\"reject_count\":%" PRIu64 ","
+        "\"drop_count\":%" PRIu64 ",\"completed_reads\":%" PRIu64 ","
+        "\"completed_writes\":%" PRIu64 ","
+        "\"direct_cfmws_completions\":%" PRIu64 ","
+        "\"server_memory_requests\":%u,"
+        "\"server_read_requests\":%u,"
+        "\"server_write_requests\":%u,"
+        "\"server_sequence\":%" PRIu64 ","
+        "\"external_commit\":%s}\n",
+        mode, configured_latency_ns, jit_status, actual_backend,
+        last_error, event_count, record_count, reject_count, drop_count,
+        completed_reads, completed_writes, direct_cfmws,
+        server->memory_requests, server->read_requests,
+        server->write_requests, server->server_sequence,
+        server->write_committed ? "true" : "false");
+    g_assert_true(g_file_set_contents(outcome_path, outcome, -1, NULL));
+
+    if (!preserve) {
+        unlink(jit_path);
+        unlink(event_path);
+        unlink(outcome_path);
         rmdir(run_dir);
     }
     g_free(server);
@@ -2076,6 +2246,8 @@ int main(int argc, char **argv)
                        cxl_t2_jext_per_tile_state);
         qtest_add_func("/pci/cxl/type2_jext_cfmws_records",
                        cxl_t2_jext_cfmws_records);
+        qtest_add_func("/pci/cxl/type2_jext_cfmws_external_reject",
+                       cxl_t2_jext_cfmws_external_reject);
         qtest_add_func("/pci/cxl/type2_jext_cfmws_reject",
                        cxl_t2_jext_cfmws_reject);
         qtest_add_func("/pci/cxl/type2_jext_cfmws_drop",
