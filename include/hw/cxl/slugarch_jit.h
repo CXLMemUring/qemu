@@ -23,6 +23,22 @@ enum {
 };
 
 enum {
+    SLUG_JIT_DIRECTION_HOST_TO_DEVICE = 0,
+    SLUG_JIT_DIRECTION_DEVICE_TO_HOST = 1,
+};
+
+enum {
+    SLUG_JIT_EVENT_CXL_MEM_READ = 1,
+    SLUG_JIT_EVENT_CXL_MEM_WRITE = 2,
+    SLUG_JIT_EVENT_CXL_MEM_DATA = 3,
+    SLUG_JIT_EVENT_COMPLETION = 4,
+    SLUG_JIT_EVENT_PTX_MODULE_LOAD = 5,
+    SLUG_JIT_EVENT_KERNEL_LAUNCH = 6,
+    SLUG_JIT_EVENT_PHASE = 7,
+    SLUG_JIT_EVENT_FENCE = 8,
+};
+
+enum {
     SLUG_JIT_CAP_POLICY = UINT64_C(1) << 0,
     SLUG_JIT_CAP_RECORD = UINT64_C(1) << 1,
     SLUG_JIT_CAP_GPU_DIAGNOSTIC = UINT64_C(1) << 2,
@@ -225,6 +241,14 @@ bool cxl_type2_jit_refresh_stats(CXLType2JitState *state, Error **errp);
 bool cxl_type2_jit_copy_diagnostic(CXLType2JitState *state, uint8_t *out,
                                    uint32_t capacity, uint32_t *written,
                                    Error **errp);
+bool cxl_type2_jit_log_cfmws_join(CXLType2JitState *state,
+                                  uint64_t request_event_id,
+                                  uint64_t completion_event_id,
+                                  uint64_t request_id,
+                                  uint64_t server_sequence,
+                                  bool external_commit,
+                                  uint32_t effective_error,
+                                  Error **errp);
 void cxl_type2_jit_close(CXLType2JitState *state);
 
 QEMU_BUILD_BUG_ON(sizeof(SlugJitCreateArgs) != 24);

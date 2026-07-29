@@ -1572,6 +1572,57 @@ static bool cxl_type2_slugarch_emit_completion_locked(
     return cxl_type2_slugarch_write_line(ct2d, line, errp);
 }
 
+static uint64_t cxl_type2_jit_phase_number(const char *phase)
+{
+    const uint8_t *byte = (const uint8_t *)(phase ?: "");
+    uint64_t hash = UINT64_C(14695981039346656037);
+
+    while (*byte) {
+        hash ^= *byte++;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash ?: 1;
+}
+
+static bool cxl_type2_jit_observe_cfmws(
+    CXLType2State *ct2d, bool is_write, bool is_completion,
+    hwaddr dpa, unsigned size, uint64_t request_id,
+    uint64_t phase_id, const uint8_t *payload, uint32_t status,
+    uint64_t *event_id, Error **errp)
+{
+    CXLType2JitEvent event = {
+        .client_id = ct2d->slugarch.client_id,
+        .direction = is_completion ?
+            SLUG_JIT_DIRECTION_DEVICE_TO_HOST :
+            SLUG_JIT_DIRECTION_HOST_TO_DEVICE,
+        .event_class = is_completion ?
+            (is_write ? SLUG_JIT_EVENT_COMPLETION :
+                        SLUG_JIT_EVENT_CXL_MEM_DATA) :
+            (is_write ? SLUG_JIT_EVENT_CXL_MEM_WRITE :
+                        SLUG_JIT_EVENT_CXL_MEM_READ),
+        .opcode = is_completion ? SLUGARCH_T2_FRAME_MEMORY_RESPONSE :
+            (is_write ? SLUGARCH_T2_FRAME_WRITE :
+                        SLUGARCH_T2_FRAME_READ),
+        .payload_len = (is_write == is_completion) ? 0 : size,
+        .address = dpa,
+        .tag = request_id,
+        .phase_id = phase_id,
+        .monotonic_ns = slugarch_t2_monotonic_ns(),
+        .status = status,
+    };
+    SlugJitDecision decision;
+    bool accepted;
+
+    *event_id = 0;
+    if (event.payload_len) {
+        memcpy(event.payload, payload, event.payload_len);
+    }
+    accepted = cxl_type2_jit_observe_event(
+        &ct2d->jit.runtime, &event, &decision, errp);
+    *event_id = ct2d->jit.runtime.last_event.event_id;
+    return accepted;
+}
+
 static MemTxResult cxl_type2_slugarch_fail_locked(
     CXLType2State *ct2d,
     SlugArchT2IOResult io_result,
@@ -1616,6 +1667,9 @@ static MemTxResult cxl_type2_slugarch_access(CXLType2State *ct2d,
     Error *local_err = NULL;
     uint64_t request_id;
     uint64_t deadline_ns;
+    uint64_t jit_phase_id = 0;
+    uint64_t request_event_id = 0;
+    uint64_t completion_event_id = 0;
     uint8_t *shadow;
     const uint8_t *payload;
     MemTxResult result = MEMTX_ERROR;
@@ -1670,6 +1724,32 @@ static MemTxResult cxl_type2_slugarch_access(CXLType2State *ct2d,
         goto out;
     }
 
+    if (ct2d->jit.advertised) {
+        Error *join_error = NULL;
+        uint32_t failure;
+
+        jit_phase_id =
+            cxl_type2_jit_phase_number(ct2d->slugarch.phase_id);
+        if (!cxl_type2_jit_observe_cfmws(
+                ct2d, is_write, false, dpa, size, request_id,
+                jit_phase_id, request.data, 0, &request_event_id,
+                &local_err)) {
+            failure = ct2d->jit.runtime.last_error ?
+                ct2d->jit.runtime.last_error : SLUG_JIT_ERR_BACKEND;
+            if (!cxl_type2_jit_log_cfmws_join(
+                    &ct2d->jit.runtime, request_event_id, 0,
+                    request_id, 0, false, failure, &join_error)) {
+                error_report_err(join_error);
+            }
+            error_prepend(
+                &local_err,
+                "SlugArch CFMWS request record failed: ");
+            result = cxl_type2_slugarch_fail_locked(
+                ct2d, SLUGARCH_T2_IO_OK, false, local_err);
+            goto out;
+        }
+    }
+
     deadline_ns = slugarch_t2_monotonic_ns() +
                   SLUGARCH_T2_REQUEST_TIMEOUT_NS;
     io_result = slugarch_t2_exchange_until(
@@ -1709,6 +1789,40 @@ static MemTxResult cxl_type2_slugarch_access(CXLType2State *ct2d,
         *value = ldn_le_p(response.data, size);
     }
     payload = is_write ? request.data : response.data;
+    if (ct2d->jit.advertised) {
+        Error *join_error = NULL;
+        uint32_t failure;
+
+        if (!cxl_type2_jit_observe_cfmws(
+                ct2d, is_write, true, dpa, size, request_id,
+                jit_phase_id, payload, response.status,
+                &completion_event_id, &local_err)) {
+            failure = ct2d->jit.runtime.last_error ?
+                ct2d->jit.runtime.last_error : SLUG_JIT_ERR_BACKEND;
+            if (!cxl_type2_jit_log_cfmws_join(
+                    &ct2d->jit.runtime, request_event_id,
+                    completion_event_id, request_id,
+                    response.server_sequence, is_write,
+                    failure, &join_error)) {
+                error_report_err(join_error);
+            }
+            error_prepend(
+                &local_err,
+                "SlugArch CFMWS completion record failed: ");
+            result = cxl_type2_slugarch_fail_locked(
+                ct2d, SLUGARCH_T2_IO_OK, false, local_err);
+            goto out;
+        }
+        if (!cxl_type2_jit_log_cfmws_join(
+                &ct2d->jit.runtime, request_event_id,
+                completion_event_id, request_id,
+                response.server_sequence, false, SLUG_JIT_OK,
+                &local_err)) {
+            result = cxl_type2_slugarch_fail_locked(
+                ct2d, SLUGARCH_T2_IO_OK, false, local_err);
+            goto out;
+        }
+    }
     if (!cxl_type2_slugarch_emit_completion_locked(
             ct2d, is_write, dpa, size, request_id,
             response.server_sequence, response.modeled_latency,
@@ -4041,6 +4155,11 @@ static char *cxl_type2_jit_get_digest(Object *obj, Error **errp)
     return digest;
 }
 
+static bool cxl_type2_jit_get_advertised(Object *obj, Error **errp)
+{
+    return CXL_TYPE2(obj)->jit.advertised;
+}
+
 static void cxl_type2_instance_init(Object *obj)
 {
     CXLType2State *ct2d = CXL_TYPE2(obj);
@@ -4091,6 +4210,8 @@ static void cxl_type2_instance_init(Object *obj)
         &ct2d->jit.runtime.selected_backend, OBJ_PROP_FLAG_READ);
     object_property_add_str(obj, "slugarch-jit-policy-digest",
                             cxl_type2_jit_get_digest, NULL);
+    object_property_add_bool(obj, "slugarch-jit-advertised",
+                             cxl_type2_jit_get_advertised, NULL);
     object_property_add_uint64_ptr(obj, "slugarch-jit-event-count",
         &ct2d->jit.runtime.stats.event_count, OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-jit-record-count",

@@ -12,6 +12,7 @@ typedef enum FakePolicyMode {
     FAKE_POLICY_VALID,
     FAKE_POLICY_REJECT,
     FAKE_POLICY_DROP,
+    FAKE_POLICY_DROP_COMPLETION,
     FAKE_POLICY_PANIC,
     FAKE_POLICY_WRONG_BACKEND,
 } FakePolicyMode;
@@ -127,6 +128,8 @@ int32_t slugarch_jit_load_policy(SlugJitHandle *handle,
         handle->mode = FAKE_POLICY_REJECT;
     } else if (strcmp(text, "drop") == 0) {
         handle->mode = FAKE_POLICY_DROP;
+    } else if (strcmp(text, "drop-completion") == 0) {
+        handle->mode = FAKE_POLICY_DROP_COMPLETION;
     } else if (strcmp(text, "panic") == 0) {
         handle->mode = FAKE_POLICY_PANIC;
     } else if (strcmp(text, "wrong-backend") == 0) {
@@ -184,7 +187,9 @@ int32_t slugarch_jit_observe(SlugJitHandle *handle,
         fake_set_diagnostic(handle, "fake panic");
         return SLUG_JIT_ERR_PANIC;
     }
-    if (handle->mode == FAKE_POLICY_DROP) {
+    if (handle->mode == FAKE_POLICY_DROP ||
+        (handle->mode == FAKE_POLICY_DROP_COMPLETION &&
+         event->event_class == 4)) {
         handle->stats.drop_count++;
         fake_set_diagnostic(handle, "fake strict drop");
         return SLUG_JIT_ERR_DROP;

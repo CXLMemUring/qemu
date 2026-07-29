@@ -13,6 +13,8 @@
 #include "qemu/bswap.h"
 #include "qemu/crc32c.h"
 #include "qemu/units.h"
+#include "qobject/qjson.h"
+#include "qobject/qnum.h"
 
 #include <poll.h>
 
@@ -438,8 +440,10 @@ static void t2_fake_server_stop(T2FakeServer *server)
     g_thread_join(server->thread);
 }
 
-static QDict *t2_device_add(QTestState *qts, const char *bus,
-                            uint16_t port, const char *event_path)
+static QDict *t2_device_add_with_jit(
+    QTestState *qts, const char *bus, uint16_t port,
+    const char *event_path, const char *mode,
+    const char *library, const char *policy, const char *jit_log)
 {
     QDict *arguments = qdict_new();
 
@@ -455,9 +459,23 @@ static QDict *t2_device_add(QTestState *qts, const char *bus,
     qdict_put_str(arguments, "slugarch-event-log", event_path);
     qdict_put_str(arguments, "cxlmemsim-addr", "127.0.0.1");
     qdict_put_int(arguments, "cxlmemsim-port", port);
+    if (mode) {
+        qdict_put_str(arguments, "slugarch-j-ext", mode);
+        qdict_put_str(arguments, "slugarch-jit-lib", library);
+        qdict_put_str(arguments, "slugarch-jit-policy", policy);
+        qdict_put_str(arguments, "slugarch-jit-log", jit_log);
+        qdict_put_bool(arguments, "slugarch-jit-strict", true);
+    }
     return qtest_qmp(qts,
                      "{'execute': 'device_add', 'arguments': %p}",
                      arguments);
+}
+
+static QDict *t2_device_add(QTestState *qts, const char *bus,
+                            uint16_t port, const char *event_path)
+{
+    return t2_device_add_with_jit(
+        qts, bus, port, event_path, NULL, NULL, NULL, NULL);
 }
 
 static void t2_assert_observability(QTestState *qts)
@@ -673,21 +691,27 @@ static void t2_pci_config_writel(QTestState *qts, uint8_t bus,
     qtest_outl(qts, 0xcfc, value);
 }
 
-static void t2_program_endpoint_bar2(QTestState *qts, uint8_t devfn,
-                                     uint64_t base)
+static void t2_program_endpoint_bar2_on_bus(QTestState *qts, uint8_t bus,
+                                            uint8_t devfn, uint64_t base)
 {
     uint16_t command;
 
     g_assert_cmphex(base & ((128 * MiB) - 1), ==, 0);
-    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_3, base >> 32);
-    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_2, base);
-    command = t2_pci_config_readw(qts, 0, devfn, PCI_COMMAND);
-    t2_pci_config_writew(qts, 0, devfn, PCI_COMMAND,
+    t2_pci_config_writel(qts, bus, devfn, PCI_BASE_ADDRESS_3, base >> 32);
+    t2_pci_config_writel(qts, bus, devfn, PCI_BASE_ADDRESS_2, base);
+    command = t2_pci_config_readw(qts, bus, devfn, PCI_COMMAND);
+    t2_pci_config_writew(qts, bus, devfn, PCI_COMMAND,
                          command | PCI_COMMAND_MEMORY);
     g_assert_cmphex(t2_pci_config_readl(
-                        qts, 0, devfn, PCI_BASE_ADDRESS_2) &
+                        qts, bus, devfn, PCI_BASE_ADDRESS_2) &
                     PCI_BASE_ADDRESS_MEM_MASK,
                     ==, base);
+}
+
+static void t2_program_endpoint_bar2(QTestState *qts, uint8_t devfn,
+                                     uint64_t base)
+{
+    t2_program_endpoint_bar2_on_bus(qts, 0, devfn, base);
 }
 
 static void t2_enable_bridge_window(QTestState *qts, uint8_t bus,
@@ -745,6 +769,15 @@ static void t2_program_switch_decoder(QTestState *qts)
     g_assert_cmphex(control & (1U << 10), ==, 1U << 10);
 }
 
+static uint64_t t2_qdict_uint(const QDict *dictionary, const char *key)
+{
+    uint64_t value;
+
+    g_assert_true(qnum_get_try_uint(
+        qobject_to(QNum, qdict_get(dictionary, key)), &value));
+    return value;
+}
+
 static uint64_t t2_qom_uint_at(QTestState *qts, const char *id,
                                const char *property)
 {
@@ -758,7 +791,7 @@ static uint64_t t2_qom_uint_at(QTestState *qts, const char *id,
         "'path':%s,'property':%s}}",
         path, property);
     g_assert_false(qdict_haskey(response, "error"));
-    value = qdict_get_int(response, "return");
+    value = t2_qdict_uint(response, "return");
     qobject_unref(response);
     return value;
 }
@@ -766,6 +799,29 @@ static uint64_t t2_qom_uint_at(QTestState *qts, const char *id,
 static uint64_t t2_qom_counter(QTestState *qts, const char *property)
 {
     return t2_qom_uint_at(qts, "t2", property);
+}
+
+static bool t2_qom_bool_at(QTestState *qts, const char *id,
+                           const char *property)
+{
+    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", id);
+    QDict *response;
+    bool value;
+
+    response = qtest_qmp(
+        qts,
+        "{'execute':'qom-get','arguments':{"
+        "'path':%s,'property':%s}}",
+        path, property);
+    g_assert_false(qdict_haskey(response, "error"));
+    value = qdict_get_bool(response, "return");
+    qobject_unref(response);
+    return value;
+}
+
+static bool t2_qom_bool(QTestState *qts, const char *property)
+{
+    return t2_qom_bool_at(qts, "t2", property);
 }
 
 static char *t2_qom_string_at(QTestState *qts, const char *id,
@@ -1206,6 +1262,328 @@ static void cxl_t2_jext_per_tile_state(void)
     rmdir(directory);
 }
 
+typedef struct T2ExpectedJitEvent {
+    uint32_t direction;
+    uint32_t event_class;
+    uint32_t opcode;
+    uint64_t tag;
+    uint32_t payload_len;
+    const char *payload_prefix_hex;
+} T2ExpectedJitEvent;
+
+typedef struct T2ExpectedJitJoin {
+    uint64_t request_event_id;
+    uint64_t completion_event_id;
+    uint64_t request_id;
+    uint64_t server_sequence;
+    bool external_commit;
+    uint32_t effective_error;
+} T2ExpectedJitJoin;
+
+static void t2_set_phase(QTestState *qts, const char *phase)
+{
+    QDict *response = qtest_qmp(
+        qts,
+        "{'execute':'qom-set','arguments':{"
+        "'path':'/machine/peripheral/t2',"
+        "'property':'slugarch-phase-id','value':%s}}",
+        phase);
+
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+}
+
+static void t2_assert_jit_event_log(
+    const char *path, const T2ExpectedJitEvent *expected,
+    size_t expected_count, const T2ExpectedJitJoin *expected_joins,
+    size_t expected_join_count)
+{
+    g_autofree char *contents = NULL;
+    g_auto(GStrv) lines = NULL;
+    uint64_t phase_id = 0;
+    size_t event_index = 0;
+    size_t join_count = 0;
+
+    g_assert_true(g_file_get_contents(path, &contents, NULL, NULL));
+    lines = g_strsplit(contents, "\n", -1);
+    for (size_t i = 0; lines[i]; i++) {
+        QObject *object;
+        QDict *entry;
+        const char *schema;
+
+        if (!lines[i][0]) {
+            continue;
+        }
+        object = qobject_from_json(lines[i], &error_abort);
+        entry = qobject_to(QDict, object);
+        g_assert_nonnull(entry);
+        schema = qdict_get_str(entry, "schema");
+        if (strcmp(schema, "slugarch.qemu-jit-event.v1") == 0) {
+            const T2ExpectedJitEvent *want;
+            uint64_t event_phase;
+
+            g_assert_cmpuint(event_index, <, expected_count);
+            want = &expected[event_index];
+            g_assert_cmpuint(t2_qdict_uint(entry, "event_id"),
+                             ==, event_index + 1);
+            g_assert_cmpuint(t2_qdict_uint(entry, "client_id"), ==, 1);
+            g_assert_cmpuint(t2_qdict_uint(entry, "direction"),
+                             ==, want->direction);
+            g_assert_cmpuint(t2_qdict_uint(entry, "event_class"),
+                             ==, want->event_class);
+            g_assert_cmpuint(t2_qdict_uint(entry, "opcode"),
+                             ==, want->opcode);
+            g_assert_cmpuint(t2_qdict_uint(entry, "address"),
+                             ==, T2_SENTINEL_DPA);
+            g_assert_cmpuint(t2_qdict_uint(entry, "tag"), ==, want->tag);
+            g_assert_cmpuint(t2_qdict_uint(entry, "payload_len"),
+                             ==, want->payload_len);
+            g_assert_cmpstr(qdict_get_str(entry, "payload_prefix_hex"),
+                            ==, want->payload_prefix_hex);
+            g_assert_cmpstr(
+                qdict_get_str(entry, "policy_digest"), ==,
+                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+            event_phase = t2_qdict_uint(entry, "phase_id");
+            g_assert_cmpuint(event_phase, >, 0);
+            if (!event_index) {
+                phase_id = event_phase;
+            } else {
+                g_assert_cmpuint(event_phase, ==, phase_id);
+            }
+            event_index++;
+        } else if (strcmp(
+                       schema, "slugarch.qemu-cfmws-join.v1") == 0) {
+            const T2ExpectedJitJoin *want;
+
+            g_assert_cmpuint(join_count, <, expected_join_count);
+            want = &expected_joins[join_count];
+            g_assert_cmpuint(
+                t2_qdict_uint(entry, "request_event_id"),
+                ==, want->request_event_id);
+            g_assert_cmpuint(
+                t2_qdict_uint(entry, "completion_event_id"),
+                ==, want->completion_event_id);
+            g_assert_cmpuint(t2_qdict_uint(entry, "request_id"),
+                             ==, want->request_id);
+            g_assert_cmpuint(t2_qdict_uint(entry, "server_sequence"),
+                             ==, want->server_sequence);
+            g_assert_cmpint(qdict_get_bool(entry, "external_commit"),
+                            ==, want->external_commit);
+            g_assert_cmpuint(t2_qdict_uint(entry, "effective_error"),
+                             ==, want->effective_error);
+            g_assert_cmpstr(
+                qdict_get_str(entry, "policy_digest"), ==,
+                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+            join_count++;
+        }
+        qobject_unref(object);
+    }
+
+    g_assert_cmpuint(event_index, ==, expected_count);
+    g_assert_cmpuint(join_count, ==, expected_join_count);
+}
+
+static void cxl_t2_jext_cfmws_records(void)
+{
+    static const T2ExpectedJitEvent expected[] = {
+        { 0, 1, 3, 2, 0, "" },
+        { 1, 3, 5, 2, 8, "8877665544332211" },
+        { 0, 2, 4, 3, 8, "1122334455667788" },
+        { 1, 4, 5, 3, 0, "" },
+    };
+    static const T2ExpectedJitJoin expected_joins[] = {
+        { 1, 2, 2, 1, false, CXL_GPU_J_OK },
+        { 3, 4, 3, 2, false, CXL_GPU_J_OK },
+    };
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    g_autofree char *jit_path = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+    uint64_t read_value;
+
+    run_dir = g_dir_make_tmp("cxl-t2-jext-cfmws-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    jit_path = g_build_filename(run_dir, "jit-events.jsonl", NULL);
+    policy = g_build_filename(run_dir, "policy.json", NULL);
+    library = t2_jit_fake_path();
+    g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+
+    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    qts = qtest_init(QEMU_T2_CFMWS_BASE);
+    response = t2_device_add_with_jit(
+        qts, "rp0", server->port, event_path, "rust",
+        library, policy, jit_path);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+    t2_set_phase(qts, "phase:cfmws");
+
+    t2_program_host_decoder(qts);
+
+    read_value = qtest_readq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA);
+    g_assert_cmphex(read_value, ==, T2_SERVER_READ_VALUE);
+    qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA,
+                 T2_CLIENT_WRITE_VALUE);
+
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-status"),
+                     ==, CXL_GPU_J_STATUS_READY);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-event-count"),
+                     ==, 4);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-record-count"),
+                     ==, 4);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-metadata-bytes"),
+                     ==, 32);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-reject-count"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-drop-count"),
+                     ==, 0);
+    g_assert_true(t2_qom_bool(qts, "slugarch-jit-advertised"));
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    g_assert_cmpuint(server->memory_requests, ==, 2);
+    g_assert_cmpuint(server->read_requests, ==, 1);
+    g_assert_cmpuint(server->write_requests, ==, 1);
+    t2_assert_jit_event_log(
+        jit_path, expected, G_N_ELEMENTS(expected),
+        expected_joins, G_N_ELEMENTS(expected_joins));
+
+    unlink(jit_path);
+    unlink(event_path);
+    unlink(policy);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void t2_jext_cfmws_failure_case(
+    const char *policy_text, uint32_t expected_error,
+    uint64_t expected_events, uint64_t expected_records,
+    uint64_t expected_rejects, uint64_t expected_drops,
+    unsigned expected_server_requests, bool post_commit)
+{
+    static const T2ExpectedJitEvent request_failure[] = {
+        { 0, 1, 3, 2, 0, "" },
+    };
+    static const T2ExpectedJitEvent completion_failure[] = {
+        { 0, 2, 4, 2, 8, "1122334455667788" },
+        { 1, 4, 5, 2, 0, "" },
+    };
+    T2ExpectedJitJoin expected_join = {
+        .request_event_id = 1,
+        .completion_event_id = post_commit ? 2 : 0,
+        .request_id = 2,
+        .server_sequence = post_commit ? 1 : 0,
+        .external_commit = post_commit,
+        .effective_error = expected_error,
+    };
+    g_autofree char *run_dir = NULL;
+    g_autofree char *event_path = NULL;
+    g_autofree char *jit_path = NULL;
+    g_autofree char *library = NULL;
+    g_autofree char *policy = NULL;
+    T2FakeServer *server;
+    QTestState *qts;
+    QDict *response;
+
+    run_dir = g_dir_make_tmp("cxl-t2-jext-failure-XXXXXX", NULL);
+    g_assert_nonnull(run_dir);
+    event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
+    jit_path = g_build_filename(run_dir, "jit-events.jsonl", NULL);
+    policy = g_build_filename(run_dir, "policy.json", NULL);
+    library = t2_jit_fake_path();
+    g_assert_true(g_file_set_contents(policy, policy_text, -1, NULL));
+
+    server = t2_fake_server_start(256 * MiB, 400, 1, false);
+    qts = qtest_init(QEMU_T2_CFMWS_BASE);
+    response = t2_device_add_with_jit(
+        qts, "rp0", server->port, event_path, "rust",
+        library, policy, jit_path);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+    t2_set_phase(qts, "phase:failure");
+    t2_program_host_decoder(qts);
+
+    if (post_commit) {
+        qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA,
+                     T2_CLIENT_WRITE_VALUE);
+        g_assert_cmphex(
+            qtest_readq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA),
+            ==, 0);
+    } else {
+        g_assert_cmphex(
+            qtest_readq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA),
+            ==, 0);
+        qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA,
+                     T2_CLIENT_WRITE_VALUE);
+    }
+
+    g_assert_true(t2_qom_bool(qts, "slugarch-jit-advertised"));
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-status"),
+                     ==, CXL_GPU_J_STATUS_ERROR);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-last-error"),
+                     ==, expected_error);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-event-count"),
+                     ==, expected_events);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-record-count"),
+                     ==, expected_records);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-reject-count"),
+                     ==, expected_rejects);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-drop-count"),
+                     ==, expected_drops);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-reads"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-completed-writes"),
+                     ==, 0);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-direct-cfmws"),
+                     ==, 0);
+
+    t2_fake_server_stop(server);
+    qtest_quit(qts);
+    g_assert_cmpuint(server->memory_requests,
+                     ==, expected_server_requests);
+    if (post_commit) {
+        g_assert_true(server->write_committed);
+        t2_assert_jit_event_log(
+            jit_path, completion_failure,
+            G_N_ELEMENTS(completion_failure), &expected_join, 1);
+    } else {
+        t2_assert_jit_event_log(
+            jit_path, request_failure,
+            G_N_ELEMENTS(request_failure), &expected_join, 1);
+    }
+
+    unlink(jit_path);
+    unlink(event_path);
+    unlink(policy);
+    rmdir(run_dir);
+    g_free(server);
+}
+
+static void cxl_t2_jext_cfmws_reject(void)
+{
+    t2_jext_cfmws_failure_case(
+        "reject", CXL_GPU_J_ERR_REJECTED, 1, 0, 1, 0, 0, false);
+}
+
+static void cxl_t2_jext_cfmws_drop(void)
+{
+    t2_jext_cfmws_failure_case(
+        "drop", CXL_GPU_J_ERR_DROP, 0, 0, 0, 1, 0, false);
+}
+
+static void cxl_t2_jext_cfmws_post_commit_drop(void)
+{
+    t2_jext_cfmws_failure_case(
+        "drop-completion", CXL_GPU_J_ERR_DROP,
+        1, 1, 0, 1, 1, true);
+}
+
 static void cxl_t2_direct_cfmws(void)
 {
     g_autofree char *run_dir = NULL;
@@ -1644,6 +2022,14 @@ int main(int argc, char **argv)
                        cxl_t2_jext_no_fallback);
         qtest_add_func("/pci/cxl/type2_jext_per_tile_state",
                        cxl_t2_jext_per_tile_state);
+        qtest_add_func("/pci/cxl/type2_jext_cfmws_records",
+                       cxl_t2_jext_cfmws_records);
+        qtest_add_func("/pci/cxl/type2_jext_cfmws_reject",
+                       cxl_t2_jext_cfmws_reject);
+        qtest_add_func("/pci/cxl/type2_jext_cfmws_drop",
+                       cxl_t2_jext_cfmws_drop);
+        qtest_add_func("/pci/cxl/type2_jext_cfmws_post_commit_drop",
+                       cxl_t2_jext_cfmws_post_commit_drop);
         qtest_add_func("/pci/cxl/type3_device", cxl_t3d_deprecated);
         qtest_add_func("/pci/cxl/type3_device_pmem", cxl_t3d_persistent);
         qtest_add_func("/pci/cxl/type3_device_vmem", cxl_t3d_volatile);

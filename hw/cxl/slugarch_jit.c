@@ -132,10 +132,23 @@ static void jit_digest_hex(const uint8_t digest[SLUG_JIT_DIGEST_BYTES],
     output[SLUG_JIT_DIGEST_BYTES * 2] = '\0';
 }
 
+static uint64_t jit_payload_fnv1a64(const SlugJitEvent *event)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+
+    for (size_t i = 0; i < event->payload_len; i++) {
+        hash ^= event->payload[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static bool jit_log_event(CXLType2JitState *state, int32_t result,
                           uint32_t effective_error, Error **errp)
 {
     char digest[SLUG_JIT_DIGEST_BYTES * 2 + 1];
+    char payload_prefix[8 * 2 + 1];
+    size_t prefix_length;
     int written;
 
     if (!state->log_file) {
@@ -143,12 +156,22 @@ static bool jit_log_event(CXLType2JitState *state, int32_t result,
     }
 
     jit_digest_hex(state->policy_digest, digest);
+    prefix_length = MIN((size_t)state->last_event.payload_len,
+                        sizeof(payload_prefix) / 2);
+    for (size_t i = 0; i < prefix_length; i++) {
+        snprintf(payload_prefix + i * 2, 3, "%02x",
+                 state->last_event.payload[i]);
+    }
+    payload_prefix[prefix_length * 2] = '\0';
     written = fprintf(state->log_file,
         "{\"schema\":\"slugarch.qemu-jit-event.v1\","
         "\"event_id\":%" PRIu64 ",\"client_id\":%" PRIu64 ","
         "\"direction\":%u,\"event_class\":%u,\"opcode\":%u,"
         "\"address\":%" PRIu64 ",\"tag\":%" PRIu64 ","
-        "\"phase_id\":%" PRIu64 ",\"status\":%u,"
+        "\"phase_id\":%" PRIu64 ",\"monotonic_ns\":%" PRIu64 ","
+        "\"status\":%u,\"payload_len\":%u,"
+        "\"payload_prefix_hex\":\"%s\","
+        "\"payload_fnv1a64\":\"%016" PRIx64 "\","
         "\"policy_digest\":\"%s\",\"result\":%d,"
         "\"effective_error\":%u,\"accepted\":%u,\"emitted\":%u,"
         "\"decision_error\":%u,"
@@ -159,7 +182,10 @@ static bool jit_log_event(CXLType2JitState *state, int32_t result,
         state->last_event.direction, state->last_event.event_class,
         state->last_event.opcode, state->last_event.address,
         state->last_event.tag, state->last_event.phase_id,
-        state->last_event.status, digest, result, effective_error,
+        state->last_event.monotonic_ns, state->last_event.status,
+        state->last_event.payload_len, payload_prefix,
+        jit_payload_fnv1a64(&state->last_event), digest,
+        result, effective_error,
         state->last_decision.accepted, state->last_decision.emitted,
         state->last_decision.error_code, state->stats.event_count,
         state->stats.record_count, state->stats.metadata_bytes,
@@ -168,6 +194,53 @@ static bool jit_log_event(CXLType2JitState *state, int32_t result,
     if (written < 0 || fflush(state->log_file) != 0) {
         error_setg_errno(errp, errno,
                          "SlugArch JIT could not write JSONL evidence");
+        jit_mark_error(state, SLUG_JIT_ERR_IO);
+        return false;
+    }
+    return true;
+}
+
+bool cxl_type2_jit_log_cfmws_join(CXLType2JitState *state,
+                                  uint64_t request_event_id,
+                                  uint64_t completion_event_id,
+                                  uint64_t request_id,
+                                  uint64_t server_sequence,
+                                  bool external_commit,
+                                  uint32_t effective_error,
+                                  Error **errp)
+{
+    char digest[SLUG_JIT_DIGEST_BYTES * 2 + 1];
+    int written;
+
+    if (!state || !state->log_file || !request_event_id || !request_id) {
+        error_setg(errp, "SlugArch JIT CFMWS join state is invalid");
+        if (state) {
+            jit_mark_error(state, SLUG_JIT_ERR_IO);
+        }
+        return false;
+    }
+    if (external_commit && (!completion_event_id || !server_sequence)) {
+        error_setg(errp,
+                   "SlugArch JIT external commit lacks completion join");
+        jit_mark_error(state, SLUG_JIT_ERR_IO);
+        return false;
+    }
+
+    jit_digest_hex(state->policy_digest, digest);
+    written = fprintf(state->log_file,
+        "{\"schema\":\"slugarch.qemu-cfmws-join.v1\","
+        "\"request_event_id\":%" PRIu64 ","
+        "\"completion_event_id\":%" PRIu64 ","
+        "\"request_id\":%" PRIu64 ","
+        "\"server_sequence\":%" PRIu64 ","
+        "\"external_commit\":%s,\"effective_error\":%u,"
+        "\"policy_digest\":\"%s\"}\n",
+        request_event_id, completion_event_id, request_id,
+        server_sequence, external_commit ? "true" : "false",
+        effective_error, digest);
+    if (written < 0 || fflush(state->log_file) != 0) {
+        error_setg_errno(errp, errno,
+                         "SlugArch JIT could not write CFMWS join evidence");
         jit_mark_error(state, SLUG_JIT_ERR_IO);
         return false;
     }
