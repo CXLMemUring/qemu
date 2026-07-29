@@ -84,6 +84,9 @@
 #define T2_CLIENT_WRITE_VALUE UINT64_C(0x8877665544332211)
 #define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
 #define T2_JEXT_BAR2_BASE UINT64_C(0x80000000)
+#define T2_FAKE_POLICY_DIGEST \
+    "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5" \
+    "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
 
 /* Dual ports on first pxb */
 #define QEMU_2RP \
@@ -1296,7 +1299,7 @@ static void t2_set_phase(QTestState *qts, const char *phase)
 static void t2_assert_jit_event_log(
     const char *path, const T2ExpectedJitEvent *expected,
     size_t expected_count, const T2ExpectedJitJoin *expected_joins,
-    size_t expected_join_count)
+    size_t expected_join_count, const char *policy_digest)
 {
     g_autofree char *contents = NULL;
     g_auto(GStrv) lines = NULL;
@@ -1341,9 +1344,7 @@ static void t2_assert_jit_event_log(
             g_assert_cmpstr(qdict_get_str(entry, "payload_prefix_hex"),
                             ==, want->payload_prefix_hex);
             g_assert_cmpstr(
-                qdict_get_str(entry, "policy_digest"), ==,
-                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
-                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+                qdict_get_str(entry, "policy_digest"), ==, policy_digest);
             event_phase = t2_qdict_uint(entry, "phase_id");
             g_assert_cmpuint(event_phase, >, 0);
             if (!event_index) {
@@ -1373,9 +1374,7 @@ static void t2_assert_jit_event_log(
             g_assert_cmpuint(t2_qdict_uint(entry, "effective_error"),
                              ==, want->effective_error);
             g_assert_cmpstr(
-                qdict_get_str(entry, "policy_digest"), ==,
-                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
-                "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+                qdict_get_str(entry, "policy_digest"), ==, policy_digest);
             join_count++;
         }
         qobject_unref(object);
@@ -1383,6 +1382,33 @@ static void t2_assert_jit_event_log(
 
     g_assert_cmpuint(event_index, ==, expected_count);
     g_assert_cmpuint(join_count, ==, expected_join_count);
+}
+
+static char *t2_cfmws_run_directory(const char *mode, bool *preserve)
+{
+    const char *evidence_root =
+        g_getenv("SLUGARCH_QTEST_CFMWS_EVIDENCE_DIR");
+    const char *iteration = g_getenv("MESON_TEST_ITERATION");
+    g_autofree char *name = NULL;
+    char *directory;
+
+    *preserve = evidence_root != NULL;
+    if (!evidence_root) {
+        return g_dir_make_tmp("cxl-t2-jext-cfmws-XXXXXX", NULL);
+    }
+
+    g_assert_true(g_path_is_absolute(evidence_root));
+    g_assert_nonnull(mode);
+    g_assert_null(strchr(mode, '/'));
+    iteration = iteration ?: "1";
+    for (const char *character = iteration; *character; character++) {
+        g_assert_true(g_ascii_isdigit(*character));
+    }
+    g_assert_cmpint(g_mkdir_with_parents(evidence_root, 0700), ==, 0);
+    name = g_strdup_printf("%s-run-%s", mode, iteration);
+    directory = g_build_filename(evidence_root, name, NULL);
+    g_assert_cmpint(g_mkdir(directory, 0700), ==, 0);
+    return directory;
 }
 
 static void cxl_t2_jext_cfmws_records(void)
@@ -1402,23 +1428,42 @@ static void cxl_t2_jext_cfmws_records(void)
     g_autofree char *jit_path = NULL;
     g_autofree char *library = NULL;
     g_autofree char *policy = NULL;
+    g_autofree char *digest = NULL;
+    const char *configured_library =
+        g_getenv("SLUGARCH_QTEST_CFMWS_JIT_LIBRARY");
+    const char *configured_policy =
+        g_getenv("SLUGARCH_QTEST_CFMWS_JIT_POLICY");
+    const char *mode = g_getenv("SLUGARCH_QTEST_CFMWS_JIT_MODE");
+    bool external_policy;
+    bool preserve;
     T2FakeServer *server;
     QTestState *qts;
     QDict *response;
     uint64_t read_value;
 
-    run_dir = g_dir_make_tmp("cxl-t2-jext-cfmws-XXXXXX", NULL);
+    g_assert_true((configured_library == NULL) ==
+                  (configured_policy == NULL));
+    external_policy = configured_library != NULL;
+    mode = mode ?: "rust";
+    g_assert_true(strcmp(mode, "rust") == 0 ||
+                  strcmp(mode, "fpga-verilator") == 0);
+    run_dir = t2_cfmws_run_directory(mode, &preserve);
     g_assert_nonnull(run_dir);
     event_path = g_build_filename(run_dir, "qemu-events.jsonl", NULL);
     jit_path = g_build_filename(run_dir, "jit-events.jsonl", NULL);
-    policy = g_build_filename(run_dir, "policy.json", NULL);
-    library = t2_jit_fake_path();
-    g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+    if (external_policy) {
+        library = g_canonicalize_filename(configured_library, NULL);
+        policy = g_canonicalize_filename(configured_policy, NULL);
+    } else {
+        policy = g_build_filename(run_dir, "policy.json", NULL);
+        library = t2_jit_fake_path();
+        g_assert_true(g_file_set_contents(policy, "valid", -1, NULL));
+    }
 
     server = t2_fake_server_start(256 * MiB, 400, 1, false);
     qts = qtest_init(QEMU_T2_CFMWS_BASE);
     response = t2_device_add_with_jit(
-        qts, "rp0", server->port, event_path, "rust",
+        qts, "rp0", server->port, event_path, mode,
         library, policy, jit_path);
     g_assert_false(qdict_haskey(response, "error"));
     qobject_unref(response);
@@ -1444,6 +1489,7 @@ static void cxl_t2_jext_cfmws_records(void)
     g_assert_cmpuint(t2_qom_counter(qts, "slugarch-jit-drop-count"),
                      ==, 0);
     g_assert_true(t2_qom_bool(qts, "slugarch-jit-advertised"));
+    digest = t2_qom_string(qts, "slugarch-jit-policy-digest");
 
     t2_fake_server_stop(server);
     qtest_quit(qts);
@@ -1452,12 +1498,16 @@ static void cxl_t2_jext_cfmws_records(void)
     g_assert_cmpuint(server->write_requests, ==, 1);
     t2_assert_jit_event_log(
         jit_path, expected, G_N_ELEMENTS(expected),
-        expected_joins, G_N_ELEMENTS(expected_joins));
+        expected_joins, G_N_ELEMENTS(expected_joins), digest);
 
-    unlink(jit_path);
-    unlink(event_path);
-    unlink(policy);
-    rmdir(run_dir);
+    if (!preserve) {
+        unlink(jit_path);
+        unlink(event_path);
+        if (!external_policy) {
+            unlink(policy);
+        }
+        rmdir(run_dir);
+    }
     g_free(server);
 }
 
@@ -1551,11 +1601,13 @@ static void t2_jext_cfmws_failure_case(
         g_assert_true(server->write_committed);
         t2_assert_jit_event_log(
             jit_path, completion_failure,
-            G_N_ELEMENTS(completion_failure), &expected_join, 1);
+            G_N_ELEMENTS(completion_failure), &expected_join, 1,
+            T2_FAKE_POLICY_DIGEST);
     } else {
         t2_assert_jit_event_log(
             jit_path, request_failure,
-            G_N_ELEMENTS(request_failure), &expected_join, 1);
+            G_N_ELEMENTS(request_failure), &expected_join, 1,
+            T2_FAKE_POLICY_DIGEST);
     }
 
     unlink(jit_path);
