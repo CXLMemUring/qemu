@@ -53,6 +53,15 @@ typedef enum {
 /* Bias mode constants */
 #define CXL_BIAS_MODE_HOST      0   /* Host-biased: CPU is coherence home */
 #define CXL_BIAS_MODE_DEVICE    1   /* Device-biased: GPU snoop filter is home */
+#define CXL_BIAS_MODE_MASK      0xffULL
+#define CXL_BIAS_GRAN_SHIFT     8
+#define CXL_BIAS_GRAN_FLIT      64ULL
+#define CXL_BIAS_GRAN_PAGE_4K   4096ULL
+#define CXL_BIAS_GRAN_PAGE_2M   2097152ULL
+#define CXL_BIAS_ENCODE(mode, gran) ((((uint64_t)(gran)) << CXL_BIAS_GRAN_SHIFT) | \
+                                     ((uint64_t)(mode) & CXL_BIAS_MODE_MASK))
+#define CXL_BIAS_MODE(encoded)  ((uint8_t)((uint64_t)(encoded) & CXL_BIAS_MODE_MASK))
+#define CXL_BIAS_GRAN(encoded)  ((uint64_t)(encoded) >> CXL_BIAS_GRAN_SHIFT)
 
 /* Snoop filter entry */
 typedef struct CXLSnoopEntry {
@@ -61,6 +70,7 @@ typedef struct CXLSnoopEntry {
     uint8_t domain_mask;        /* Bitmask of domains holding this line */
     uint8_t owner_domain;       /* Domain that owns exclusive/modified copy */
     uint8_t bias_mode;          /* CXL_BIAS_MODE_HOST or CXL_BIAS_MODE_DEVICE */
+    uint64_t bias_granularity;  /* Bias ownership granularity in bytes */
     uint8_t flags;
     #define CXL_SNOOP_FLAG_DIRTY    (1 << 0)
     #define CXL_SNOOP_FLAG_PENDING  (1 << 1)
@@ -229,10 +239,10 @@ void cxl_bar_coherency_dump_stats(CXLBARCoherencyState *state);
 
 /* Bias mode control */
 void cxl_bar_set_bias(CXLBARCoherencyState *state,
-                      uint64_t addr, uint64_t size, uint8_t bias_mode);
-uint8_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr);
+                      uint64_t addr, uint64_t size, uint64_t encoded_bias);
+uint64_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr);
 void cxl_bar_bias_flip(struct CXLType2State *ct2d,
-                       uint64_t addr, uint64_t size, uint8_t new_bias);
+                       uint64_t addr, uint64_t size, uint64_t encoded_bias);
 
 /* Atomic operation support */
 typedef enum {

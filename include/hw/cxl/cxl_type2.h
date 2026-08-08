@@ -160,6 +160,9 @@ typedef struct CXLType2State {
     /* Enhanced BAR coherency tracking */
     CXLBARCoherencyState bar_coherency;
 
+    /* Directory (snoop filter) capacity override - 0 means use built-in default */
+    uint32_t directory_entries;
+
     /* P2P DMA engine for Type2 <-> Type3 transfers */
     CXLP2PDMAEngine p2p_engine;
 

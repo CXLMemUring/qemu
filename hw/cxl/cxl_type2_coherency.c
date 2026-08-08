@@ -295,6 +295,87 @@ void cxl_bar_snoop_update(CXLBARCoherencyState *state, uint64_t addr,
     qemu_mutex_unlock(&state->lock);
 }
 
+/* Find an approximate-LRU victim in the snoop filter for eviction. */
+static gboolean cxl_bar_find_lru_victim(gpointer key, gpointer value, gpointer ud)
+{
+    (void)key;
+    struct { CXLSnoopEntry *best; } *state = ud;
+    CXLSnoopEntry *cur = value;
+    if (!state->best || cur->timestamp < state->best->timestamp) {
+        state->best = cur;
+    }
+    return FALSE;
+}
+
+static void cxl_bar_evict_one_locked(CXLBARCoherencyState *state)
+{
+    struct { CXLSnoopEntry *best; } search = { NULL };
+    g_hash_table_foreach(state->snoop_filter, (GHFunc)cxl_bar_find_lru_victim, &search);
+    if (search.best) {
+        uint64_t victim_addr = search.best->addr;
+        if (search.best->state == CXL_COHERENCY_MODIFIED) {
+            state->stats.writebacks++;
+        }
+        if (g_hash_table_remove(state->snoop_filter, &victim_addr)) {
+            state->snoop_filter_size--;
+            state->stats.evictions++;
+        }
+    }
+}
+
+/* Internal helper: insert without acquiring state->lock (caller holds it). */
+static void cxl_bar_snoop_insert_locked(CXLBARCoherencyState *state,
+                                        uint64_t addr,
+                                        uint8_t state_val,
+                                        CXLCoherencyDomain domain)
+{
+    uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
+
+    CXLSnoopEntry *existing = g_hash_table_lookup(state->snoop_filter,
+                                                   &aligned_addr);
+    if (existing) {
+        existing->state = state_val;
+        existing->domain_mask |= (1 << domain);
+        if (state_val == CXL_COHERENCY_EXCLUSIVE ||
+            state_val == CXL_COHERENCY_MODIFIED) {
+            existing->owner_domain = domain;
+        }
+        existing->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        existing->access_count++;
+    } else {
+        /* Enforce capacity: evict one approximate-LRU entry when at the cap. */
+        while (state->snoop_filter_capacity > 0 &&
+               state->snoop_filter_size >= state->snoop_filter_capacity) {
+            uint32_t before = state->snoop_filter_size;
+            cxl_bar_evict_one_locked(state);
+            if (state->snoop_filter_size >= before) break; /* no progress */
+        }
+        uint64_t *key = g_new(uint64_t, 1);
+        CXLSnoopEntry *entry = g_new0(CXLSnoopEntry, 1);
+        *key = aligned_addr;
+        entry->addr = aligned_addr;
+        entry->state = state_val;
+        entry->domain_mask = (1 << domain);
+        entry->owner_domain = domain;
+        entry->flags = 0;
+        entry->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        entry->access_count = 1;
+        g_hash_table_insert(state->snoop_filter, key, entry);
+        state->snoop_filter_size++;
+    }
+}
+
+/* Internal helper: remove without acquiring state->lock (caller holds it). */
+static void cxl_bar_snoop_remove_locked(CXLBARCoherencyState *state,
+                                        uint64_t addr)
+{
+    uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
+    if (g_hash_table_remove(state->snoop_filter, &aligned_addr)) {
+        state->snoop_filter_size--;
+        state->stats.evictions++;
+    }
+}
+
 void cxl_bar_snoop_remove(CXLBARCoherencyState *state, uint64_t addr)
 {
     uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
@@ -338,7 +419,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (!entry) {
             /* Cache miss - fetch from memory */
             response = CXL_COH_RSP_S;
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_SHARED, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_SHARED, source);
         } else if (entry->state == CXL_COHERENCY_MODIFIED) {
             /* Need writeback from owner first */
             state->stats.writebacks++;
@@ -368,7 +449,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (!entry) {
             /* Cache miss - allocate exclusive */
             response = CXL_COH_RSP_E;
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_EXCLUSIVE, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_EXCLUSIVE, source);
         } else {
             /* Check bias mode for fast path */
             if (entry->bias_mode == CXL_BIAS_MODE_DEVICE &&
@@ -417,7 +498,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             entry->owner_domain = source;
             entry->flags |= CXL_SNOOP_FLAG_DIRTY;
         } else {
-            cxl_bar_snoop_insert(state, addr, CXL_COHERENCY_MODIFIED, source);
+            cxl_bar_snoop_insert_locked(state, addr, CXL_COHERENCY_MODIFIED, source);
             entry = g_hash_table_lookup(state->snoop_filter, &aligned_addr);
             if (entry) {
                 entry->flags |= CXL_SNOOP_FLAG_DIRTY;
@@ -448,7 +529,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
         if (entry) {
             entry->domain_mask &= ~(1 << source);
             if (entry->domain_mask == 0) {
-                cxl_bar_snoop_remove(state, addr);
+                cxl_bar_snoop_remove_locked(state, addr);
             }
         }
         response = CXL_COH_RSP_I;
@@ -461,7 +542,7 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
             entry->domain_mask &= ~(1 << source);
             entry->flags &= ~CXL_SNOOP_FLAG_DIRTY;
             if (entry->domain_mask == 0) {
-                cxl_bar_snoop_remove(state, addr);
+                cxl_bar_snoop_remove_locked(state, addr);
             } else {
                 entry->state = CXL_COHERENCY_SHARED;
             }
@@ -475,11 +556,6 @@ CXLCoherencyRspType cxl_bar_coherency_request(CXLBARCoherencyState *state,
     }
 
     qemu_mutex_unlock(&state->lock);
-
-    qemu_log_mask(LOG_TRACE,
-                 "CXL BAR Coherency: req=%d addr=0x%lx src=%d -> rsp=%d\n",
-                 req, addr, source, response);
-
     return response;
 }
 
@@ -783,12 +859,35 @@ void cxl_bar_cache_writeback(CXLBARCoherencyState *state,
  * Bias Mode Control
  * ======================================================================== */
 
-void cxl_bar_set_bias(CXLBARCoherencyState *state,
-                      uint64_t addr, uint64_t size, uint8_t bias_mode)
+static uint64_t cxl_bias_decode(uint64_t encoded_bias, uint8_t *bias_mode)
 {
-    uint64_t aligned_start = addr & CXL_CACHE_LINE_MASK;
-    uint64_t aligned_end = (addr + size + CXL_CACHE_LINE_SIZE - 1) &
-                           CXL_CACHE_LINE_MASK;
+    uint64_t granularity = CXL_BIAS_GRAN(encoded_bias);
+
+    *bias_mode = CXL_BIAS_MODE(encoded_bias);
+    if (encoded_bias == CXL_BIAS_MODE_HOST || encoded_bias == CXL_BIAS_MODE_DEVICE) {
+        granularity = CXL_BIAS_GRAN_FLIT;
+    }
+    if (granularity == 0) {
+        granularity = CXL_BIAS_GRAN_FLIT;
+    }
+
+    return granularity;
+}
+
+void cxl_bar_set_bias(CXLBARCoherencyState *state,
+                      uint64_t addr, uint64_t size, uint64_t encoded_bias)
+{
+    uint8_t bias_mode;
+    uint64_t granularity = cxl_bias_decode(encoded_bias, &bias_mode);
+    uint64_t gran_mask = granularity - 1;
+    uint64_t aligned_start = addr & ~gran_mask;
+    uint64_t aligned_end = (addr + size + granularity - 1) & ~gran_mask;
+
+    if (bias_mode > CXL_BIAS_MODE_DEVICE ||
+        granularity < CXL_BIAS_GRAN_FLIT ||
+        (granularity & (granularity - 1)) != 0) {
+        return;
+    }
 
     qemu_mutex_lock(&state->lock);
 
@@ -796,6 +895,7 @@ void cxl_bar_set_bias(CXLBARCoherencyState *state,
         CXLSnoopEntry *entry = g_hash_table_lookup(state->snoop_filter, &a);
         if (entry) {
             entry->bias_mode = bias_mode;
+            entry->bias_granularity = granularity;
         } else {
             /* Create entry with the bias setting */
             uint64_t *key = g_new(uint64_t, 1);
@@ -804,6 +904,7 @@ void cxl_bar_set_bias(CXLBARCoherencyState *state,
             new_entry->addr = a;
             new_entry->state = CXL_COHERENCY_INVALID;
             new_entry->bias_mode = bias_mode;
+            new_entry->bias_granularity = granularity;
             new_entry->timestamp = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             g_hash_table_insert(state->snoop_filter, key, new_entry);
             state->snoop_filter_size++;
@@ -813,15 +914,17 @@ void cxl_bar_set_bias(CXLBARCoherencyState *state,
     qemu_mutex_unlock(&state->lock);
 
     qemu_log_mask(LOG_TRACE,
-                 "CXL BAR Bias: Set 0x%lx-0x%lx to %s\n",
+                 "CXL BAR Bias: Set 0x%lx-0x%lx to %s granularity=%luB\n",
                  (unsigned long)aligned_start, (unsigned long)aligned_end,
-                 bias_mode == CXL_BIAS_MODE_DEVICE ? "device" : "host");
+                 bias_mode == CXL_BIAS_MODE_DEVICE ? "device" : "host",
+                 (unsigned long)granularity);
 }
 
-uint8_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr)
+uint64_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr)
 {
     uint64_t aligned_addr = addr & CXL_CACHE_LINE_MASK;
     uint8_t bias = CXL_BIAS_MODE_HOST; /* Default to host-biased */
+    uint64_t granularity = CXL_BIAS_GRAN_FLIT;
 
     qemu_mutex_lock(&state->lock);
 
@@ -829,19 +932,29 @@ uint8_t cxl_bar_get_bias(CXLBARCoherencyState *state, uint64_t addr)
                                                 &aligned_addr);
     if (entry) {
         bias = entry->bias_mode;
+        granularity = entry->bias_granularity ? entry->bias_granularity
+                                              : CXL_BIAS_GRAN_FLIT;
     }
 
     qemu_mutex_unlock(&state->lock);
-    return bias;
+    return granularity == CXL_BIAS_GRAN_FLIT ? bias : CXL_BIAS_ENCODE(bias, granularity);
 }
 
 void cxl_bar_bias_flip(CXLType2State *ct2d,
-                       uint64_t addr, uint64_t size, uint8_t new_bias)
+                       uint64_t addr, uint64_t size, uint64_t encoded_bias)
 {
     CXLBARCoherencyState *state = &ct2d->bar_coherency;
-    uint64_t aligned_start = addr & CXL_CACHE_LINE_MASK;
-    uint64_t aligned_end = (addr + size + CXL_CACHE_LINE_SIZE - 1) &
-                           CXL_CACHE_LINE_MASK;
+    uint8_t new_bias;
+    uint64_t granularity = cxl_bias_decode(encoded_bias, &new_bias);
+    uint64_t gran_mask = granularity - 1;
+    uint64_t aligned_start = addr & ~gran_mask;
+    uint64_t aligned_end = (addr + size + granularity - 1) & ~gran_mask;
+
+    if (new_bias > CXL_BIAS_MODE_DEVICE ||
+        granularity < CXL_BIAS_GRAN_FLIT ||
+        (granularity & (granularity - 1)) != 0) {
+        return;
+    }
 
     /* Step 1: Flush old home domain caches */
     if (new_bias == CXL_BIAS_MODE_DEVICE) {
@@ -865,7 +978,7 @@ void cxl_bar_bias_flip(CXLType2State *ct2d,
     }
 
     /* Step 2: Set the new bias mode */
-    cxl_bar_set_bias(state, addr, size, new_bias);
+    cxl_bar_set_bias(state, addr, size, encoded_bias);
 
     /* Step 3: Update statistics */
     qemu_mutex_lock(&state->lock);
@@ -875,9 +988,10 @@ void cxl_bar_bias_flip(CXLType2State *ct2d,
     /* Step 4: Memory fence to ensure ordering */
     __sync_synchronize();
 
-    qemu_log("CXL BAR Bias: Flip 0x%lx-0x%lx to %s (total flips: %lu)\n",
+    qemu_log("CXL BAR Bias: Flip 0x%lx-0x%lx to %s granularity=%luB (total flips: %lu)\n",
              (unsigned long)aligned_start, (unsigned long)aligned_end,
              new_bias == CXL_BIAS_MODE_DEVICE ? "device" : "host",
+             (unsigned long)granularity,
              (unsigned long)state->stats.bias_flips);
 }
 

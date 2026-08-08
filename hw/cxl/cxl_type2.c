@@ -48,6 +48,85 @@
 static void cxl_type2_hetgpu_coherency_callback(void *opaque, uint64_t addr,
                                                  uint64_t size, bool invalidate);
 
+#define CXL_T2_MAX_KERNEL_ARGS 64
+
+static bool cxl_type2_simulate_hitm_kernel(CXLType2State *ct2d,
+                                           const HetGPULaunchConfig *config,
+                                           const uint64_t *arg_values,
+                                           size_t num_args)
+{
+    uint64_t base;
+    uint32_t lines;
+    uint32_t seq;
+    uint64_t bytes;
+    uint64_t launched_threads;
+    uint8_t *mem;
+
+    if (num_args != 3 || !config) {
+        return false;
+    }
+
+    base = arg_values[0];
+    lines = (uint32_t)arg_values[1];
+    seq = (uint32_t)arg_values[2];
+    bytes = (uint64_t)lines * 64;
+    launched_threads = (uint64_t)config->grid_dim[0] *
+                       (uint64_t)config->grid_dim[1] *
+                       (uint64_t)config->grid_dim[2] *
+                       (uint64_t)config->block_dim[0] *
+                       (uint64_t)config->block_dim[1] *
+                       (uint64_t)config->block_dim[2];
+
+    if (lines == 0 || lines > launched_threads ||
+        base > ct2d->device_mem_size || bytes > ct2d->device_mem_size - base) {
+        return false;
+    }
+
+    if (base >= ct2d->coherent_pool.base_offset &&
+        base - ct2d->coherent_pool.base_offset <= ct2d->coherent_pool.size &&
+        bytes <= ct2d->coherent_pool.size - (base - ct2d->coherent_pool.base_offset)) {
+        mem = memory_region_get_ram_ptr(&ct2d->coherent_pool_region);
+        if (mem) {
+            mem += base - ct2d->coherent_pool.base_offset;
+        }
+    } else if (base < ct2d->bulk_transfer_size &&
+               bytes <= ct2d->bulk_transfer_size - base) {
+        mem = ct2d->bulk_transfer_ptr ? (uint8_t *)ct2d->bulk_transfer_ptr + base : NULL;
+    } else {
+        mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (mem) {
+            mem += base;
+        }
+    }
+
+    if (!mem) {
+        return false;
+    }
+
+    if (ct2d->bar_coherency.enabled) {
+        cxl_bar_notify_gpu_access(&ct2d->bar_coherency, base, bytes, false);
+        cxl_bar_notify_gpu_access(&ct2d->bar_coherency, base, bytes, true);
+    }
+
+    for (uint32_t i = 0; i < lines; i++) {
+        uint8_t *line = mem + (uint64_t)i * 64;
+        uint32_t counter;
+        uint32_t checksum;
+
+        memcpy(&counter, line, sizeof(counter));
+        counter++;
+        checksum = counter ^ seq;
+        memcpy(line, &counter, sizeof(counter));
+        memcpy(line + 4, &seq, sizeof(seq));
+        memcpy(line + 12, &checksum, sizeof(checksum));
+    }
+
+    ct2d->stats.gpu_accesses += lines;
+    qemu_log("CXL Type2: Simulated gpu_hitm_touch base=0x%lx lines=%u seq=%u\n",
+             (unsigned long)base, lines, seq);
+    return true;
+}
+
 /* ========================================================================
  * Coherency Protocol Implementation
  * ======================================================================== */
@@ -1288,8 +1367,8 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
         /* Cache hit */
         memcpy(&value, &line->data[offset], MIN(size, 64 - offset));
 
-        qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read hit at 0x%lx = 0x%lx\n",
-                     addr, value);
+        // qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read hit at 0x%lx = 0x%lx\n",
+        //              addr, value);
     } else {
         /* Cache miss - fetch from device memory */
         uint8_t *mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
@@ -1317,8 +1396,8 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
                                  (char *)&msg, sizeof(msg), NULL);
         }
 
-        qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read miss at 0x%lx = 0x%lx\n",
-                     addr, value);
+        // qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read miss at 0x%lx = 0x%lx\n",
+        //              addr, value);
     }
 
     ct2d->stats.read_ops++;
@@ -1902,13 +1981,31 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
                 config.stream = NULL;
 
-                /* Kernel args are in data buffer as array of pointers */
+                /* Kernel args are marshaled by the guest shim as 8-byte values.
+                 * CUDA wants an array of host pointers to each argument value.
+                 */
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
-                void **args = (void **)ct2d->gpu_cmd.data;
+                uint64_t *arg_values = (uint64_t *)ct2d->gpu_cmd.data;
+                void *arg_ptrs[CXL_T2_MAX_KERNEL_ARGS];
+
+                if (num_args > CXL_T2_MAX_KERNEL_ARGS ||
+                    (uint64_t)num_args * sizeof(arg_values[0]) > ct2d->gpu_cmd.data_size) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+
+                for (uint32_t i = 0; i < num_args; i++) {
+                    arg_ptrs[i] = &arg_values[i];
+                }
+
+                if (hetgpu->backend == HETGPU_BACKEND_SIMULATION &&
+                    cxl_type2_simulate_hitm_kernel(ct2d, &config, arg_values, num_args)) {
+                    break;
+                }
 
                 err = hetgpu_launch_kernel(hetgpu,
                                            ct2d->gpu_cmd.functions[func_id],
-                                           &config, args, num_args);
+                                           &config, arg_ptrs, num_args);
                 if (err != HETGPU_SUCCESS) {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_LAUNCH_FAILED;
                 }
@@ -2236,12 +2333,22 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         {
             uint64_t bias_addr = ct2d->gpu_cmd.params[0];
             uint64_t bias_size = ct2d->gpu_cmd.params[1];
-            uint8_t bias_mode = (uint8_t)ct2d->gpu_cmd.params[2];
-            if (bias_mode > CXL_BIAS_DEVICE) {
+            uint64_t encoded_bias = ct2d->gpu_cmd.params[2];
+            uint8_t bias_mode = CXL_BIAS_MODE(encoded_bias);
+            uint64_t bias_granularity = CXL_BIAS_GRAN(encoded_bias);
+            if (encoded_bias == CXL_BIAS_HOST || encoded_bias == CXL_BIAS_DEVICE) {
+                bias_granularity = CXL_BIAS_GRAN_FLIT;
+            }
+            if (bias_granularity == 0) {
+                bias_granularity = CXL_BIAS_GRAN_FLIT;
+            }
+            if (bias_mode > CXL_BIAS_DEVICE ||
+                bias_granularity < CXL_BIAS_GRAN_FLIT ||
+                (bias_granularity & (bias_granularity - 1)) != 0) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             } else {
                 cxl_bar_set_bias(&ct2d->bar_coherency, bias_addr, bias_size,
-                                 bias_mode);
+                                 encoded_bias);
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
             }
         }
@@ -2260,11 +2367,21 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         {
             uint64_t flip_addr = ct2d->gpu_cmd.params[0];
             uint64_t flip_size = ct2d->gpu_cmd.params[1];
-            uint8_t new_bias = (uint8_t)ct2d->gpu_cmd.params[2];
-            if (new_bias > CXL_BIAS_DEVICE) {
+            uint64_t encoded_bias = ct2d->gpu_cmd.params[2];
+            uint8_t new_bias = CXL_BIAS_MODE(encoded_bias);
+            uint64_t bias_granularity = CXL_BIAS_GRAN(encoded_bias);
+            if (encoded_bias == CXL_BIAS_HOST || encoded_bias == CXL_BIAS_DEVICE) {
+                bias_granularity = CXL_BIAS_GRAN_FLIT;
+            }
+            if (bias_granularity == 0) {
+                bias_granularity = CXL_BIAS_GRAN_FLIT;
+            }
+            if (new_bias > CXL_BIAS_DEVICE ||
+                bias_granularity < CXL_BIAS_GRAN_FLIT ||
+                (bias_granularity & (bias_granularity - 1)) != 0) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             } else {
-                cxl_bar_bias_flip(ct2d, flip_addr, flip_size, new_bias);
+                cxl_bar_bias_flip(ct2d, flip_addr, flip_size, encoded_bias);
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
             }
         }
@@ -2589,6 +2706,11 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Initialize enhanced BAR coherency tracking */
     cxl_bar_coherency_init(&ct2d->bar_coherency);
+    if (ct2d->directory_entries != 0) {
+        ct2d->bar_coherency.snoop_filter_capacity = ct2d->directory_entries;
+        qemu_log("CXL Type2: directory capacity overridden to %u entries\n",
+                 ct2d->directory_entries);
+    }
 
     /* Initialize P2P DMA engine */
     cxl_p2p_dma_init(&ct2d->p2p_engine, ct2d);
@@ -2857,6 +2979,8 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_INT32("hetgpu-device", CXLType2State, gpu_info.hetgpu_device_index, 0),
     DEFINE_PROP_UINT32("hetgpu-backend", CXLType2State, gpu_info.hetgpu_backend,
                        HETGPU_BACKEND_AUTO),
+    /* Directory (snoop filter) capacity override; 0 = keep built-in default. */
+    DEFINE_PROP_UINT32("directory-entries", CXLType2State, directory_entries, 0),
 };
 
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)

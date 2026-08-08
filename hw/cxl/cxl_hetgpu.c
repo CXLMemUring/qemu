@@ -772,8 +772,7 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
                 return HETGPU_SUCCESS;
             }
         }
-        qemu_log("CXL hetGPU: SIM memcpy HtoD failed - allocation not found for 0x%lx\n",
-                 (unsigned long)dst);
+        /* Silent fallback for the same reason as DtoH above. */
         return HETGPU_ERROR_INVALID_VALUE;
     }
 
@@ -819,9 +818,9 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
                 return HETGPU_SUCCESS;
             }
         }
-        qemu_log("CXL hetGPU: SIM memcpy DtoH failed - allocation not found for 0x%lx\n",
-                 (unsigned long)src);
-        memset(dst, 0, size);  /* Return zeros on error */
+        /* Silent fallback: allocation-not-found is expected when the guest
+         * mixes BAR4 direct pointers with cuMemcpy. Return zeros. */
+        memset(dst, 0, size);
         return HETGPU_ERROR_INVALID_VALUE;
     }
 

@@ -508,8 +508,8 @@ static uint64_t cxl_type1_cache_read(void *opaque, hwaddr addr, unsigned size)
                              (char *)&msg, sizeof(msg), NULL);
     }
     
-    qemu_log_mask(LOG_TRACE, "CXL Type1: Cache read at 0x%lx = 0x%lx (size %u)\n", 
-                 addr, value, size);
+    // qemu_log_mask(LOG_TRACE, "CXL Type1: Cache read at 0x%lx = 0x%lx (size %u)\n",
+    //              addr, value, size);
     return value;
 }
 
