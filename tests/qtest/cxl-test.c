@@ -104,6 +104,7 @@
 #define T2_POOL_TEST_BAR4_BASE UINT64_C(0xe0000000)
 #define T2_V2_HOST_SESSION UINT64_C(0x1001)
 #define T2_V2_DEVICE_SESSION UINT64_C(0x2001)
+#define T2_V2_FAKE_LINE_COUNT 64
 #define T2_FAKE_POLICY_DIGEST \
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5" \
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
@@ -476,8 +477,32 @@ typedef struct T2V2FakeServer {
     unsigned requests[2][CXL_MEMSIM_V2_OP_FENCE + 1];
     uint64_t line_address;
     uint64_t epoch;
-    uint8_t line[CXL_MEMSIM_V2_LINE_SIZE];
+    uint8_t lines[T2_V2_FAKE_LINE_COUNT][CXL_MEMSIM_V2_LINE_SIZE];
+    int fail_device_get_line;
+    int fail_device_put_line;
+    gint device_putm_requests;
+    gint send_device_snoop_line;
+    gint device_snoop_sent;
+    gint device_snoop_acked;
+    uint16_t device_snoop_status;
 } T2V2FakeServer;
+
+static uint8_t *t2_v2_fake_line(T2V2FakeServer *server, uint64_t address)
+{
+    uint64_t line_address = address &
+        ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+    uint64_t index;
+
+    if (line_address < server->line_address) {
+        return NULL;
+    }
+    index = (line_address - server->line_address) /
+        CXL_MEMSIM_V2_LINE_SIZE;
+    if (index >= T2_V2_FAKE_LINE_COUNT) {
+        return NULL;
+    }
+    return server->lines[index];
+}
 
 static void t2_v2_frame_init(uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE],
                              uint16_t opcode)
@@ -572,9 +597,33 @@ static bool t2_v2_send_response(T2V2FakeServer *server, uint16_t endpoint,
     stq_le_p(response + 56, epoch);
     stq_le_p(response + 88, old_value);
     if (include_line) {
+        uint8_t *line = t2_v2_fake_line(server,
+                                        ldq_le_p(request + 48));
+
+        if (!line) {
+            return false;
+        }
         stw_le_p(response + 20, CXL_MEMSIM_V2_LINE_SIZE);
-        memcpy(response + 104, server->line, sizeof(server->line));
+        memcpy(response + 104, line, CXL_MEMSIM_V2_LINE_SIZE);
     }
+    return t2_write_exact(server->client_fd[endpoint], response,
+                          sizeof(response));
+}
+
+static bool t2_v2_send_error_response(T2V2FakeServer *server,
+                                      uint16_t endpoint,
+                                      const uint8_t *request,
+                                      uint16_t status)
+{
+    uint8_t response[CXL_MEMSIM_V2_FRAME_SIZE];
+
+    t2_v2_frame_init(response, CXL_MEMSIM_V2_OP_RESPONSE);
+    stw_le_p(response + 12, status);
+    stw_le_p(response + 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
+    stw_le_p(response + 18, endpoint);
+    stq_le_p(response + 24, ldq_le_p(request + 24));
+    stq_le_p(response + 40, server->sessions[endpoint]);
+    stq_le_p(response + 48, ldq_le_p(request + 48));
     return t2_write_exact(server->client_fd[endpoint], response,
                           sizeof(response));
 }
@@ -587,36 +636,75 @@ static bool t2_v2_handle_request(T2V2FakeServer *server,
     uint16_t opcode;
     unsigned line_offset;
     uint64_t old_value;
+    uint8_t *line;
+    int fail_device_get_line;
+    int fail_device_put_line;
 
+    opcode = lduw_le_p(request + 6);
+    if (opcode == CXL_MEMSIM_V2_OP_SNOOP_ACK) {
+        uint8_t *ack_line = t2_v2_fake_line(server, address);
+
+        if (endpoint != CXL_MEMSIM_V2_DEVICE_ENDPOINT || !ack_line ||
+            ldq_le_p(request + 32) != 501 ||
+            ldq_le_p(request + 40) != server->sessions[endpoint]) {
+            return false;
+        }
+        server->device_snoop_status = lduw_le_p(request + 12);
+        if (lduw_le_p(request + 20) == CXL_MEMSIM_V2_LINE_SIZE) {
+            memcpy(ack_line, request + 104, CXL_MEMSIM_V2_LINE_SIZE);
+        }
+        g_atomic_int_set(&server->device_snoop_acked, 1);
+        return true;
+    }
     if (!t2_v2_request_valid(server, endpoint, request, &opcode)) {
         return false;
     }
     server->request_sessions[endpoint] = ldq_le_p(request + 40);
     server->requests[endpoint][opcode]++;
+    line = t2_v2_fake_line(server, address);
+    fail_device_get_line = g_atomic_int_get(
+        &server->fail_device_get_line);
+    fail_device_put_line = g_atomic_int_get(
+        &server->fail_device_put_line);
 
     switch (opcode) {
     case CXL_MEMSIM_V2_OP_GETS:
-        return address == server->line_address &&
+        return line && address % CXL_MEMSIM_V2_LINE_SIZE == 0 &&
                t2_v2_send_response(server, endpoint, request,
                                    CXL_MEMSIM_V2_STATE_E,
                                    ++server->epoch, true, 0);
     case CXL_MEMSIM_V2_OP_GETM:
-        return address == server->line_address &&
+        if (line && endpoint == CXL_MEMSIM_V2_DEVICE_ENDPOINT &&
+            fail_device_get_line >= 0 &&
+            line == server->lines[fail_device_get_line]) {
+            return t2_v2_send_error_response(
+                server, endpoint, request,
+                CXL_MEMSIM_V2_STATUS_IO_ERROR);
+        }
+        return line && address % CXL_MEMSIM_V2_LINE_SIZE == 0 &&
                t2_v2_send_response(server, endpoint, request,
                                    CXL_MEMSIM_V2_STATE_M,
                                    ++server->epoch, true, 0);
     case CXL_MEMSIM_V2_OP_PUTS:
-        return address == server->line_address &&
+        return line && address % CXL_MEMSIM_V2_LINE_SIZE == 0 &&
                lduw_le_p(request + 20) == 0 &&
                t2_v2_send_response(server, endpoint, request,
                                    CXL_MEMSIM_V2_STATE_I,
                                    ++server->epoch, false, 0);
     case CXL_MEMSIM_V2_OP_PUTM:
-        if (address != server->line_address ||
+        if (!line || address % CXL_MEMSIM_V2_LINE_SIZE ||
             lduw_le_p(request + 20) != CXL_MEMSIM_V2_LINE_SIZE) {
             return false;
         }
-        memcpy(server->line, request + 104, sizeof(server->line));
+        if (endpoint == CXL_MEMSIM_V2_DEVICE_ENDPOINT &&
+            fail_device_put_line >= 0 &&
+            line == server->lines[fail_device_put_line]) {
+            return t2_v2_send_error_response(
+                server, endpoint, request,
+                CXL_MEMSIM_V2_STATUS_IO_ERROR);
+        }
+        g_atomic_int_inc(&server->device_putm_requests);
+        memcpy(line, request + 104, CXL_MEMSIM_V2_LINE_SIZE);
         return t2_v2_send_response(server, endpoint, request,
                                    CXL_MEMSIM_V2_STATE_I,
                                    ++server->epoch, false, 0);
@@ -628,12 +716,12 @@ static bool t2_v2_handle_request(T2V2FakeServer *server,
             return false;
         }
         line_offset = address - server->line_address;
-        old_value = ldq_le_p(server->line + line_offset);
+        old_value = ldq_le_p(server->lines[0] + line_offset);
         if (opcode == CXL_MEMSIM_V2_OP_ATOMIC_FAA) {
-            stq_le_p(server->line + line_offset,
+            stq_le_p(server->lines[0] + line_offset,
                      old_value + ldq_le_p(request + 80));
         } else if (old_value == ldq_le_p(request + 72)) {
-            stq_le_p(server->line + line_offset,
+            stq_le_p(server->lines[0] + line_offset,
                      ldq_le_p(request + 80));
         }
         return t2_v2_send_response(server, endpoint, request,
@@ -646,6 +734,34 @@ static bool t2_v2_handle_request(T2V2FakeServer *server,
     default:
         return false;
     }
+}
+
+static bool t2_v2_maybe_send_device_snoop(T2V2FakeServer *server)
+{
+    int line_index = g_atomic_int_get(&server->send_device_snoop_line);
+    uint8_t snoop[CXL_MEMSIM_V2_FRAME_SIZE];
+    bool sent;
+
+    if (line_index < 0) {
+        return true;
+    }
+    g_atomic_int_set(&server->send_device_snoop_line, -1);
+    t2_v2_frame_init(snoop, CXL_MEMSIM_V2_OP_SNP_DATA_INV);
+    stw_le_p(snoop + 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
+    stw_le_p(snoop + 18, CXL_MEMSIM_V2_DEVICE_ENDPOINT);
+    stq_le_p(snoop + 32, 501);
+    stq_le_p(snoop + 40,
+             server->sessions[CXL_MEMSIM_V2_DEVICE_ENDPOINT]);
+    stq_le_p(snoop + 48, server->line_address +
+             line_index * CXL_MEMSIM_V2_LINE_SIZE);
+    stq_le_p(snoop + 56, ++server->epoch);
+    sent = t2_write_exact(
+        server->client_fd[CXL_MEMSIM_V2_DEVICE_ENDPOINT],
+        snoop, sizeof(snoop));
+    if (sent) {
+        g_atomic_int_set(&server->device_snoop_sent, 1);
+    }
+    return sent;
 }
 
 static bool t2_v2_accept_endpoint(T2V2FakeServer *server)
@@ -710,6 +826,11 @@ static gpointer t2_v2_fake_server_thread(gpointer opaque)
     while (!g_atomic_int_get(&server->stop) && live) {
         int ready = poll(clients, G_N_ELEMENTS(clients), 50);
 
+        if (!t2_v2_maybe_send_device_snoop(server)) {
+            server->error_code = EPROTO;
+            break;
+        }
+
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -768,6 +889,9 @@ static T2V2FakeServer *t2_v2_fake_server_start(void)
     server->sessions[CXL_MEMSIM_V2_HOST_ENDPOINT] = T2_V2_HOST_SESSION;
     server->sessions[CXL_MEMSIM_V2_DEVICE_ENDPOINT] = T2_V2_DEVICE_SESSION;
     server->line_address = T2_SENTINEL_DPA;
+    server->fail_device_get_line = -1;
+    server->fail_device_put_line = -1;
+    server->send_device_snoop_line = -1;
     server->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     g_assert_cmpint(server->listen_fd, >=, 0);
     g_assert_cmpint(setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR,
@@ -1106,9 +1230,9 @@ static void t2_program_direct_endpoint_bar2(QTestState *qts, uint64_t base)
     t2_program_endpoint_bar2_on_bus(qts, 53, 0, base);
 }
 
-static void t2_v2_execute_bar2_command(QTestState *qts, uint64_t bar2,
-                                       uint32_t command, uint64_t param0,
-                                       uint64_t param1, uint64_t param2)
+static uint32_t t2_v2_issue_bar2_command(QTestState *qts, uint64_t bar2,
+                                         uint32_t command, uint64_t param0,
+                                         uint64_t param1, uint64_t param2)
 {
     qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0, param0);
     qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM1, param1);
@@ -1116,8 +1240,33 @@ static void t2_v2_execute_bar2_command(QTestState *qts, uint64_t bar2,
     qtest_writel(qts, bar2 + CXL_GPU_REG_CMD, command);
     g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
                      ==, CXL_GPU_CMD_STATUS_COMPLETE);
-    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+    return qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT);
+}
+
+static void t2_v2_execute_bar2_command(QTestState *qts, uint64_t bar2,
+                                       uint32_t command, uint64_t param0,
+                                       uint64_t param1, uint64_t param2)
+{
+    g_assert_cmpuint(t2_v2_issue_bar2_command(
+                         qts, bar2, command, param0, param1, param2),
                      ==, CXL_GPU_SUCCESS);
+}
+
+typedef struct T2V2LaunchThread {
+    QTestState *qts;
+    uint32_t result;
+} T2V2LaunchThread;
+
+static gpointer t2_v2_launch_thread(gpointer opaque)
+{
+    T2V2LaunchThread *launch = opaque;
+
+    qtest_writeq(launch->qts, T2_V2_BAR2_BASE + CXL_GPU_REG_PARAM3, 0);
+    qtest_writeq(launch->qts, T2_V2_BAR2_BASE + CXL_GPU_REG_PARAM4, 0);
+    launch->result = t2_v2_issue_bar2_command(
+        launch->qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL,
+        1, 1, UINT64_C(1) << 32);
+    return NULL;
 }
 
 static void t2_program_switch_decoder(QTestState *qts)
@@ -2746,6 +2895,221 @@ static void cxl_t2_v2_coherent_domain(void)
     g_free(server);
 }
 
+static void cxl_t2_v2_coherent_gpu_range_commands(void)
+{
+    g_autofree char *library = t2_hetgpu_fake_path();
+    g_autofree char *launch_entered = NULL;
+    g_autofree char *launch_release = NULL;
+    g_autoptr(GString) command = g_string_new(NULL);
+    T2V2FakeServer *server;
+    T2V2LaunchThread launch = { 0 };
+    GThread *launch_thread;
+    QTestState *qts;
+    uint64_t pool_offset;
+    unsigned putm_before;
+    uint32_t result;
+    bool acked_before_release;
+    int marker_fd;
+
+    marker_fd = g_file_open_tmp("cxl-t2-launch-entered-XXXXXX",
+                                &launch_entered, NULL);
+    g_assert_cmpint(marker_fd, >=, 0);
+    close(marker_fd);
+    unlink(launch_entered);
+    marker_fd = g_file_open_tmp("cxl-t2-launch-release-XXXXXX",
+                                &launch_release, NULL);
+    g_assert_cmpint(marker_fd, >=, 0);
+    close(marker_fd);
+    unlink(launch_release);
+    g_setenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED", launch_entered, true);
+    g_setenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE", launch_release, true);
+    server = t2_v2_fake_server_start();
+
+    server->line_address = 192 * MiB;
+    g_string_printf(
+        command,
+        QEMU_T2_V2_CFMWS_BASE
+        "-device cxl-type2,id=t2,bus=rp0,addr=0.0,sn=2,gpu-mode=2,"
+        "hetgpu-backend=3,hetgpu-lib=%s,coherency-enabled=true,"
+        "cache-size=128M,mem-size=256M,cxlmemsim-addr=127.0.0.1,"
+        "cxlmemsim-port=%u,coherence-v2=on,"
+        "coherence-v2-host-endpoint=0,coherence-v2-device-endpoint=1,"
+        "coherence-v2-cache-capacity=262144,coherence-v2-cache-ways=4,"
+        "coherence-v2-timeout-ms=2000,coherence-v2-write-through=off",
+        library, server->port);
+    qts = qtest_init(command->str);
+    t2_program_host_decoder(qts);
+    t2_program_direct_endpoint_bar2(qts, T2_V2_BAR2_BASE);
+
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_ALLOC,
+                               4096, 0, 0);
+    pool_offset = qtest_readq(qts, T2_V2_BAR2_BASE +
+                                      CXL_GPU_REG_RESULT0);
+    g_assert_cmphex(pool_offset, ==, server->line_address);
+
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset + 4096 - 32, 64, CXL_COH_RANGE_READ);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_INVALID_VALUE);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        UINT64_MAX - 31, 64, CXL_COH_RANGE_READ);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_INVALID_VALUE);
+
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset + 16, 80, CXL_COH_RANGE_READ);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 2);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT1),
+                    !=, 0);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COHERENT_FREE,
+        pool_offset, 0, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_RELEASE_RANGE,
+        pool_offset + 16, 80, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 2);
+
+    g_atomic_int_set(&server->fail_device_get_line, 1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset, 128, CXL_COH_RANGE_WRITE);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL, 0, 0, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+
+    g_atomic_int_set(&server->fail_device_get_line, -1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset, 128, CXL_COH_RANGE_WRITE);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 2);
+
+    g_atomic_int_set(&server->fail_device_put_line, 1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_RELEASE_RANGE,
+        pool_offset, 128, 1);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL, 0, 0, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+    g_atomic_int_set(&server->fail_device_put_line, -1);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_RELEASE_RANGE,
+        pool_offset, 128, 1);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT0),
+                     ==, 2);
+
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset, 128, CXL_COH_RANGE_WRITE);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+
+    qtest_memwrite(qts, T2_V2_BAR2_BASE + CXL_GPU_DATA_OFFSET,
+                   "fake-ptx", sizeof("fake-ptx"));
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_MODULE_LOAD_PTX, 0, 0, 0);
+    qtest_memwrite(qts, T2_V2_BAR2_BASE + CXL_GPU_DATA_OFFSET,
+                   "fake_kernel", sizeof("fake_kernel"));
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_FUNC_GET, 1, 0, 0);
+
+    launch.qts = qts;
+    launch_thread = g_thread_new("cxl-t2-v2-launch",
+                                 t2_v2_launch_thread, &launch);
+    for (unsigned int attempt = 0; attempt < 200; attempt++) {
+        if (g_file_test(launch_entered, G_FILE_TEST_EXISTS)) {
+            break;
+        }
+        g_usleep(10000);
+    }
+    g_assert_true(g_file_test(launch_entered, G_FILE_TEST_EXISTS));
+
+    g_atomic_int_set(&server->send_device_snoop_line, 0);
+    for (unsigned int attempt = 0; attempt < 200; attempt++) {
+        if (g_atomic_int_get(&server->device_snoop_sent)) {
+            break;
+        }
+        g_usleep(10000);
+    }
+    g_assert_true(g_atomic_int_get(&server->device_snoop_sent));
+    for (unsigned int attempt = 0; attempt < 50; attempt++) {
+        if (g_atomic_int_get(&server->device_snoop_acked)) {
+            break;
+        }
+        g_usleep(10000);
+    }
+    acked_before_release =
+        g_atomic_int_get(&server->device_snoop_acked);
+    marker_fd = open(launch_release, O_CREAT | O_WRONLY, 0600);
+    g_assert_cmpint(marker_fd, >=, 0);
+    close(marker_fd);
+    g_thread_join(launch_thread);
+    g_assert_cmpuint(launch.result, ==, CXL_GPU_SUCCESS);
+    for (unsigned int attempt = 0; attempt < 200; attempt++) {
+        if (g_atomic_int_get(&server->device_snoop_acked)) {
+            break;
+        }
+        g_usleep(10000);
+    }
+    g_assert_false(acked_before_release);
+    g_assert_true(g_atomic_int_get(&server->device_snoop_acked));
+    g_assert_cmpuint(server->device_snoop_status,
+                     ==, CXL_MEMSIM_V2_STATUS_OK);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL, 0, 0, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_COHERENCY);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset, 128, CXL_COH_RANGE_WRITE);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL, 0, 0, 0);
+    g_assert_cmpuint(result, ==, CXL_GPU_ERROR_INVALID_HANDLE);
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_RELEASE_RANGE,
+        pool_offset, 128, 1);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+
+    result = t2_v2_issue_bar2_command(
+        qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_COH_ACQUIRE_RANGE,
+        pool_offset, 128, CXL_COH_RANGE_WRITE);
+    g_assert_cmpuint(result, ==, CXL_GPU_SUCCESS);
+    putm_before = g_atomic_int_get(&server->device_putm_requests);
+    qtest_system_reset(qts);
+    g_assert_cmpuint(g_atomic_int_get(&server->device_putm_requests),
+                     ==, putm_before + 2);
+
+    qtest_quit(qts);
+    t2_v2_fake_server_stop(server);
+    g_assert_cmpint(server->error_code, ==, 0);
+    g_unsetenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED");
+    g_unsetenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE");
+    unlink(launch_entered);
+    unlink(launch_release);
+    g_free(server);
+}
+
 static void t2_rejected_cfmws_case(const char *command_line,
                                    const char *endpoint_bus,
                                    void (*topology_setup)(QTestState *))
@@ -3161,6 +3525,8 @@ int main(int argc, char **argv)
                        cxl_t2_direct_cfmws);
         qtest_add_func("/pci/cxl/type2_v2_coherent_domain",
                        cxl_t2_v2_coherent_domain);
+        qtest_add_func("/pci/cxl/type2_v2_coherent_gpu_range_commands",
+                       cxl_t2_v2_coherent_gpu_range_commands);
         qtest_add_func("/pci/cxl/type2_coherent_pool_traps_guest_access",
                        cxl_t2_coherent_pool_traps_guest_access);
         qtest_add_func("/pci/cxl/type2_coherent_pool_uses_v2_host_endpoint",

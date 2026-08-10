@@ -270,6 +270,16 @@ typedef struct CXLType2State {
         uint32_t num_modules;
         uint32_t num_functions;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
+        bool coherent_launch_blocked;
+        bool coherent_range_valid;
+        bool coherent_range_complete;
+        bool coherent_range_releasing;
+        uint8_t coherent_range_intent;
+        uint64_t coherent_range_lines_granted;
+        uint64_t coherent_range_lines_released;
+        uint64_t coherent_range_allocation;
+        uint64_t coherent_range_offset;
+        uint64_t coherent_range_size;
     } gpu_cmd;
 
     /* Bulk transfer region for large memory operations */

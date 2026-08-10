@@ -1041,6 +1041,284 @@ static bool cxl_memsim_v2_access_size_valid(uint64_t address, unsigned size) {
     return (size == 1 || size == 2 || size == 4 || size == 8) && address <= UINT64_MAX - size;
 }
 
+static bool cxl_memsim_v2_range_geometry(uint64_t address, uint64_t size,
+                                         uint64_t *first_line,
+                                         uint64_t *line_count, Error **errp)
+{
+    uint64_t last_address;
+    uint64_t last_line;
+
+    if (!size || address > UINT64_MAX - (size - 1)) {
+        error_setg(errp, "invalid CXLMemSim v2 range");
+        return false;
+    }
+    last_address = address + size - 1;
+    *first_line = address & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+    last_line = last_address & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+    *line_count = (last_line - *first_line) / CXL_MEMSIM_V2_LINE_SIZE + 1;
+    if (*line_count > SIZE_MAX / CXL_MEMSIM_V2_LINE_SIZE) {
+        error_setg(errp, "CXLMemSim v2 range is too large");
+        return false;
+    }
+    return true;
+}
+
+bool cxl_memsim_v2_acquire_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 bool modified, uint8_t *line_data,
+                                 uint64_t *lines_completed, int timeout_ms,
+                                 Error **errp)
+{
+    uint64_t first_line;
+    uint64_t line_count;
+    uint64_t index;
+    bool success = false;
+
+    if (lines_completed) {
+        *lines_completed = 0;
+    }
+    if (!client || !line_data || !lines_completed ||
+        !cxl_memsim_v2_range_geometry(address, size, &first_line,
+                                      &line_count, errp)) {
+        if (errp && !*errp) {
+            error_setg(errp, "invalid CXLMemSim v2 range acquire");
+        }
+        return false;
+    }
+    if (line_count > client->cache_line_count) {
+        error_setg(errp, "CXLMemSim v2 range exceeds device cache capacity");
+        return false;
+    }
+
+    qemu_mutex_lock(&client->operation_lock);
+    for (index = 0; index < line_count; index++) {
+        CxlMemsimV2CacheLine *line;
+        uint64_t line_address = first_line +
+            index * CXL_MEMSIM_V2_LINE_SIZE;
+
+        if (!cxl_memsim_v2_cache_ensure(client, line_address, modified,
+                                        timeout_ms, errp)) {
+            goto out;
+        }
+        qemu_mutex_lock(&client->cache_lock);
+        line = cxl_memsim_v2_cache_find_locked(client, line_address);
+        if (!line || (modified && line->state != CXL_MEMSIM_V2_STATE_M)) {
+            qemu_mutex_unlock(&client->cache_lock);
+            error_setg(errp, "CXLMemSim v2 range grant was invalidated");
+            goto out;
+        }
+        memcpy(line_data + index * CXL_MEMSIM_V2_LINE_SIZE, line->data,
+               CXL_MEMSIM_V2_LINE_SIZE);
+        cxl_memsim_v2_cache_touch_locked(client, line);
+        qemu_mutex_unlock(&client->cache_lock);
+        *lines_completed = index + 1;
+    }
+    success = true;
+
+out:
+    qemu_mutex_unlock(&client->operation_lock);
+    return success;
+}
+
+bool cxl_memsim_v2_release_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 bool dirty, const uint8_t *line_data,
+                                 uint64_t *lines_completed, int timeout_ms,
+                                 Error **errp)
+{
+    uint64_t first_line;
+    uint64_t line_count;
+    uint64_t index;
+    bool success = false;
+
+    if (lines_completed) {
+        *lines_completed = 0;
+    }
+    if (!client || !line_data || !lines_completed ||
+        !cxl_memsim_v2_range_geometry(address, size, &first_line,
+                                      &line_count, errp)) {
+        if (errp && !*errp) {
+            error_setg(errp, "invalid CXLMemSim v2 range release");
+        }
+        return false;
+    }
+    if (line_count > client->cache_line_count) {
+        error_setg(errp, "CXLMemSim v2 release exceeds cache capacity");
+        return false;
+    }
+
+    qemu_mutex_lock(&client->operation_lock);
+    for (index = 0; index < line_count; index++) {
+        CxlMemsimV2CacheLine *line;
+        uint64_t line_address = first_line +
+            index * CXL_MEMSIM_V2_LINE_SIZE;
+
+        qemu_mutex_lock(&client->cache_lock);
+        line = cxl_memsim_v2_cache_find_locked(client, line_address);
+        if (!line || (dirty && line->state != CXL_MEMSIM_V2_STATE_M)) {
+            qemu_mutex_unlock(&client->cache_lock);
+            error_setg(errp, "CXLMemSim v2 range release has no valid grant");
+            goto out;
+        }
+        if (dirty) {
+            memcpy(line->data,
+                   line_data + index * CXL_MEMSIM_V2_LINE_SIZE,
+                   CXL_MEMSIM_V2_LINE_SIZE);
+            line->dirty = true;
+        }
+        qemu_mutex_unlock(&client->cache_lock);
+        if (!cxl_memsim_v2_cache_evict_address(client, line_address,
+                                                timeout_ms, errp)) {
+            goto out;
+        }
+        *lines_completed = index + 1;
+    }
+    success = true;
+
+out:
+    qemu_mutex_unlock(&client->operation_lock);
+    return success;
+}
+
+bool cxl_memsim_v2_release_cached_range(
+    CxlMemsimV2Client *client, uint64_t address, uint64_t size,
+    bool dirty, const uint8_t *line_data, uint64_t *lines_completed,
+    int timeout_ms, Error **errp)
+{
+    uint64_t first_line;
+    uint64_t line_count;
+    uint64_t index;
+    bool success = false;
+
+    if (lines_completed) {
+        *lines_completed = 0;
+    }
+    if (!client || !line_data || !lines_completed ||
+        !cxl_memsim_v2_range_geometry(address, size, &first_line,
+                                      &line_count, errp)) {
+        if (errp && !*errp) {
+            error_setg(errp, "invalid CXLMemSim v2 cached range release");
+        }
+        return false;
+    }
+    if (line_count > client->cache_line_count) {
+        error_setg(errp,
+                   "CXLMemSim v2 cached release exceeds cache capacity");
+        return false;
+    }
+
+    qemu_mutex_lock(&client->operation_lock);
+    for (index = 0; index < line_count; index++) {
+        CxlMemsimV2CacheLine *line;
+        uint64_t line_address = first_line +
+            index * CXL_MEMSIM_V2_LINE_SIZE;
+        bool cached;
+
+        qemu_mutex_lock(&client->cache_lock);
+        line = cxl_memsim_v2_cache_find_locked(client, line_address);
+        cached = line != NULL;
+        if (dirty && line && line->state == CXL_MEMSIM_V2_STATE_M) {
+            memcpy(line->data,
+                   line_data + index * CXL_MEMSIM_V2_LINE_SIZE,
+                   CXL_MEMSIM_V2_LINE_SIZE);
+            line->dirty = true;
+        }
+        qemu_mutex_unlock(&client->cache_lock);
+        if (!cached) {
+            continue;
+        }
+        if (!cxl_memsim_v2_cache_evict_address(client, line_address,
+                                                timeout_ms, errp)) {
+            goto out;
+        }
+        (*lines_completed)++;
+    }
+    success = true;
+
+out:
+    qemu_mutex_unlock(&client->operation_lock);
+    return success;
+}
+
+bool cxl_memsim_v2_refresh_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 const uint8_t *line_data, Error **errp)
+{
+    uint64_t first_line;
+    uint64_t line_count;
+    uint64_t index;
+
+    if (!client || !line_data ||
+        !cxl_memsim_v2_range_geometry(address, size, &first_line,
+                                      &line_count, errp)) {
+        if (errp && !*errp) {
+            error_setg(errp, "invalid CXLMemSim v2 range refresh");
+        }
+        return false;
+    }
+
+    qemu_mutex_lock(&client->cache_lock);
+    for (index = 0; index < line_count; index++) {
+        uint64_t line_address = first_line +
+            index * CXL_MEMSIM_V2_LINE_SIZE;
+        CxlMemsimV2CacheLine *line =
+            cxl_memsim_v2_cache_find_locked(client, line_address);
+
+        if (!line || line->state != CXL_MEMSIM_V2_STATE_M) {
+            qemu_mutex_unlock(&client->cache_lock);
+            error_setg(errp, "CXLMemSim v2 refresh has no Modified grant");
+            return false;
+        }
+        memcpy(line->data,
+               line_data + index * CXL_MEMSIM_V2_LINE_SIZE,
+               CXL_MEMSIM_V2_LINE_SIZE);
+        line->dirty = true;
+        cxl_memsim_v2_cache_touch_locked(client, line);
+    }
+    qemu_mutex_unlock(&client->cache_lock);
+    return true;
+}
+
+bool cxl_memsim_v2_range_cached(CxlMemsimV2Client *client,
+                                uint64_t address, uint64_t size,
+                                bool modified)
+{
+    uint64_t first_line;
+    uint64_t line_count;
+    uint64_t index;
+    bool cached = true;
+
+    if (!client ||
+        !cxl_memsim_v2_range_geometry(address, size, &first_line,
+                                      &line_count, NULL)) {
+        return false;
+    }
+    qemu_mutex_lock(&client->cache_lock);
+    for (index = 0; index < line_count; index++) {
+        uint64_t line_address = first_line +
+            index * CXL_MEMSIM_V2_LINE_SIZE;
+        CxlMemsimV2CacheLine *line =
+            cxl_memsim_v2_cache_find_locked(client, line_address);
+
+        if (!line || (modified && line->state != CXL_MEMSIM_V2_STATE_M)) {
+            cached = false;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&client->cache_lock);
+    return cached;
+}
+
+bool cxl_memsim_v2_handle_cached_snoop(CxlMemsimV2Client *client,
+                                       const CxlMemsimV2Frame *snoop,
+                                       CxlMemsimV2Frame *ack)
+{
+    if (!client || !snoop || !ack) {
+        return false;
+    }
+    return cxl_memsim_v2_cache_snoop(client, snoop, ack);
+}
+
 bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address, unsigned size, uint64_t *value, int timeout_ms,
                         Error **errp) {
     uint8_t bytes[sizeof(*value)] = {0};

@@ -1447,12 +1447,17 @@ static void cxl_type2_memsim_v2_disconnect(CXLType2State *ct2d) {
     ct2d->memsim_v2.endpoints.host = NULL;
 }
 
+static bool cxl_type2_memsim_v2_device_snoop(
+    void *opaque, const CxlMemsimV2Frame *snoop,
+    CxlMemsimV2Frame *ack, Error **errp);
+
 static bool cxl_type2_memsim_v2_connect(CXLType2State *ct2d, Error **errp) {
     CXLType2MemSimV2State *v2 = &ct2d->memsim_v2;
     Error *local_err = NULL;
 
     v2->endpoints.host = cxl_memsim_v2_client_new(v2->host_endpoint, NULL, NULL);
-    v2->endpoints.device = cxl_memsim_v2_client_new(v2->device_endpoint, NULL, NULL);
+    v2->endpoints.device = cxl_memsim_v2_client_new(
+        v2->device_endpoint, cxl_type2_memsim_v2_device_snoop, ct2d);
     if (!v2->endpoints.host || !v2->endpoints.device) {
         error_setg(&local_err, "cannot allocate CXLMemSim v2 endpoints");
         goto fail;
@@ -2842,6 +2847,118 @@ static int cxl_coherent_pool_free(CXLType2State *ct2d, uint64_t offset) {
     return 0;
 }
 
+static bool cxl_coherent_pool_contains_range(CXLType2State *ct2d,
+                                             uint64_t offset, uint64_t size,
+                                             uint64_t *allocation_base)
+{
+    GHashTableIter iter;
+    gpointer key;
+    gpointer value;
+    uint64_t end;
+    bool found = false;
+
+    if (!size || offset > UINT64_MAX - (size - 1)) {
+        return false;
+    }
+    end = offset + size - 1;
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+    g_hash_table_iter_init(&iter, ct2d->coherent_pool.allocations);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        uint64_t base = *(uint64_t *)key;
+        uint64_t allocation_size = *(uint64_t *)value;
+
+        if (offset >= base && end - base < allocation_size) {
+            if (allocation_base) {
+                *allocation_base = base;
+            }
+            found = true;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+    return found;
+}
+
+static void cxl_type2_clear_coherent_range(CXLType2State *ct2d)
+{
+    ct2d->gpu_cmd.coherent_range_valid = false;
+    ct2d->gpu_cmd.coherent_range_complete = false;
+    ct2d->gpu_cmd.coherent_range_releasing = false;
+    ct2d->gpu_cmd.coherent_range_intent = CXL_COH_RANGE_READ;
+    ct2d->gpu_cmd.coherent_range_lines_granted = 0;
+    ct2d->gpu_cmd.coherent_range_lines_released = 0;
+    ct2d->gpu_cmd.coherent_range_allocation = 0;
+    ct2d->gpu_cmd.coherent_range_offset = 0;
+    ct2d->gpu_cmd.coherent_range_size = 0;
+}
+
+static CxlMemsimV2Client *
+cxl_type2_memsim_v2_device_client(CXLType2State *ct2d);
+
+static void cxl_type2_quiesce_coherent_range(CXLType2State *ct2d,
+                                              const char *reason)
+{
+    CxlMemsimV2Client *client =
+        cxl_type2_memsim_v2_device_client(ct2d);
+    uint64_t offset;
+    uint64_t size;
+    uint64_t first_line;
+    uint64_t lines_released = 0;
+    uint8_t intent;
+    const uint8_t *line_data;
+    HetGPUError gpu_err;
+    Error *local_err = NULL;
+
+    /* The pool lock does not exist until realize has initialized the pool. */
+    if (!ct2d->coherent_pool.allocations || !client) {
+        return;
+    }
+
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+    if (!ct2d->gpu_cmd.coherent_range_valid) {
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        return;
+    }
+    ct2d->gpu_cmd.coherent_range_releasing = true;
+    offset = ct2d->gpu_cmd.coherent_range_offset;
+    size = ct2d->gpu_cmd.coherent_range_size;
+    intent = ct2d->gpu_cmd.coherent_range_intent;
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+
+    qemu_log("CXL Type2: %s coherent GPU range offset=0x%" PRIx64
+             " size=%" PRIu64 " intent=%s\n",
+             reason, offset, size,
+             intent == CXL_COH_RANGE_WRITE ? "write" : "read");
+
+    gpu_err = hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state);
+    if (gpu_err != HETGPU_SUCCESS) {
+        error_report("CXL Type2: cannot %s active coherent GPU range: %s",
+                     reason, hetgpu_get_error_string(gpu_err));
+        abort();
+    }
+
+    first_line = offset & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+    line_data = ct2d->coherent_pool_host_ptr +
+        (first_line - ct2d->coherent_pool.base_offset);
+    if (!cxl_memsim_v2_release_cached_range(
+            client, offset, size, intent == CXL_COH_RANGE_WRITE, line_data,
+            &lines_released, ct2d->memsim_v2.timeout_ms, &local_err)) {
+        error_prepend(&local_err,
+                      "CXL Type2: cannot %s active coherent GPU range: ",
+                      reason);
+        error_report_err(local_err);
+        abort();
+    }
+
+    qemu_log("CXL Type2: %s released %" PRIu64
+             " cached coherent GPU lines\n", reason, lines_released);
+
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+    ct2d->gpu_cmd.coherent_launch_blocked = false;
+    cxl_type2_clear_coherent_range(ct2d);
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+}
+
 /* ========================================================================
  * GPU Command Interface
  * ======================================================================== */
@@ -2961,6 +3078,77 @@ static CxlMemsimV2Client *cxl_type2_memsim_v2_device_client(CXLType2State *ct2d)
     return cxl_memsim_v2_path_client(&ct2d->memsim_v2.endpoints, CXL_MEMSIM_V2_PATH_BAR2_DEVICE);
 }
 
+static bool cxl_type2_memsim_v2_device_snoop(
+    void *opaque, const CxlMemsimV2Frame *snoop,
+    CxlMemsimV2Frame *ack, Error **errp)
+{
+    CXLType2State *ct2d = opaque;
+    CxlMemsimV2Client *client =
+        cxl_type2_memsim_v2_device_client(ct2d);
+    uint64_t first_line;
+    uint64_t last_line;
+    bool active_snoop = false;
+    bool handled;
+
+    (void)errp;
+    qemu_mutex_lock(&ct2d->coherent_pool.lock);
+    if (ct2d->gpu_cmd.coherent_range_valid) {
+        first_line = ct2d->gpu_cmd.coherent_range_offset &
+            ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+        last_line = (ct2d->gpu_cmd.coherent_range_offset +
+                     ct2d->gpu_cmd.coherent_range_size - 1) &
+            ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+        active_snoop = snoop->type == CXL_MEMSIM_V2_OP_HOST_FENCE ||
+            (snoop->addr >= first_line && snoop->addr <= last_line);
+    }
+    if (active_snoop && ct2d->gpu_cmd.coherent_range_releasing) {
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        return true;
+    }
+    if (active_snoop && ct2d->gpu_cmd.coherent_range_complete) {
+        HetGPUError gpu_err =
+            hetgpu_synchronize(&ct2d->gpu_info.hetgpu_state);
+
+        if (gpu_err != HETGPU_SUCCESS) {
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_complete = false;
+            ack->status = CXL_MEMSIM_V2_STATUS_IO_ERROR;
+            error_report("CXL Type2: GPU synchronization failed before "
+                         "snoop ACK: %s",
+                         hetgpu_get_error_string(gpu_err));
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            return true;
+        }
+        if (ct2d->gpu_cmd.coherent_range_intent ==
+                CXL_COH_RANGE_WRITE) {
+            Error *local_err = NULL;
+
+            if (!cxl_memsim_v2_refresh_range(
+                    client, ct2d->gpu_cmd.coherent_range_offset,
+                    ct2d->gpu_cmd.coherent_range_size,
+                    ct2d->coherent_pool_host_ptr +
+                        (first_line - ct2d->coherent_pool.base_offset),
+                    &local_err)) {
+                error_report_err(local_err);
+                ct2d->gpu_cmd.coherent_launch_blocked = true;
+                ct2d->gpu_cmd.coherent_range_complete = false;
+                ack->status = CXL_MEMSIM_V2_STATUS_IO_ERROR;
+                qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+                return true;
+            }
+        }
+    }
+
+    handled = cxl_memsim_v2_handle_cached_snoop(client, snoop, ack);
+    if (active_snoop && ct2d->gpu_cmd.coherent_range_complete &&
+        ack->status == CXL_MEMSIM_V2_STATUS_OK) {
+        ct2d->gpu_cmd.coherent_launch_blocked = true;
+        ct2d->gpu_cmd.coherent_range_complete = false;
+    }
+    qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+    return handled;
+}
+
 static void cxl_type2_memsim_v2_command_error(Error *err) {
     if (err) {
         error_prepend(&err, "CXL Type2 BAR2 protocol-v2 command failed: ");
@@ -2975,7 +3163,11 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
     size_t size;
     bool jit_command = cmd >= CXL_GPU_CMD_J_QUERY && cmd <= CXL_GPU_CMD_J_GET_DIAGNOSTIC;
     bool memsim_v2_command =
-        (cmd >= CXL_GPU_CMD_COHERENT_LOAD && cmd <= CXL_GPU_CMD_COHERENT_CAS) || cmd == CXL_GPU_CMD_COHERENT_FENCE;
+        (cmd >= CXL_GPU_CMD_COHERENT_LOAD &&
+         cmd <= CXL_GPU_CMD_COHERENT_CAS) ||
+        cmd == CXL_GPU_CMD_COHERENT_FENCE ||
+        cmd == CXL_GPU_CMD_COH_ACQUIRE_RANGE ||
+        cmd == CXL_GPU_CMD_COH_RELEASE_RANGE;
 
     qemu_log_mask(LOG_GUEST_ERROR, "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n", cmd, hetgpu->initialized,
                   hetgpu->context);
@@ -3224,7 +3416,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
         break;
 
     case CXL_GPU_CMD_LAUNCH_KERNEL:
-        if (hetgpu->initialized) {
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        if (ct2d->gpu_cmd.coherent_launch_blocked) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+        } else if (hetgpu->initialized) {
             /* Guest sends 1-based function ID */
             uint32_t func_id = ct2d->gpu_cmd.params[0] - 1;
             if (func_id < ct2d->gpu_cmd.num_functions) {
@@ -3252,6 +3447,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
         } else {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
         }
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
         break;
 
     /* Bulk transfer commands - optimized for large memory operations */
@@ -3580,7 +3776,15 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
 
     case CXL_GPU_CMD_COHERENT_FREE: {
         uint64_t free_offset = ct2d->gpu_cmd.params[0];
-        if (cxl_coherent_pool_free(ct2d, free_offset) == 0) {
+        bool range_active;
+
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        range_active = ct2d->gpu_cmd.coherent_range_valid &&
+            ct2d->gpu_cmd.coherent_range_allocation == free_offset;
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        if (range_active) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+        } else if (cxl_coherent_pool_free(ct2d, free_offset) == 0) {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         } else {
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -3612,6 +3816,193 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
             cxl_bar_process_back_invalidations(ct2d);
             ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         }
+    } break;
+
+    case CXL_GPU_CMD_COH_ACQUIRE_RANGE: {
+        CxlMemsimV2Client *client =
+            cxl_type2_memsim_v2_device_client(ct2d);
+        uint64_t offset = ct2d->gpu_cmd.params[0];
+        uint64_t range_size = ct2d->gpu_cmd.params[1];
+        uint64_t intent = ct2d->gpu_cmd.params[2];
+        uint64_t allocation_base = 0;
+        uint64_t first_line;
+        uint64_t lines_granted = 0;
+        uint8_t *line_data;
+        Error *local_err = NULL;
+        bool retry;
+        bool range_conflict;
+
+        if (!ct2d->memsim_v2.enabled || !client ||
+            !ct2d->coherent_pool_gpu_region.host_registered ||
+            !ct2d->coherent_pool_gpu_region.device_ptr ||
+            intent > CXL_COH_RANGE_WRITE ||
+            !cxl_coherent_pool_contains_range(
+                ct2d, offset, range_size, &allocation_base)) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        retry = ct2d->gpu_cmd.coherent_range_valid;
+        range_conflict = retry &&
+            (ct2d->gpu_cmd.coherent_range_complete ||
+             ct2d->gpu_cmd.coherent_range_releasing ||
+             ct2d->gpu_cmd.coherent_range_offset != offset ||
+             ct2d->gpu_cmd.coherent_range_size != range_size ||
+             ct2d->gpu_cmd.coherent_range_intent != intent);
+        if (!retry) {
+            ct2d->gpu_cmd.coherent_range_valid = true;
+            ct2d->gpu_cmd.coherent_range_complete = false;
+            ct2d->gpu_cmd.coherent_range_releasing = false;
+            ct2d->gpu_cmd.coherent_range_intent = intent;
+            ct2d->gpu_cmd.coherent_range_lines_granted = 0;
+            ct2d->gpu_cmd.coherent_range_lines_released = 0;
+            ct2d->gpu_cmd.coherent_range_allocation = allocation_base;
+            ct2d->gpu_cmd.coherent_range_offset = offset;
+            ct2d->gpu_cmd.coherent_range_size = range_size;
+        }
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        if (range_conflict) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            break;
+        }
+
+        if (retry && intent == CXL_COH_RANGE_WRITE) {
+            err = hetgpu_synchronize(hetgpu);
+            if (err != HETGPU_SUCCESS) {
+                qemu_mutex_lock(&ct2d->coherent_pool.lock);
+                ct2d->gpu_cmd.coherent_launch_blocked = true;
+                qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+                break;
+            }
+        }
+
+        first_line = offset &
+            ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+        line_data = ct2d->coherent_pool_host_ptr +
+            (first_line - ct2d->coherent_pool.base_offset);
+        if (!cxl_memsim_v2_acquire_range(
+                client, offset, range_size,
+                intent == CXL_COH_RANGE_WRITE, line_data,
+                &lines_granted, ct2d->memsim_v2.timeout_ms,
+                &local_err)) {
+            ct2d->gpu_cmd.results[0] = lines_granted;
+            qemu_mutex_lock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_complete = false;
+            ct2d->gpu_cmd.coherent_range_lines_granted = lines_granted;
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            cxl_type2_memsim_v2_command_error(local_err);
+            break;
+        }
+
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        if (!cxl_memsim_v2_range_cached(
+                client, offset, range_size,
+                intent == CXL_COH_RANGE_WRITE)) {
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_complete = false;
+            ct2d->gpu_cmd.coherent_range_lines_granted = lines_granted;
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.results[0] = lines_granted;
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            break;
+        }
+
+        ct2d->gpu_cmd.results[0] = lines_granted;
+        ct2d->gpu_cmd.results[1] =
+            ct2d->coherent_pool_gpu_region.device_ptr +
+            (offset - ct2d->coherent_pool.base_offset);
+        ct2d->gpu_cmd.results[2] = ct2d->memsim_v2.device_endpoint;
+        ct2d->gpu_cmd.results[3] =
+            cxl_memsim_v2_client_session(client);
+        ct2d->gpu_cmd.coherent_launch_blocked = false;
+        ct2d->gpu_cmd.coherent_range_complete = true;
+        ct2d->gpu_cmd.coherent_range_lines_granted = lines_granted;
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+    } break;
+
+    case CXL_GPU_CMD_COH_RELEASE_RANGE: {
+        CxlMemsimV2Client *client =
+            cxl_type2_memsim_v2_device_client(ct2d);
+        uint64_t offset = ct2d->gpu_cmd.params[0];
+        uint64_t range_size = ct2d->gpu_cmd.params[1];
+        uint64_t dirty = ct2d->gpu_cmd.params[2];
+        uint64_t first_line;
+        uint64_t lines_released = 0;
+        const uint8_t *line_data;
+        Error *local_err = NULL;
+        bool range_valid;
+
+        if (!ct2d->memsim_v2.enabled || !client || dirty > 1) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        range_valid = ct2d->gpu_cmd.coherent_range_valid &&
+            ct2d->gpu_cmd.coherent_range_complete &&
+            !ct2d->gpu_cmd.coherent_range_releasing &&
+            ct2d->gpu_cmd.coherent_range_offset == offset &&
+            ct2d->gpu_cmd.coherent_range_size == range_size &&
+            (!dirty || ct2d->gpu_cmd.coherent_range_intent ==
+                       CXL_COH_RANGE_WRITE);
+        if (range_valid) {
+            ct2d->gpu_cmd.coherent_range_releasing = true;
+        }
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        if (!range_valid) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            break;
+        }
+        err = hetgpu_synchronize(hetgpu);
+        if (err != HETGPU_SUCCESS) {
+            qemu_mutex_lock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_releasing = false;
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            break;
+        }
+
+        first_line = offset &
+            ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+        line_data = ct2d->coherent_pool_host_ptr +
+            (first_line - ct2d->coherent_pool.base_offset);
+        if (!cxl_memsim_v2_release_cached_range(
+                client, offset, range_size, dirty, line_data,
+                &lines_released, ct2d->memsim_v2.timeout_ms,
+                &local_err)) {
+            qemu_mutex_lock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_releasing = false;
+            ct2d->gpu_cmd.coherent_range_lines_released += lines_released;
+            ct2d->gpu_cmd.results[0] =
+                ct2d->gpu_cmd.coherent_range_lines_released;
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            cxl_type2_memsim_v2_command_error(local_err);
+            break;
+        }
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        ct2d->gpu_cmd.coherent_range_lines_released += lines_released;
+        ct2d->gpu_cmd.results[0] =
+            ct2d->gpu_cmd.coherent_range_lines_released;
+        if (ct2d->gpu_cmd.coherent_range_lines_released !=
+            ct2d->gpu_cmd.coherent_range_lines_granted) {
+            ct2d->gpu_cmd.coherent_launch_blocked = true;
+            ct2d->gpu_cmd.coherent_range_releasing = false;
+            qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_COHERENCY;
+            break;
+        }
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
+        ct2d->gpu_cmd.results[1] = ct2d->memsim_v2.device_endpoint;
+        ct2d->gpu_cmd.results[2] =
+            cxl_memsim_v2_client_session(client);
+        qemu_mutex_lock(&ct2d->coherent_pool.lock);
+        cxl_type2_clear_coherent_range(ct2d);
+        qemu_mutex_unlock(&ct2d->coherent_pool.lock);
     } break;
 
     /* ---- Device-biased directory commands ---- */
@@ -4281,6 +4672,9 @@ static void cxl_type2_reset(DeviceState *dev) {
 
     /* Reset statistics */
     memset(&ct2d->stats, 0, sizeof(ct2d->stats));
+    cxl_type2_quiesce_coherent_range(ct2d, "reset");
+    ct2d->gpu_cmd.coherent_launch_blocked = false;
+    cxl_type2_clear_coherent_range(ct2d);
 
     qemu_log("CXL Type2: Device reset\n");
 }
@@ -4587,6 +4981,9 @@ static void cxl_type2_exit(PCIDevice *pci_dev) {
         }
         qemu_mutex_unlock(&ct2d->memsim.lock);
     }
+    /* Preserve GPU write-back data before protocol teardown can evict it. */
+    cxl_type2_quiesce_coherent_range(ct2d, "remove");
+
     /* Disconnect from CXLMemSim */
     cxl_type2_memsim_v2_disconnect(ct2d);
     cxlmemsim_disconnect(ct2d);

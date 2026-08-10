@@ -162,6 +162,35 @@ bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address,
 bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address,
                          unsigned size, uint64_t value, int timeout_ms,
                          Error **errp);
+/*
+ * @line_data points to one 64-byte slot for each outward-aligned line in the
+ * requested range. Acquire fills those slots from granted cache lines. Release
+ * consumes them for dirty Modified lines. On failure, @lines_completed reports
+ * the prefix that completed and earlier grants remain cached.
+ */
+bool cxl_memsim_v2_acquire_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 bool modified, uint8_t *line_data,
+                                 uint64_t *lines_completed, int timeout_ms,
+                                 Error **errp);
+bool cxl_memsim_v2_release_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 bool dirty, const uint8_t *line_data,
+                                 uint64_t *lines_completed, int timeout_ms,
+                                 Error **errp);
+bool cxl_memsim_v2_release_cached_range(
+    CxlMemsimV2Client *client, uint64_t address, uint64_t size,
+    bool dirty, const uint8_t *line_data, uint64_t *lines_completed,
+    int timeout_ms, Error **errp);
+bool cxl_memsim_v2_refresh_range(CxlMemsimV2Client *client,
+                                 uint64_t address, uint64_t size,
+                                 const uint8_t *line_data, Error **errp);
+bool cxl_memsim_v2_range_cached(CxlMemsimV2Client *client,
+                                uint64_t address, uint64_t size,
+                                bool modified);
+bool cxl_memsim_v2_handle_cached_snoop(CxlMemsimV2Client *client,
+                                       const CxlMemsimV2Frame *snoop,
+                                       CxlMemsimV2Frame *ack);
 bool cxl_memsim_v2_fetch_add(CxlMemsimV2Client *client, uint64_t address,
                              uint64_t addend, uint64_t *old_value,
                              uint64_t *new_value, int timeout_ms,

@@ -797,6 +797,9 @@ static void test_bar2_coherent_command_numbers(void) {
     g_assert_cmpuint(CXL_GPU_CMD_COHERENT_FAA, ==, 0x85);
     g_assert_cmpuint(CXL_GPU_CMD_COHERENT_CAS, ==, 0x86);
     g_assert_cmpuint(CXL_GPU_CMD_COHERENT_FENCE, ==, 0xA3);
+    g_assert_cmpuint(CXL_GPU_CMD_COH_ACQUIRE_RANGE, ==, 0xB2);
+    g_assert_cmpuint(CXL_GPU_CMD_COH_RELEASE_RANGE, ==, 0xB3);
+    g_assert_cmpuint(CXL_GPU_ERROR_COHERENCY, ==, 1000);
 }
 
 static void test_endpoint_memory_and_atomic_operations(void) {

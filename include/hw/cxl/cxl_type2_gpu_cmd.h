@@ -214,6 +214,14 @@ typedef enum {
     /* Coherency statistics commands */
     CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */
     CXL_GPU_CMD_COH_RESET_STATS     = 0xB1,  /* Reset coherency statistics */
+    /*
+     * Acquire: P0=absolute BAR4 offset, P1=size, P2=CXLCohRangeIntent;
+     *          R0=lines granted, R1=CUDA pointer, R2=endpoint, R3=session.
+     * Release: P0=absolute BAR4 offset, P1=size, P2=dirty;
+     *          R0=lines released, R1=endpoint, R2=session.
+     */
+    CXL_GPU_CMD_COH_ACQUIRE_RANGE   = 0xB2,
+    CXL_GPU_CMD_COH_RELEASE_RANGE   = 0xB3,
 
     /* DCD/GFAM/MH-SLD fabric-memory commands */
     CXL_GPU_CMD_DCD_ADD             = 0xC0,  /* params: base, size, tag */
@@ -285,7 +293,13 @@ typedef enum {
     CXL_GPU_ERROR_LAUNCH_FAILED         = 700,
     CXL_GPU_ERROR_INVALID_PTX           = 800,
     CXL_GPU_ERROR_UNKNOWN               = 999,
+    CXL_GPU_ERROR_COHERENCY             = 1000,
 } CXLGPUError;
+
+typedef enum {
+    CXL_COH_RANGE_READ = 0,
+    CXL_COH_RANGE_WRITE = 1,
+} CXLCohRangeIntent;
 
 /* Memory allocation info */
 typedef struct {

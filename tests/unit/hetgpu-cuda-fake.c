@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static unsigned host_register_calls;
 static unsigned host_get_device_pointer_calls;
@@ -195,6 +196,74 @@ int cuMemHostUnregister(void *pointer)
         return 23;
     }
     return host_unregister_result;
+}
+
+int cuModuleLoadData(void **module, const void *image)
+{
+    if (!module || !image) {
+        return 1;
+    }
+    *module = (void *)(uintptr_t)0x23450000;
+    return 0;
+}
+
+int cuModuleGetFunction(void **function, void *module, const char *name)
+{
+    if (!function || !module || !name) {
+        return 1;
+    }
+    *function = (void *)(uintptr_t)0x34560000;
+    return 0;
+}
+
+static void create_marker(const char *path)
+{
+    FILE *stream;
+
+    if (!path) {
+        return;
+    }
+    stream = fopen(path, "w");
+    if (!stream) {
+        return;
+    }
+    fclose(stream);
+}
+
+int cuLaunchKernel(void *function, unsigned int grid_x,
+                   unsigned int grid_y, unsigned int grid_z,
+                   unsigned int block_x, unsigned int block_y,
+                   unsigned int block_z, unsigned int shared_mem,
+                   void *stream, void **args, void **extra)
+{
+    const char *entered = getenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED");
+    const char *release = getenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE");
+    unsigned int attempt;
+
+    (void)grid_x;
+    (void)grid_y;
+    (void)grid_z;
+    (void)block_x;
+    (void)block_y;
+    (void)block_z;
+    (void)shared_mem;
+    (void)stream;
+    (void)args;
+    (void)extra;
+    if (!function) {
+        return 1;
+    }
+    create_marker(entered);
+    if (!release) {
+        return 0;
+    }
+    for (attempt = 0; attempt < 5000; attempt++) {
+        if (access(release, F_OK) == 0) {
+            return 0;
+        }
+        usleep(1000);
+    }
+    return 1;
 }
 
 int cuGetErrorName(int error, const char **name)

@@ -32,6 +32,13 @@ int cuMemHostRegister_v2(void *pointer, size_t size, unsigned int flags);
 int cuMemHostGetDevicePointer_v2(uint64_t *device_pointer,
                                  void *host_pointer, unsigned int flags);
 int cuMemHostUnregister(void *pointer);
+int cuModuleLoadData(void **module, const void *image);
+int cuModuleGetFunction(void **function, void *module, const char *name);
+int cuLaunchKernel(void *function, unsigned int grid_x,
+                   unsigned int grid_y, unsigned int grid_z,
+                   unsigned int block_x, unsigned int block_y,
+                   unsigned int block_z, unsigned int shared_mem,
+                   void *stream, void **args, void **extra);
 int cuGetErrorName(int error, const char **name);
 int cuGetErrorString(int error, const char **description);
 
