@@ -7,6 +7,10 @@
 #include "qemu/timer.h"
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "cxl_type3_rdma.h"
 
 #define RDMA_BUFFER_SIZE 4096
 #define RDMA_CQ_SIZE 1024
@@ -249,7 +253,7 @@ int cxl_memsim_rdma_connect(const char *server_addr, int port)
 
 /* Send RDMA request and receive response */
 int cxl_memsim_rdma_request(uint8_t op, uint64_t addr, uint64_t size,
-                            void *data, RDMAResponse *resp)
+                            void *data, void *resp)
 {
     RDMAMessage *msg;
     struct ibv_send_wr wr, *bad_wr;
@@ -337,7 +341,7 @@ int cxl_memsim_rdma_request(uint8_t op, uint64_t addr, uint64_t size,
     
     /* Copy response */
     if (resp) {
-        memcpy(resp, &msg->response, sizeof(*resp));
+        memcpy(resp, &msg->response, sizeof(RDMAResponse));
     }
     
     pthread_mutex_unlock(&g_rdma_conn.lock);

@@ -84,7 +84,7 @@
     "-device cxl-rp,id=rp0,bus=cxl.0,addr=0.0,chassis=0,slot=0 " \
     "-device cxl-upstream,id=us0,bus=rp0,addr=0.0 " \
     "-device cxl-downstream,id=swport0,bus=us0,addr=0.0,port=0," \
-    "chassis=0,slot=4 "
+    "chassis=0,slot=4,power_controller_present=off "
 
 #define Q35_PCIE_MCFG_BASE UINT64_C(0xb0000000)
 #define Q35_CXL_HOST_REG_BASE UINT64_C(0x100000000)

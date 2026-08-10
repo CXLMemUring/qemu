@@ -15,12 +15,16 @@
 #include "hw/pci/msi.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/pcie_port.h"
+#include "hw/cxl/cxl_vcs_switch.h"
 #include "hw/pci-bridge/cxl_upstream_port.h"
 /*
  * Null value of all Fs suggested by IEEE RA guidelines for use of
  * EU, OUI and CID
  */
 #define UI64_NULL (~0ULL)
+
+#define PCI_VENDOR_ID_ZETTAI 0x7a74
+#define PCI_DEVICE_ID_ZETTAI_CXL_USP 0xa128
 
 #define CXL_UPSTREAM_PORT_MSI_NR_VECTOR 2
 
@@ -90,7 +94,7 @@ static void latch_registers(CXLUpstreamPort *usp)
     uint32_t *write_msk = usp->cxl_cstate.crb.cache_mem_regs_write_mask;
 
     cxl_component_register_init_common(reg_state, write_msk,
-                                       CXL2_UPSTREAM_PORT);
+                                       CXL2_UPSTREAM_PORT, usp->flitmode);
     ARRAY_FIELD_DP32(reg_state, CXL_HDM_DECODER_CAPABILITY, TARGET_COUNT, 8);
 }
 
@@ -101,7 +105,7 @@ static void cxl_usp_reset(DeviceState *qdev)
 
     pci_bridge_reset(qdev);
     pcie_cap_deverr_reset(d);
-    pcie_cap_fill_link_ep_usp(d, usp->width, usp->speed);
+    pcie_cap_fill_link_ep_usp(d, usp->width, usp->speed, usp->flitmode);
     latch_registers(usp);
 }
 
@@ -119,7 +123,7 @@ static void build_dvsecs(CXLComponentState *cxl)
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
         .cap                     = 0x27, /* Cache, IO, Mem, non-MLD */
         .ctrl                    = 0x27, /* Cache, IO, Mem */
-        .status                  = 0x26, /* same */
+        .status                  = CXL_USP(cxl->pdev)->flitmode ? 0x6 : 0x26,
         .rcvd_mod_ts_data_phase1 = 0xef, /* WTF? */
     };
     cxl_component_create_dvsec(cxl, CXL2_UPSTREAM_PORT,
@@ -344,6 +348,24 @@ static void cxl_usp_realize(PCIDevice *d, Error **errp)
         goto err_cap;
     }
 
+    if (usp->vcs_name && usp->ppb != UINT8_MAX) {
+        Object *obj = object_resolve_path_component(object_get_objects_root(),
+                                                    usp->vcs_name);
+
+        if (!obj) {
+            error_setg(errp, "vcs '%s' not found", usp->vcs_name);
+            goto err_cap;
+        }
+        if (!object_dynamic_cast(obj, TYPE_CXL_VCS_SWITCH)) {
+            error_setg(errp, "'%s' is not a Zettai switch", usp->vcs_name);
+            goto err_cap;
+        }
+        cxl_vcs_register_usp(CXL_VCS_SWITCH(obj), usp, errp);
+        if (*errp) {
+            goto err_cap;
+        }
+    }
+
     return;
 
 err_cap:
@@ -369,6 +391,9 @@ static const Property cxl_upstream_props[] = {
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLUpstreamPort,
                                 width, PCIE_LINK_WIDTH_16),
+    DEFINE_PROP_BOOL("x-256b-flit", CXLUpstreamPort, flitmode, true),
+    DEFINE_PROP_STRING("vcs", CXLUpstreamPort, vcs_name),
+    DEFINE_PROP_UINT8("usppb", CXLUpstreamPort, ppb, UINT8_MAX),
 };
 
 static void cxl_upstream_class_init(ObjectClass *oc, const void *data)
@@ -380,11 +405,11 @@ static void cxl_upstream_class_init(ObjectClass *oc, const void *data)
     k->config_read = cxl_usp_read_config;
     k->realize = cxl_usp_realize;
     k->exit = cxl_usp_exitfn;
-    k->vendor_id = 0x19e5; /* Huawei */
-    k->device_id = 0xa128; /* Emulated CXL Switch Upstream Port */
+    k->vendor_id = PCI_VENDOR_ID_ZETTAI;
+    k->device_id = PCI_DEVICE_ID_ZETTAI_CXL_USP;
     k->revision = 0;
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);
-    dc->desc = "CXL Switch Upstream Port";
+    dc->desc = "Zettai CXL Switch Upstream Port";
     device_class_set_legacy_reset(dc, cxl_usp_reset);
     device_class_set_props(dc, cxl_upstream_props);
 }

@@ -555,3 +555,62 @@
            },
   'features': [ 'unstable' ]
 }
+
+##
+# @zettai-bind-vppb:
+#
+# Bind a hidden Zettai physical downstream PPB to a virtual PPB. This is a QMP
+# test hook for the RFC VCS switch model, equivalent to issuing the FMAPI Bind
+# vPPB command through the switch mailbox.
+#
+# @path: Zettai object id or QOM path.
+#
+# @vcs-id: Virtual CXL Switch id.
+#
+# @vppb-id: Virtual PPB id within the VCS.
+#
+# @dsp-ppb-id: Physical downstream PPB id to bind.
+#
+# @ld-id: Logical device id. Defaults to 0xffff, meaning SLD/no LD selection.
+#
+# Features:
+#
+# @unstable: For test automation only.
+#
+# Since: 10.2
+##
+{ 'command': 'zettai-bind-vppb',
+  'data': { 'path': 'str',
+            'vcs-id': 'uint8',
+            'vppb-id': 'uint8',
+            'dsp-ppb-id': 'uint8',
+            '*ld-id': 'uint16' },
+  'features': [ 'unstable' ] }
+
+##
+# @zettai-unbind-vppb:
+#
+# Unbind a Zettai virtual PPB. This is a QMP test hook for the RFC VCS switch
+# model, equivalent to issuing the FMAPI Unbind vPPB command through the switch
+# mailbox.
+#
+# @path: Zettai object id or QOM path.
+#
+# @vcs-id: Virtual CXL Switch id.
+#
+# @vppb-id: Virtual PPB id within the VCS.
+#
+# @option: Unbind option. Defaults to 2, surprise hot-remove.
+#
+# Features:
+#
+# @unstable: For test automation only.
+#
+# Since: 10.2
+##
+{ 'command': 'zettai-unbind-vppb',
+  'data': { 'path': 'str',
+            'vcs-id': 'uint8',
+            'vppb-id': 'uint8',
+            '*option': 'uint16' },
+  'features': [ 'unstable' ] }
