@@ -731,10 +731,18 @@ void cxl_type2_hetgpu_cleanup(CXLType2State *ct2d) {
     err = hetgpu_unregister_coherent_region(
         hetgpu, &ct2d->coherent_pool_gpu_region);
     if (err != HETGPU_SUCCESS) {
+        HetGPUError sync_err;
+
         qemu_log("CXL Type2: Coherent pool unregister failed; "
                  "synchronizing and retrying: %s\n",
                  hetgpu_get_error_string(err));
-        hetgpu_synchronize(hetgpu);
+        sync_err = hetgpu_synchronize(hetgpu);
+        if (sync_err != HETGPU_SUCCESS) {
+            error_report("CXL Type2: refusing to release CUDA-registered "
+                         "coherent pool after synchronization failure: %s",
+                         hetgpu_get_error_string(sync_err));
+            abort();
+        }
         err = hetgpu_unregister_coherent_region(
             hetgpu, &ct2d->coherent_pool_gpu_region);
         if (err != HETGPU_SUCCESS) {

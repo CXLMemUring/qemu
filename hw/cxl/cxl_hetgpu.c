@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/thread.h"
 #include "hw/cxl/cxl_hetgpu.h"
@@ -1048,7 +1049,20 @@ HetGPUError hetgpu_unregister_coherent_region(HetGPUState *state,
 void hetgpu_destroy_coherent_region(HetGPUState *state,
                                     HetGPUCoherentRegion *region)
 {
+    HetGPUError err;
+
     if (!state || !region) {
+        return;
+    }
+
+    if (region->host_registered) {
+        err = hetgpu_unregister_coherent_region(state, region);
+        if (err != HETGPU_SUCCESS) {
+            error_report("CXL hetGPU: refusing to destroy a CUDA-registered "
+                         "host region after unregister failure: %s",
+                         hetgpu_get_error_string(err));
+            abort();
+        }
         return;
     }
 

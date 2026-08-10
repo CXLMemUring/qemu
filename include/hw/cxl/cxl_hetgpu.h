@@ -323,9 +323,11 @@ HetGPUError hetgpu_create_coherent_region(HetGPUState *state, size_t size,
  * @size: Size in bytes
  * @region: Output coherent region info
  *
- * The caller retains ownership of @host_ptr. Registration is rolled back if
- * obtaining the GPU-visible pointer fails. @region must be zero-initialized
- * and must not describe an active registration.
+ * The caller retains ownership of @host_ptr. If obtaining the GPU-visible
+ * pointer fails and rollback unregister also fails, @region retains the live
+ * registration so the caller can retry unregister without releasing the host
+ * allocation. @region must be zero-initialized and must not describe an active
+ * registration.
  *
  * Returns: HETGPU_SUCCESS on success
  */
@@ -350,6 +352,11 @@ HetGPUError hetgpu_unregister_coherent_region(HetGPUState *state,
  * hetgpu_destroy_coherent_region - Destroy coherent memory region
  * @state: Initialized HetGPUState
  * @region: Coherent region to destroy
+ *
+ * Regions created by hetgpu_create_coherent_region() are freed. Regions mapped
+ * by hetgpu_register_coherent_region() are unregistered without freeing their
+ * caller-owned host allocation. An unregister failure is fatal because freeing
+ * or discarding a still-registered region would violate its ownership contract.
  */
 void hetgpu_destroy_coherent_region(HetGPUState *state,
                                     HetGPUCoherentRegion *region);

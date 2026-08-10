@@ -1375,6 +1375,30 @@ static char *t2_hetgpu_fake_path(void)
     return g_canonicalize_filename(relative, NULL);
 }
 
+static void t2_wait_for_device_deleted(QTestState *qts, const char *id)
+{
+    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", id);
+    unsigned int attempt;
+
+    qtest_qmp_device_del_send(qts, id);
+    for (attempt = 0; attempt < 200; attempt++) {
+        QDict *response = qtest_qmp(
+            qts, "{'execute':'qom-get','arguments':"
+                 "{'path':%s,'property':'realized'}}", path);
+        bool deleted = qdict_haskey(response, "error");
+
+        qobject_unref(response);
+        if (deleted) {
+            response = qtest_qmp(qts, "{'execute':'query-status'}");
+            g_assert_false(qdict_haskey(response, "error"));
+            qobject_unref(response);
+            return;
+        }
+        g_usleep(10000);
+    }
+    g_assert_not_reached();
+}
+
 static void cxl_t2_coherent_pool_registers_with_hetgpu(void)
 {
     g_autofree char *library = t2_hetgpu_fake_path();
@@ -1408,7 +1432,7 @@ static void cxl_t2_coherent_pool_registers_with_hetgpu(void)
     g_assert_false(qdict_haskey(response, "error"));
     qobject_unref(response);
     g_assert_true(t2_qom_bool(qts, "coherent-pool-gpu-registered"));
-    qtest_qmp_device_del_send(qts, "t2");
+    t2_wait_for_device_deleted(qts, "t2");
     qtest_quit(qts);
     g_assert_true(g_file_get_contents(trace, &trace_contents, NULL, NULL));
     g_assert_cmpstr(trace_contents, ==, "register\nunregister\n");
@@ -1583,13 +1607,58 @@ static void cxl_t2_gpu_unregister_retries_once(void)
                          arguments);
     g_assert_false(qdict_haskey(response, "error"));
     qobject_unref(response);
-    qtest_qmp_device_del_send(qts, "t2");
+    t2_wait_for_device_deleted(qts, "t2");
     qtest_quit(qts);
 
     g_assert_true(g_file_get_contents(trace, &trace_contents, NULL, NULL));
     g_assert_cmpstr(trace_contents, ==,
                     "register\nunregister\nunregister\n");
     unlink(trace);
+}
+
+static void cxl_t2_gpu_sync_failure_fails_stop(void)
+{
+    if (g_test_subprocess()) {
+        g_autofree char *library = t2_hetgpu_fake_path();
+        QDict *arguments = qdict_new();
+        QTestState *qts;
+        QDict *response;
+        unsigned int attempt;
+
+        g_setenv("HETGPU_CUDA_FAKE_UNREGISTER_FAILURES", "1", true);
+        g_setenv("HETGPU_CUDA_FAKE_SYNCHRONIZE_RESULT", "17", true);
+        qts = qtest_init(QEMU_T2_SYNC_BASE "-m 128M");
+
+        qdict_put_str(arguments, "driver", "cxl-type2");
+        qdict_put_str(arguments, "id", "t2");
+        qdict_put_str(arguments, "bus", "rp0");
+        qdict_put_int(arguments, "gpu-mode", 2);
+        qdict_put_int(arguments, "hetgpu-backend", 3);
+        qdict_put_str(arguments, "hetgpu-lib", library);
+        qdict_put_bool(arguments, "coherency-enabled", false);
+        qdict_put_int(arguments, "cache-size", 128 * MiB);
+        qdict_put_int(arguments, "mem-size", 256 * MiB);
+        qdict_put_int(arguments, "cxlmemsim-port", 1);
+        response = qtest_qmp(qts,
+                             "{'execute':'device_add','arguments':%p}",
+                             arguments);
+        g_assert_false(qdict_haskey(response, "error"));
+        qobject_unref(response);
+
+        qtest_qmp_device_del_send(qts, "t2");
+        for (attempt = 0; attempt < 200; attempt++) {
+            response = qtest_qmp(qts, "{'execute':'query-status'}");
+            qobject_unref(response);
+            g_usleep(10000);
+        }
+        g_assert_not_reached();
+    }
+
+    g_test_trap_subprocess(NULL, 0, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr(
+        "*refusing to release CUDA-registered coherent pool after "
+        "synchronization failure*");
 }
 
 static void cxl_t2_jext_capability(void)
@@ -3109,6 +3178,8 @@ int main(int argc, char **argv)
                        cxl_t2_protocol_failure_unwinds_gpu_registration);
         qtest_add_func("/pci/cxl/type2_gpu_unregister_retries_once",
                        cxl_t2_gpu_unregister_retries_once);
+        qtest_add_func("/pci/cxl/type2_gpu_sync_failure_fails_stop",
+                       cxl_t2_gpu_sync_failure_fails_stop);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_two_targets",
                        cxl_t2_cfmws_reject_two_targets);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_512m",

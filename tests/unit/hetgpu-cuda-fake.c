@@ -131,7 +131,10 @@ int cuCtxDestroy_v2(void *context)
 
 int cuCtxSynchronize(void)
 {
-    return 0;
+    const char *forced_result = getenv(
+        "HETGPU_CUDA_FAKE_SYNCHRONIZE_RESULT");
+
+    return forced_result ? atoi(forced_result) : 0;
 }
 
 int cuCtxPopCurrent_v2(void **context)

@@ -199,6 +199,30 @@ static void test_failed_rollback_is_retryable(void)
     dlclose(fake.handle);
 }
 
+static void test_destroy_registered_region_unregisters(void)
+{
+    g_autofree char *path = fake_cuda_path();
+    g_autofree void *backing = g_malloc0(4096);
+    FakeCuda fake = fake_cuda_open(path);
+    HetGPUState state;
+    HetGPUCoherentRegion region = { 0 };
+
+    fake.reset();
+    g_assert_cmpint(hetgpu_init(&state, HETGPU_BACKEND_NVIDIA, 0, path),
+                    ==, HETGPU_SUCCESS);
+    g_assert_cmpint(
+        hetgpu_register_coherent_region(&state, backing, 4096, &region),
+        ==, HETGPU_SUCCESS);
+
+    hetgpu_destroy_coherent_region(&state, &region);
+
+    g_assert_false(region.host_registered);
+    g_assert_null(region.host_ptr);
+    g_assert_cmpuint(fake.host_unregister_calls(), ==, 1);
+    hetgpu_cleanup(&state);
+    dlclose(fake.handle);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -212,5 +236,7 @@ int main(int argc, char **argv)
                     test_active_region_is_not_overwritten);
     g_test_add_func("/cxl/hetgpu/retry-failed-rollback",
                     test_failed_rollback_is_retryable);
+    g_test_add_func("/cxl/hetgpu/destroy-registered-region",
+                    test_destroy_registered_region_unregisters);
     return g_test_run();
 }
