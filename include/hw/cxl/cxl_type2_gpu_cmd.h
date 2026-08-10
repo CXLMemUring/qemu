@@ -167,6 +167,8 @@ typedef enum {
     CXL_GPU_CMD_SWITCH_DOT_I32      = 0xE3,  /* params: a, b, count; result0=dot */
     CXL_GPU_CMD_SWITCH_MATMUL_I32   = 0xE4,  /* params: a, b, c, m, n, k */
     CXL_GPU_CMD_SWITCH_GET_STATS    = 0xE5,  /* results/data: server switch stats */
+    CXL_GPU_CMD_SWITCH_HWJIT        = 0xE6,  /* params: src, dst, bytes, switchlet, mask, tiles, control, aux */
+    CXL_GPU_CMD_SWITCH_HWJIT_STATS  = 0xE7,  /* results/data: Hardware-JIT stats */
 } CXLGPUCommand;
 
 typedef struct CXLSwitchMatmulI32Descriptor {
@@ -178,6 +180,21 @@ typedef struct CXLSwitchMatmulI32Descriptor {
     uint32_t k;
     uint32_t flags;
 } CXLSwitchMatmulI32Descriptor;
+
+typedef struct CXLSwitchHardwareJitDescriptor {
+    uint64_t src_addr;
+    uint64_t dst_addr;
+    uint64_t aux_addr;
+    uint64_t bytes;
+    uint32_t switchlet_id;
+    uint32_t transform_mask;
+    uint32_t tile_count;
+    uint32_t ttl;
+    uint32_t max_ops;
+    uint32_t flags;
+    uint32_t priority;
+    uint32_t reserved;
+} CXLSwitchHardwareJitDescriptor;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */
 

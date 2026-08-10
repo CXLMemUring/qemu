@@ -62,6 +62,8 @@
 #define CXL_OP_SWITCH_DOT_I32      22
 #define CXL_OP_SWITCH_MATMUL_I32   23
 #define CXL_OP_SWITCH_QUERY        24
+#define CXL_OP_SWITCH_HWJIT        25
+#define CXL_OP_SWITCH_HWJIT_QUERY  26
 
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
@@ -3160,6 +3162,65 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             CXLMemSimResponse resp;
 
             if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_QUERY,
+                                             0, 0, NULL, 0, 0, &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.results[2] = 0;
+                ct2d->gpu_cmd.results[3] = 0;
+                if (ct2d->gpu_cmd.data_size >= sizeof(resp.data)) {
+                    memcpy(ct2d->gpu_cmd.data, resp.data, sizeof(resp.data));
+                }
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_HWJIT:
+        {
+            CXLMemSimResponse resp;
+            uint64_t control = ct2d->gpu_cmd.params[6];
+            CXLSwitchHardwareJitDescriptor desc = {
+                .src_addr = ct2d->gpu_cmd.params[0],
+                .dst_addr = ct2d->gpu_cmd.params[1],
+                .aux_addr = ct2d->gpu_cmd.params[7],
+                .bytes = ct2d->gpu_cmd.params[2],
+                .switchlet_id = (uint32_t)ct2d->gpu_cmd.params[3],
+                .transform_mask = (uint32_t)ct2d->gpu_cmd.params[4],
+                .tile_count = (uint32_t)ct2d->gpu_cmd.params[5],
+                .ttl = (uint32_t)(control & 0xffff),
+                .max_ops = (uint32_t)((control >> 16) & 0xffff),
+                .flags = (uint32_t)(control >> 32),
+                .priority = 8,
+                .reserved = 0,
+            };
+
+            if (desc.ttl == 0) {
+                desc.ttl = 4;
+            }
+            if (desc.max_ops == 0) {
+                desc.max_ops = 1;
+            }
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_HWJIT,
+                                             0, sizeof(desc),
+                                             (const uint8_t *)&desc,
+                                             0, 0, &resp)) {
+                ct2d->gpu_cmd.results[0] = resp.old_value;
+                ct2d->gpu_cmd.results[1] = resp.latency_ns;
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            } else {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_SWITCH_HWJIT_STATS:
+        {
+            CXLMemSimResponse resp;
+
+            if (cxl_type2_memsim_request_ext(ct2d, CXL_OP_SWITCH_HWJIT_QUERY,
                                              0, 0, NULL, 0, 0, &resp)) {
                 ct2d->gpu_cmd.results[0] = resp.old_value;
                 ct2d->gpu_cmd.results[1] = resp.latency_ns;
