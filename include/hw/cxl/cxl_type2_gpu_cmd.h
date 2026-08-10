@@ -63,6 +63,68 @@
 #define CXL_GPU_CAP_DMA_ENGINE      (1 << 2)  /* Hardware DMA engine available */
 #define CXL_GPU_CAP_COHERENT_POOL   (1 << 3)  /* Coherent shared memory pool */
 #define CXL_GPU_CAP_DEVICE_BIAS     (1 << 4)  /* Device-biased directory mode */
+#define CXL_GPU_CAP_SLUGARCH_J_EXT  (1U << 5) /* Vendor SlugArch J-extension */
+
+/*
+ * SlugArch vendor J-extension registers.  This is a local BAR2 ABI, not a
+ * standardized CXL capability.
+ */
+#define CXL_GPU_REG_J_MAGIC          0x0400
+#define CXL_GPU_REG_J_ABI_VERSION    0x0404
+#define CXL_GPU_REG_J_CAPS           0x0408
+#define CXL_GPU_REG_J_STATUS         0x040c
+#define CXL_GPU_REG_J_BACKEND        0x0410
+#define CXL_GPU_REG_J_POLICY_BYTES   0x0414
+#define CXL_GPU_REG_J_LAST_ERROR     0x0418
+#define CXL_GPU_REG_J_POLICY_DIGEST  0x0420
+#define CXL_GPU_REG_J_RECORD_COUNT   0x0440
+#define CXL_GPU_REG_J_METADATA_BYTES 0x0448
+#define CXL_GPU_REG_J_EVENT_COUNT    0x0450
+#define CXL_GPU_REG_J_REJECT_COUNT   0x0458
+#define CXL_GPU_REG_J_DROP_COUNT     0x0460
+#define CXL_GPU_REG_J_EPOCH          0x0468
+#define CXL_GPU_REG_J_END            0x0500
+
+#define CXL_GPU_J_MAGIC              0x4a474c53U /* "SLGJ", little endian */
+#define CXL_GPU_J_ABI_VERSION        1U
+
+#define CXL_GPU_J_CAP_POLICY         (1U << 0)
+#define CXL_GPU_J_CAP_RECORD         (1U << 1)
+#define CXL_GPU_J_CAP_GPU_DIAGNOSTIC (1U << 2)
+#define CXL_GPU_J_CAP_FPGA_RTL       (1U << 3)
+
+#define CXL_GPU_J_STATUS_DISABLED    0U
+#define CXL_GPU_J_STATUS_LOADING     1U
+#define CXL_GPU_J_STATUS_READY       2U
+#define CXL_GPU_J_STATUS_ERROR       3U
+
+#define CXL_GPU_J_BACKEND_NONE            0U
+#define CXL_GPU_J_BACKEND_RUST            1U
+#define CXL_GPU_J_BACKEND_GPU             2U
+#define CXL_GPU_J_BACKEND_FPGA_VERILATOR  3U
+
+/* Stable J-extension result codes, mirrored from ABI version 1. */
+#define CXL_GPU_J_OK                        0U
+#define CXL_GPU_J_ERR_NULL                  1U
+#define CXL_GPU_J_ERR_STRUCT_SIZE           2U
+#define CXL_GPU_J_ERR_ABI_VERSION           3U
+#define CXL_GPU_J_ERR_PARSE                 4U
+#define CXL_GPU_J_ERR_POLICY_VERSION        5U
+#define CXL_GPU_J_ERR_TOO_MANY_INSTRUCTIONS 6U
+#define CXL_GPU_J_ERR_TOO_MANY_RANGES       7U
+#define CXL_GPU_J_ERR_INVALID_RANGE         8U
+#define CXL_GPU_J_ERR_INVALID_STRIDE        9U
+#define CXL_GPU_J_ERR_BUDGET_EXCEEDED       10U
+#define CXL_GPU_J_ERR_INVALID_CONTROL_FLOW  11U
+#define CXL_GPU_J_ERR_UNSUPPORTED           12U
+#define CXL_GPU_J_ERR_DIGEST_MISMATCH       13U
+#define CXL_GPU_J_ERR_REJECTED              14U
+#define CXL_GPU_J_ERR_DROP                  15U
+#define CXL_GPU_J_ERR_TIMEOUT               16U
+#define CXL_GPU_J_ERR_BACKEND               17U
+#define CXL_GPU_J_ERR_IO                    18U
+#define CXL_GPU_J_ERR_POISONED              19U
+#define CXL_GPU_J_ERR_PANIC                 20U
 
 /* Magic number */
 #define CXL_GPU_MAGIC               0x43584C32  /* "CXL2" */
@@ -127,6 +189,10 @@ typedef enum {
     CXL_GPU_CMD_CACHE_FLUSH     = 0x80,  /* Flush cache lines to device */
     CXL_GPU_CMD_CACHE_INVALIDATE= 0x81,  /* Invalidate cache lines */
     CXL_GPU_CMD_CACHE_WRITEBACK = 0x82,  /* Writeback dirty cache lines */
+    CXL_GPU_CMD_COHERENT_LOAD   = 0x83,  /* Protocol-v2 device load */
+    CXL_GPU_CMD_COHERENT_STORE  = 0x84,  /* Protocol-v2 device store */
+    CXL_GPU_CMD_COHERENT_FAA    = 0x85,  /* Protocol-v2 fetch-and-add */
+    CXL_GPU_CMD_COHERENT_CAS    = 0x86,  /* Protocol-v2 compare-and-swap */
 
     /* P2P DMA commands: defined as macros in cxl_p2p_dma.h (0x90-0x96) */
 
@@ -144,6 +210,13 @@ typedef enum {
     /* Coherency statistics commands */
     CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */
     CXL_GPU_CMD_COH_RESET_STATS     = 0xB1,  /* Reset coherency statistics */
+
+    /* SlugArch vendor J-extension commands */
+    CXL_GPU_CMD_J_QUERY             = 0xC0,
+    CXL_GPU_CMD_J_LOAD_POLICY       = 0xC1,
+    CXL_GPU_CMD_J_RESET             = 0xC2,
+    CXL_GPU_CMD_J_GET_STATS         = 0xC3,
+    CXL_GPU_CMD_J_GET_DIAGNOSTIC    = 0xC4,
 } CXLGPUCommand;
 
 /* P2P register offsets and peer types: defined in cxl_p2p_dma.h */

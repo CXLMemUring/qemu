@@ -547,6 +547,6 @@ static void cxl_type1_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
                              (char *)&msg, sizeof(msg), NULL);
     }
     
-    qemu_log_mask(LOG_TRACE, "CXL Type1: Cache write at 0x%lx = 0x%lx (size %u)\n",
-                 addr, value, size);
+    // qemu_log_mask(LOG_TRACE, "CXL Type1: Cache write at 0x%lx = 0x%lx (size %u)\n",
+                //  addr, value, size);
 }

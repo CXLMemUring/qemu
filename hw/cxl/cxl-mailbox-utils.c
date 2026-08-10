@@ -15,6 +15,7 @@
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_events.h"
 #include "hw/cxl/cxl_mailbox.h"
+#include "hw/cxl/cxl_type2.h"
 #include "hw/pci/pci.h"
 #include "hw/pci-bridge/cxl_upstream_port.h"
 #include "qemu/cutils.h"
@@ -1522,6 +1523,53 @@ static CXLRetCode cmd_identify_memory_device(const struct cxl_cmd *cmd,
     stw_le_p(&id->inject_poison_limit, 0);
     stw_le_p(&id->dc_event_log_size, CXL_DC_EVENT_LOG_SIZE);
 
+    *len_out = sizeof(*id);
+    return CXL_MBOX_SUCCESS;
+}
+
+static CXLRetCode cmd_identify_type2_memory_device(const struct cxl_cmd *cmd,
+                                                   uint8_t *payload_in,
+                                                   size_t len_in,
+                                                   uint8_t *payload_out,
+                                                   size_t *len_out,
+                                                   CXLCCI *cci)
+{
+    struct {
+        char fw_revision[0x10];
+        uint64_t total_capacity;
+        uint64_t volatile_capacity;
+        uint64_t persistent_capacity;
+        uint64_t partition_align;
+        uint16_t info_event_log_size;
+        uint16_t warning_event_log_size;
+        uint16_t failure_event_log_size;
+        uint16_t fatal_event_log_size;
+        uint32_t lsa_size;
+        uint8_t poison_list_max_mer[3];
+        uint16_t inject_poison_limit;
+        uint8_t poison_caps;
+        uint8_t qos_telemetry_caps;
+        uint16_t dc_event_log_size;
+    } QEMU_PACKED *id = (void *)payload_out;
+    CXLType2State *ct2d = CXL_TYPE2(cci->d);
+    CXLDeviceState *cxl_dstate = &ct2d->cxl_dstate;
+
+    QEMU_BUILD_BUG_ON(sizeof(*id) != 0x45);
+    if (!QEMU_IS_ALIGNED(cxl_dstate->vmem_size,
+                         CXL_CAPACITY_MULTIPLIER) ||
+        !QEMU_IS_ALIGNED(cxl_dstate->pmem_size,
+                         CXL_CAPACITY_MULTIPLIER)) {
+        return CXL_MBOX_INTERNAL_ERROR;
+    }
+
+    memset(id, 0, sizeof(*id));
+    snprintf(id->fw_revision, sizeof(id->fw_revision), "T2EMU V%02d", 2);
+    stq_le_p(&id->total_capacity,
+             cxl_dstate->static_mem_size / CXL_CAPACITY_MULTIPLIER);
+    stq_le_p(&id->volatile_capacity,
+             cxl_dstate->vmem_size / CXL_CAPACITY_MULTIPLIER);
+    stq_le_p(&id->persistent_capacity,
+             cxl_dstate->pmem_size / CXL_CAPACITY_MULTIPLIER);
     *len_out = sizeof(*id);
     return CXL_MBOX_SUCCESS;
 }
@@ -3805,6 +3853,11 @@ static const struct cxl_cmd cxl_cmd_set[256][256] = {
         cmd_media_get_scan_media_results, 0, 0 },
 };
 
+static const struct cxl_cmd cxl_cmd_set_t2[256][256] = {
+    [IDENTIFY][MEMORY_DEVICE] = { "IDENTIFY_MEMORY_DEVICE",
+        cmd_identify_type2_memory_device, 0, 0 },
+};
+
 static const struct cxl_cmd cxl_cmd_set_dcd[256][256] = {
     [DCD_CONFIG][GET_DC_CONFIG] = { "DCD_GET_DC_CONFIG",
         cmd_dcd_get_dyn_cap_config, 2, 0 },
@@ -4105,6 +4158,14 @@ void cxl_initialize_mailbox_t3(CXLCCI *cci, DeviceState *d, size_t payload_max)
     cci->d = d;
 
     /* No separation for PCI MB as protocol handled in PCI device */
+    cci->intf = d;
+    cxl_init_cci(cci, payload_max);
+}
+
+void cxl_initialize_mailbox_t2(CXLCCI *cci, DeviceState *d, size_t payload_max)
+{
+    cxl_copy_cci_commands(cci, cxl_cmd_set_t2);
+    cci->d = d;
     cci->intf = d;
     cxl_init_cci(cci, payload_max);
 }

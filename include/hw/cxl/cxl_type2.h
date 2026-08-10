@@ -16,9 +16,13 @@
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_memsim_v2.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
+#include "hw/cxl/slugarch_jit.h"
+#include "exec/memattrs.h"
 #include "qemu/thread.h"
+#include "qemu/units.h"
 #include "io/channel-socket.h"
 
 #define TYPE_CXL_TYPE2 "cxl-type2"
@@ -28,6 +32,7 @@
 /* Type 2 combines Type 1 (accelerator/cache) + Type 3 (memory) */
 #define CXL_TYPE2_DEFAULT_CACHE_SIZE (128 * MiB)
 #define CXL_TYPE2_DEFAULT_MEM_SIZE (4 * GiB)
+#define CXL_TYPE2_JIT_DIAGNOSTIC_SIZE (16 * KiB)
 
 /* Coherency states for cache lines */
 typedef enum {
@@ -101,6 +106,61 @@ typedef struct CXLType2MemSimConn {
     char *shm_name;
 } CXLType2MemSimConn;
 
+typedef struct CXLType2SlugArchState {
+    bool enabled;
+    bool connection_failed;
+    bool shadow_after_write;
+    bool lock_initialized;
+    uint16_t wire_version;
+    char *event_log_path;
+    char *phase_id;
+    FILE *event_log;
+    uint64_t next_request_id;
+    uint64_t client_id;
+    uint8_t server_uuid[16];
+    uint64_t server_capacity;
+    uint64_t configured_base_latency;
+    uint64_t completed_reads;
+    uint64_t completed_writes;
+    uint64_t read_bytes;
+    uint64_t written_bytes;
+    uint64_t failed_requests;
+    uint64_t timed_out_requests;
+    uint64_t partial_io_failures;
+    uint64_t mismatched_responses;
+    uint64_t direct_cfmws_completions;
+    uint64_t bar4_overlay_completions;
+    uint64_t bulk_overlay_completions;
+    uint64_t coherent_pool_completions;
+    uint64_t local_shadow_completions;
+    uint64_t local_cache_completions;
+    uint64_t delay_events;
+    uint64_t delay_undershoots;
+} CXLType2SlugArchState;
+
+typedef struct CXLType2MemSimV2State {
+    CxlMemsimV2EndpointPair endpoints;
+    bool enabled;
+    uint16_t host_endpoint;
+    uint16_t device_endpoint;
+    uint32_t cache_capacity;
+    uint16_t cache_ways;
+    uint32_t timeout_ms;
+    bool write_through;
+} CXLType2MemSimV2State;
+
+typedef struct CXLType2JitConfig {
+    CXLType2JitState runtime;
+    char *mode;
+    char *library_path;
+    char *policy_path;
+    char *log_path;
+    bool strict;
+    bool advertised;
+    uint32_t diagnostic_length;
+    uint8_t diagnostic[CXL_TYPE2_JIT_DIAGNOSTIC_SIZE];
+} CXLType2JitConfig;
+
 /* Free block for coherent pool allocator */
 typedef struct CXLCohFreeBlock {
     uint64_t offset;            /* Offset within BAR4 */
@@ -115,6 +175,7 @@ typedef struct CXLType2State {
     /* CXL component and device states */
     CXLComponentState cxl_cstate;
     CXLDeviceState cxl_dstate;
+    CXLCCI cci;
 
     /* Memory regions */
     MemoryRegion bar0;                 /* Component registers */
@@ -165,6 +226,9 @@ typedef struct CXLType2State {
 
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;
+    CXLType2MemSimV2State memsim_v2;
+    CXLType2SlugArchState slugarch;
+    CXLType2JitConfig jit;
 
     /* Memory backend for device memory */
     HostMemoryBackend *hostmem;
@@ -178,6 +242,8 @@ typedef struct CXLType2State {
         struct CXLCohFreeBlock *free_list;
         QemuMutex lock;
     } coherent_pool;
+    MemoryRegion coherent_pool_region;  /* RAM window bypassing I/O overlay */
+    void *coherent_pool_ptr;
 
     /* Statistics and monitoring */
     struct {
@@ -253,5 +319,37 @@ int cxl_type2_hetgpu_free(CXLType2State *ct2d, uint64_t dev_ptr);
 int cxl_type2_hetgpu_memcpy_htod(CXLType2State *ct2d, uint64_t dst, const void *src, size_t size);
 int cxl_type2_hetgpu_memcpy_dtoh(CXLType2State *ct2d, void *dst, uint64_t src, size_t size);
 int cxl_type2_hetgpu_sync(CXLType2State *ct2d);
+
+MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
+                                 uint64_t *value, unsigned size,
+                                 MemTxAttrs attrs);
+MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
+                                  uint64_t value, unsigned size,
+                                  MemTxAttrs attrs);
+static inline bool cxl_type2_cfmws_protocol_enabled(bool legacy_wire,
+                                                     bool protocol_v2)
+{
+    return legacy_wire || protocol_v2;
+}
+
+static inline bool cxl_type2_cfmws_shape_valid(unsigned total_windows,
+                                               unsigned num_targets,
+                                               uint8_t encoded_ways,
+                                               uint64_t window_size,
+                                               uint64_t dpa_base,
+                                               uint64_t device_size,
+                                               uint64_t access_offset,
+                                               unsigned access_size)
+{
+    return total_windows == 1 &&
+           num_targets == 1 &&
+           encoded_ways == 0 &&
+           window_size == 256 * MiB &&
+           dpa_base == 0 &&
+           device_size == 256 * MiB &&
+           access_size > 0 &&
+           access_offset <= window_size &&
+           access_size <= window_size - access_offset;
+}
 
 #endif /* CXL_TYPE2_H */

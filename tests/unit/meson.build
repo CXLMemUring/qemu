@@ -1,6 +1,36 @@
 
 testblock = declare_dependency(dependencies: [block], sources: 'iothread.c')
 
+slugarch_jit_fake = shared_module(
+  'slugarch-jit-fake',
+  'slugarch-jit-fake.c',
+  name_prefix: '',
+  include_directories: [
+    include_directories('../..'),
+    include_directories('../../include'),
+  ],
+  dependencies: [glib],
+  install: false,
+)
+slugarch_jit_fake_missing = shared_module(
+  'slugarch-jit-fake-missing',
+  'slugarch-jit-fake.c',
+  name_prefix: '',
+  c_args: ['-DSLUGARCH_JIT_FAKE_OMIT_STATS'],
+  include_directories: [
+    include_directories('../..'),
+    include_directories('../../include'),
+  ],
+  dependencies: [glib],
+  install: false,
+)
+test_deps += {
+  'test-cxl-slugarch-jit': [
+    slugarch_jit_fake,
+    slugarch_jit_fake_missing,
+  ],
+}
+
 tests = {
   'check-block-qdict': [],
   'check-qdict': [],
@@ -48,6 +78,22 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-cxl-type2-wire': [
+    meson.project_source_root() / 'hw/cxl/slugarch_type2_protocol.c',
+    io,
+  ],
+  'test-cxl-memsim-v2': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
+  'test-cxl-memsim-v2-cache': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
+  'test-cxl-type2-route': [],
+  'test-cxl-slugarch-jit': [
+    meson.project_source_root() / 'hw/cxl/slugarch_jit.c',
+  ],
 }
 
 if have_system or have_tools

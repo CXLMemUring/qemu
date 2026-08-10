@@ -1546,26 +1546,40 @@ static void cxl_memsim_init(void) {
 }
 
 /* Connect function - assumes lock is already held */
+static bool cxl_memsim_should_log_connect_attempt(uint64_t attempt)
+{
+    return attempt <= 3 || (attempt % 1024) == 0;
+}
+
 static int cxl_memsim_connect_locked(void) {
     struct sockaddr_in server_addr = {0};
+    static uint64_t connection_count;
+    bool report_attempt;
     
     if (g_memsim.connected) {
         return 0;
     }
 
+    connection_count++;
+    report_attempt = cxl_memsim_should_log_connect_attempt(connection_count);
+
     if (g_memsim.transport_mode == CXL_TRANSPORT_SHM) {
         /* Connect to shared memory */
         g_memsim.shm_fd = shm_open(g_memsim.shm_name, O_RDWR, 0666);
         if (g_memsim.shm_fd < 0) {
-            error_report("CXL Type3: Failed to open shared memory %s: %s",
-                        g_memsim.shm_name, strerror(errno));
+            if (report_attempt) {
+                error_report("CXL Type3: Failed to open shared memory %s: %s",
+                             g_memsim.shm_name, strerror(errno));
+            }
             return -1;
         }
 
         /* Get size from stat */
         struct stat sb;
         if (fstat(g_memsim.shm_fd, &sb) < 0) {
-            error_report("CXL Type3: fstat failed on shm: %s", strerror(errno));
+            if (report_attempt) {
+                error_report("CXL Type3: fstat failed on shm: %s", strerror(errno));
+            }
             close(g_memsim.shm_fd);
             g_memsim.shm_fd = -1;
             return -1;
@@ -1577,7 +1591,9 @@ static int cxl_memsim_connect_locked(void) {
         void *mapped = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED,
                            g_memsim.shm_fd, 0);
         if (mapped == MAP_FAILED) {
-            error_report("CXL Type3: mmap failed on shm: %s", strerror(errno));
+            if (report_attempt) {
+                error_report("CXL Type3: mmap failed on shm: %s", strerror(errno));
+            }
             close(g_memsim.shm_fd);
             g_memsim.shm_fd = -1;
             return -1;
@@ -1587,9 +1603,11 @@ static int cxl_memsim_connect_locked(void) {
 
         /* Validate magic number */
         if (g_memsim.shm_header->magic != CXL_SHM_MAGIC) {
-            error_report("CXL Type3: SHM invalid magic (got 0x%lx, expected 0x%lx)",
-                        (unsigned long)g_memsim.shm_header->magic,
-                        (unsigned long)CXL_SHM_MAGIC);
+            if (report_attempt) {
+                error_report("CXL Type3: SHM invalid magic (got 0x%lx, expected 0x%lx)",
+                             (unsigned long)g_memsim.shm_header->magic,
+                             (unsigned long)CXL_SHM_MAGIC);
+            }
             munmap(mapped, shm_size);
             close(g_memsim.shm_fd);
             g_memsim.shm_fd = -1;
@@ -1605,7 +1623,9 @@ static int cxl_memsim_connect_locked(void) {
         }
 
         if (retries == 0) {
-            error_report("CXL Type3: SHM server not ready after timeout");
+            if (report_attempt) {
+                error_report("CXL Type3: SHM server not ready after timeout");
+            }
             munmap(mapped, shm_size);
             close(g_memsim.shm_fd);
             g_memsim.shm_fd = -1;
@@ -1637,26 +1657,34 @@ static int cxl_memsim_connect_locked(void) {
         if (cxl_memsim_rdma_available()) {
             /* Use TCP port 9999 for RDMA-aware connections */
             int connection_port = 9999;
-            info_report("CXL Type3: Attempting RDMA connection to %s:%d", 
-                       g_memsim.host, connection_port);
+            if (report_attempt) {
+                info_report("CXL Type3: Attempting RDMA connection to %s:%d",
+                            g_memsim.host, connection_port);
+            }
             int ret = cxl_memsim_rdma_connect(g_memsim.host, connection_port);
             if (ret == 0) {
                 g_memsim.connected = true;
                 info_report("CXL Type3: RDMA-mode connection successful");
                 return 0;
             }
-            error_report("CXL Type3: RDMA-mode connection failed, falling back to TCP");
+            if (report_attempt) {
+                error_report("CXL Type3: RDMA-mode connection failed, falling back to TCP");
+            }
         } else {
-            error_report("CXL Type3: RDMA not available, falling back to TCP");
+            if (report_attempt) {
+                error_report("CXL Type3: RDMA not available, falling back to TCP");
+            }
         }
         g_memsim.transport_mode = CXL_TRANSPORT_TCP;
     }
     
     /* Add debugging to track connection source with backtrace */
-    static int connection_count = 0;
-    connection_count++;
-    info_report("CXL Type3: Connection attempt #%d to CXLMemSim server at %s:%d",
-                connection_count, g_memsim.host, g_memsim.port);
+    if (report_attempt) {
+        info_report("CXL Type3: Connection attempt #%lu"
+                    " to CXLMemSim server at %s:%d",
+                    (unsigned long)connection_count, g_memsim.host,
+                    g_memsim.port);
+    }
     
     g_memsim.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_memsim.socket_fd < 0) {
@@ -1671,7 +1699,9 @@ static int cxl_memsim_connect_locked(void) {
                 sizeof(server_addr)) < 0) {
         close(g_memsim.socket_fd);
         g_memsim.socket_fd = -1;
-        error_report("CXL Type3: Failed to connect to CXLMemSim");
+        if (report_attempt) {
+            error_report("CXL Type3: Failed to connect to CXLMemSim");
+        }
         return -1;
     }
     
@@ -1954,7 +1984,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     }
 
     /* Forward to CXLMemSim if enabled */
-    if (g_memsim.enabled && g_memsim.connected) {
+    if (g_memsim.enabled) {
         CXLMemSimResponse resp = {0};
 
         /* Record wall-clock time before IPC for latency compensation */
@@ -2011,7 +2041,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     }
 
     /* Forward to CXLMemSim if enabled */
-    if (g_memsim.enabled && g_memsim.connected) {
+    if (g_memsim.enabled) {
         CXLMemSimResponse resp = {0};
 
         /* Record wall-clock time before IPC for latency compensation */
@@ -2115,8 +2145,10 @@ static uint64_t get_lsa(CXLType3Dev *ct3d, void *buf, uint64_t size,
         return 0;
     }
 
+    cxl_memsim_init();
+
     /* Route LSA reads through CXLMemSim server when connected */
-    if (g_memsim.enabled && g_memsim.connected &&
+    if (g_memsim.enabled &&
         (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
          g_memsim.transport_mode == CXL_TRANSPORT_RDMA)) {
         uint64_t remaining = size;
@@ -2162,8 +2194,10 @@ static void set_lsa(CXLType3Dev *ct3d, const void *buf, uint64_t size,
         return;
     }
 
+    cxl_memsim_init();
+
     /* Route LSA writes through CXLMemSim server when connected */
-    if (g_memsim.enabled && g_memsim.connected &&
+    if (g_memsim.enabled &&
         (g_memsim.transport_mode == CXL_TRANSPORT_TCP ||
          g_memsim.transport_mode == CXL_TRANSPORT_RDMA)) {
         uint64_t remaining = size;
