@@ -189,6 +189,10 @@ typedef enum {
     CXL_GPU_CMD_CACHE_FLUSH     = 0x80,  /* Flush cache lines to device */
     CXL_GPU_CMD_CACHE_INVALIDATE= 0x81,  /* Invalidate cache lines */
     CXL_GPU_CMD_CACHE_WRITEBACK = 0x82,  /* Writeback dirty cache lines */
+    CXL_GPU_CMD_COHERENT_LOAD   = 0x83,  /* Protocol-v2 device load */
+    CXL_GPU_CMD_COHERENT_STORE  = 0x84,  /* Protocol-v2 device store */
+    CXL_GPU_CMD_COHERENT_FAA    = 0x85,  /* Protocol-v2 fetch-and-add */
+    CXL_GPU_CMD_COHERENT_CAS    = 0x86,  /* Protocol-v2 compare-and-swap */
 
     /* P2P DMA commands: defined as macros in cxl_p2p_dma.h (0x90-0x96) */
 

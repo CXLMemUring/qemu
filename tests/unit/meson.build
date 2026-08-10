@@ -82,6 +82,14 @@ tests = {
     meson.project_source_root() / 'hw/cxl/slugarch_type2_protocol.c',
     io,
   ],
+  'test-cxl-memsim-v2': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
+  'test-cxl-memsim-v2-cache': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
   'test-cxl-type2-route': [],
   'test-cxl-slugarch-jit': [
     meson.project_source_root() / 'hw/cxl/slugarch_jit.c',

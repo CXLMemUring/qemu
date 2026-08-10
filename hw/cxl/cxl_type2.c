@@ -37,6 +37,9 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "system/memory.h"
+
+#define CXL_TYPE2_DEVICE_REG_OFFSET CXL2_COMPONENT_BLOCK_SIZE
+#define CXL_TYPE2_BAR0_SIZE (2 * CXL2_COMPONENT_BLOCK_SIZE)
 #include "io/channel-socket.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1434,6 +1437,70 @@ static void cxlmemsim_disconnect(CXLType2State *ct2d)
     }
 }
 
+static void cxl_type2_memsim_v2_disconnect(CXLType2State *ct2d)
+{
+    cxl_memsim_v2_client_free(ct2d->memsim_v2.endpoints.device);
+    cxl_memsim_v2_client_free(ct2d->memsim_v2.endpoints.host);
+    ct2d->memsim_v2.endpoints.device = NULL;
+    ct2d->memsim_v2.endpoints.host = NULL;
+}
+
+static bool cxl_type2_memsim_v2_connect(CXLType2State *ct2d, Error **errp)
+{
+    CXLType2MemSimV2State *v2 = &ct2d->memsim_v2;
+    Error *local_err = NULL;
+
+    v2->endpoints.host = cxl_memsim_v2_client_new(v2->host_endpoint,
+                                                   NULL, NULL);
+    v2->endpoints.device = cxl_memsim_v2_client_new(v2->device_endpoint,
+                                                     NULL, NULL);
+    if (!v2->endpoints.host || !v2->endpoints.device) {
+        error_setg(&local_err, "cannot allocate CXLMemSim v2 endpoints");
+        goto fail;
+    }
+    if (!cxl_memsim_v2_client_set_write_policy(
+            v2->endpoints.host,
+            v2->write_through ? CXL_MEMSIM_V2_WRITE_THROUGH :
+                                CXL_MEMSIM_V2_WRITE_BACK,
+            &local_err) ||
+        !cxl_memsim_v2_client_set_write_policy(
+            v2->endpoints.device,
+            v2->write_through ? CXL_MEMSIM_V2_WRITE_THROUGH :
+                                CXL_MEMSIM_V2_WRITE_BACK,
+            &local_err)) {
+        goto fail;
+    }
+    if (!cxl_memsim_v2_client_connect(
+            v2->endpoints.host, ct2d->memsim.server_addr,
+            ct2d->memsim.server_port, v2->cache_capacity,
+            v2->cache_ways, v2->timeout_ms, &local_err)) {
+        error_prepend(&local_err, "host endpoint %u registration failed: ",
+                      v2->host_endpoint);
+        goto fail;
+    }
+    if (!cxl_memsim_v2_client_connect(
+            v2->endpoints.device, ct2d->memsim.server_addr,
+            ct2d->memsim.server_port, v2->cache_capacity,
+            v2->cache_ways, v2->timeout_ms, &local_err)) {
+        error_prepend(&local_err, "device endpoint %u registration failed: ",
+                      v2->device_endpoint);
+        goto fail;
+    }
+    qemu_log("CXL Type2: protocol-v2 host endpoint %u session 0x%" PRIx64
+             ", device endpoint %u session 0x%" PRIx64 ", policy=%s\n",
+             v2->host_endpoint,
+             cxl_memsim_v2_client_session(v2->endpoints.host),
+             v2->device_endpoint,
+             cxl_memsim_v2_client_session(v2->endpoints.device),
+             v2->write_through ? "write-through" : "write-back");
+    return true;
+
+fail:
+    cxl_type2_memsim_v2_disconnect(ct2d);
+    error_propagate(errp, local_err);
+    return false;
+}
+
 static void *cxlmemsim_recv_thread(void *opaque)
 {
     CXLType2State *ct2d = opaque;
@@ -1868,6 +1935,28 @@ MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
                                  uint64_t *value, unsigned size,
                                  MemTxAttrs attrs)
 {
+    CXLType2State *ct2d = CXL_TYPE2(pdev);
+    Error *local_err = NULL;
+
+    if (ct2d->memsim_v2.enabled) {
+        CxlMemsimV2Client *client = cxl_memsim_v2_path_client(
+            &ct2d->memsim_v2.endpoints,
+            CXL_MEMSIM_V2_PATH_CFMWS_HOST);
+
+        (void)attrs;
+        if (!value || dpa > ct2d->device_mem_size ||
+            size > ct2d->device_mem_size - dpa ||
+            !cxl_memsim_v2_load(client, dpa, size, value,
+                                ct2d->memsim_v2.timeout_ms, &local_err)) {
+            if (local_err) {
+                error_prepend(&local_err,
+                              "CXL Type2 protocol-v2 CFMWS read failed: ");
+                error_report_err(local_err);
+            }
+            return MEMTX_ERROR;
+        }
+        return MEMTX_OK;
+    }
     return cxl_type2_slugarch_access(CXL_TYPE2(pdev), false, dpa,
                                      value, size, attrs);
 }
@@ -1876,6 +1965,28 @@ MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
                                   uint64_t value, unsigned size,
                                   MemTxAttrs attrs)
 {
+    CXLType2State *ct2d = CXL_TYPE2(pdev);
+    Error *local_err = NULL;
+
+    if (ct2d->memsim_v2.enabled) {
+        CxlMemsimV2Client *client = cxl_memsim_v2_path_client(
+            &ct2d->memsim_v2.endpoints,
+            CXL_MEMSIM_V2_PATH_CFMWS_HOST);
+
+        (void)attrs;
+        if (dpa > ct2d->device_mem_size ||
+            size > ct2d->device_mem_size - dpa ||
+            !cxl_memsim_v2_store(client, dpa, size, value,
+                                 ct2d->memsim_v2.timeout_ms, &local_err)) {
+            if (local_err) {
+                error_prepend(&local_err,
+                              "CXL Type2 protocol-v2 CFMWS write failed: ");
+                error_report_err(local_err);
+            }
+            return MEMTX_ERROR;
+        }
+        return MEMTX_OK;
+    }
     return cxl_type2_slugarch_access(CXL_TYPE2(pdev), true, dpa,
                                      &value, size, attrs);
 }
@@ -2528,6 +2639,29 @@ static uint32_t cxl_type2_jit_get_diagnostic(CXLType2State *ct2d,
     return SLUG_JIT_OK;
 }
 
+static bool cxl_type2_memsim_v2_range_valid(CXLType2State *ct2d,
+                                             uint64_t address,
+                                             unsigned size)
+{
+    return address <= ct2d->device_mem_size &&
+           size <= ct2d->device_mem_size - address;
+}
+
+static CxlMemsimV2Client *cxl_type2_memsim_v2_device_client(
+    CXLType2State *ct2d)
+{
+    return cxl_memsim_v2_path_client(&ct2d->memsim_v2.endpoints,
+                                     CXL_MEMSIM_V2_PATH_BAR2_DEVICE);
+}
+
+static void cxl_type2_memsim_v2_command_error(Error *err)
+{
+    if (err) {
+        error_prepend(&err, "CXL Type2 BAR2 protocol-v2 command failed: ");
+        error_report_err(err);
+    }
+}
+
 static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
@@ -2537,6 +2671,10 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
     bool jit_command =
         cmd >= CXL_GPU_CMD_J_QUERY &&
         cmd <= CXL_GPU_CMD_J_GET_DIAGNOSTIC;
+    bool memsim_v2_command =
+        (cmd >= CXL_GPU_CMD_COHERENT_LOAD &&
+         cmd <= CXL_GPU_CMD_COHERENT_CAS) ||
+        cmd == CXL_GPU_CMD_COHERENT_FENCE;
 
     qemu_log_mask(LOG_GUEST_ERROR,
                   "CXL GPU: execute cmd 0x%x, hetgpu_init=%d, ctx=%p\n",
@@ -2544,7 +2682,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     ct2d->gpu_cmd.cmd_status = CXL_GPU_CMD_STATUS_RUNNING;
     ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
-    if (jit_command) {
+    if (jit_command || memsim_v2_command) {
         memset(ct2d->gpu_cmd.results, 0, sizeof(ct2d->gpu_cmd.results));
     }
 
@@ -2995,6 +3133,119 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_COHERENT_LOAD:
+        {
+            uint64_t address = ct2d->gpu_cmd.params[0];
+            unsigned access_size = ct2d->gpu_cmd.params[1];
+            uint64_t value = 0;
+            Error *local_err = NULL;
+
+            if (!ct2d->memsim_v2.enabled) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            } else if (!cxl_type2_memsim_v2_range_valid(
+                           ct2d, address, access_size)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (!cxl_memsim_v2_load(
+                           cxl_type2_memsim_v2_device_client(ct2d),
+                           address, access_size, &value,
+                           ct2d->memsim_v2.timeout_ms, &local_err)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                cxl_type2_memsim_v2_command_error(local_err);
+            } else {
+                ct2d->gpu_cmd.results[0] = value;
+                ct2d->gpu_cmd.results[1] =
+                    ct2d->memsim_v2.device_endpoint;
+                ct2d->gpu_cmd.results[2] = cxl_memsim_v2_client_session(
+                    cxl_type2_memsim_v2_device_client(ct2d));
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_STORE:
+        {
+            uint64_t address = ct2d->gpu_cmd.params[0];
+            unsigned access_size = ct2d->gpu_cmd.params[1];
+            uint64_t value = ct2d->gpu_cmd.params[2];
+            Error *local_err = NULL;
+
+            if (!ct2d->memsim_v2.enabled) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            } else if (!cxl_type2_memsim_v2_range_valid(
+                           ct2d, address, access_size)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (!cxl_memsim_v2_store(
+                           cxl_type2_memsim_v2_device_client(ct2d),
+                           address, access_size, value,
+                           ct2d->memsim_v2.timeout_ms, &local_err)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                cxl_type2_memsim_v2_command_error(local_err);
+            } else {
+                ct2d->gpu_cmd.results[1] =
+                    ct2d->memsim_v2.device_endpoint;
+                ct2d->gpu_cmd.results[2] = cxl_memsim_v2_client_session(
+                    cxl_type2_memsim_v2_device_client(ct2d));
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_FAA:
+        {
+            uint64_t address = ct2d->gpu_cmd.params[0];
+            uint64_t addend = ct2d->gpu_cmd.params[1];
+            uint64_t old_value = 0;
+            uint64_t new_value = 0;
+            Error *local_err = NULL;
+
+            if (!ct2d->memsim_v2.enabled) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            } else if (!cxl_type2_memsim_v2_range_valid(
+                           ct2d, address, sizeof(uint64_t))) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (!cxl_memsim_v2_fetch_add(
+                           cxl_type2_memsim_v2_device_client(ct2d),
+                           address, addend, &old_value, &new_value,
+                           ct2d->memsim_v2.timeout_ms, &local_err)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                cxl_type2_memsim_v2_command_error(local_err);
+            } else {
+                ct2d->gpu_cmd.results[0] = old_value;
+                ct2d->gpu_cmd.results[1] = new_value;
+                ct2d->gpu_cmd.results[2] = cxl_memsim_v2_client_session(
+                    cxl_type2_memsim_v2_device_client(ct2d));
+            }
+        }
+        break;
+
+    case CXL_GPU_CMD_COHERENT_CAS:
+        {
+            uint64_t address = ct2d->gpu_cmd.params[0];
+            uint64_t expected_value = ct2d->gpu_cmd.params[1];
+            uint64_t desired = ct2d->gpu_cmd.params[2];
+            uint64_t old_value = 0;
+            uint64_t new_value = 0;
+            Error *local_err = NULL;
+
+            if (!ct2d->memsim_v2.enabled) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_INITIALIZED;
+            } else if (!cxl_type2_memsim_v2_range_valid(
+                           ct2d, address, sizeof(uint64_t))) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (!cxl_memsim_v2_compare_exchange(
+                           cxl_type2_memsim_v2_device_client(ct2d),
+                           address, expected_value, desired,
+                           &old_value, &new_value,
+                           ct2d->memsim_v2.timeout_ms, &local_err)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                cxl_type2_memsim_v2_command_error(local_err);
+            } else {
+                ct2d->gpu_cmd.results[0] = old_value;
+                ct2d->gpu_cmd.results[1] = new_value;
+                ct2d->gpu_cmd.results[2] = cxl_memsim_v2_client_session(
+                    cxl_type2_memsim_v2_device_client(ct2d));
+            }
+        }
+        break;
+
     /* P2P DMA commands */
     case CXL_GPU_CMD_P2P_DISCOVER:
         /* Discover P2P peer devices */
@@ -3128,10 +3379,28 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 
     case CXL_GPU_CMD_COHERENT_FENCE:
         {
-            /* Memory fence - ensure all pending coherency ops complete */
-            cxl_bar_memory_fence(&ct2d->bar_coherency, CXL_DOMAIN_CPU);
-            cxl_bar_process_back_invalidations(ct2d);
-            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            if (ct2d->memsim_v2.enabled) {
+                Error *local_err = NULL;
+
+                if (!cxl_memsim_v2_fence(
+                        cxl_type2_memsim_v2_device_client(ct2d),
+                        ct2d->memsim_v2.timeout_ms, &local_err)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_UNKNOWN;
+                    cxl_type2_memsim_v2_command_error(local_err);
+                } else {
+                    ct2d->gpu_cmd.results[1] =
+                        ct2d->memsim_v2.device_endpoint;
+                    ct2d->gpu_cmd.results[2] =
+                        cxl_memsim_v2_client_session(
+                            cxl_type2_memsim_v2_device_client(ct2d));
+                }
+            } else {
+                /* Preserve the legacy local fence when v2 is disabled. */
+                cxl_bar_memory_fence(&ct2d->bar_coherency,
+                                     CXL_DOMAIN_CPU);
+                cxl_bar_process_back_invalidations(ct2d);
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+            }
         }
         break;
 
@@ -3578,15 +3847,13 @@ static void build_dvsecs(CXLType2State *ct2d)
                               PCIE_CXL31_DEVICE_DVSEC_REVID,
                               dvsec);
 
-    /* Register Locator DVSEC
-     * Type 2 devices only have component registers in BAR0
-     * BAR2 is used for cache memory, not CXL device registers
-     */
+    /* BAR2 remains cache memory; the device-register block follows BAR0. */
     dvsec = (uint8_t *)&(CXLDVSECRegisterLocator){
         .rsvd = 0,
         .reg0_base_lo = RBI_COMPONENT_REG | CXL_COMPONENT_REG_BAR_IDX,
         .reg0_base_hi = 0,
-        .reg1_base_lo = RBI_EMPTY,  /* No device registers - Type 2 uses cache memory at BAR2 */
+        .reg1_base_lo = CXL_TYPE2_DEVICE_REG_OFFSET |
+                        RBI_CXL_DEVICE_REG | CXL_COMPONENT_REG_BAR_IDX,
         .reg1_base_hi = 0,
     };
 
@@ -3690,6 +3957,10 @@ static void cxl_type2_reset(DeviceState *dev)
     uint32_t *write_msk = cxl_cstate->crb.cache_mem_regs_write_mask;
 
     cxl_component_register_init_common(reg_state, write_msk, CXL2_TYPE3_DEVICE);
+    if (ct2d->cci.initialized) {
+        cxl_destroy_cci(&ct2d->cci);
+    }
+    cxl_device_register_init_t2(ct2d, 0);
 
     /* Reset statistics */
     memset(&ct2d->stats, 0, sizeof(ct2d->stats));
@@ -3717,6 +3988,42 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     }
     if (ct2d->device_mem_size == 0) {
         ct2d->device_mem_size = CXL_TYPE2_DEFAULT_MEM_SIZE;
+    }
+    if (ct2d->memsim_v2.enabled) {
+        uint32_t cache_lines =
+            ct2d->memsim_v2.cache_capacity / CXL_MEMSIM_V2_LINE_SIZE;
+
+        if (ct2d->slugarch.enabled) {
+            error_setg(errp,
+                       "coherence-v2 and sync-type2-wire are mutually exclusive");
+            return;
+        }
+        if (ct2d->device_mem_size != 256 * MiB) {
+            error_setg(errp,
+                       "coherence-v2 requires mem-size=268435456");
+            return;
+        }
+        if (ct2d->memsim_v2.host_endpoint >=
+                CXL_MEMSIM_V2_MAX_ENDPOINTS ||
+            ct2d->memsim_v2.device_endpoint >=
+                CXL_MEMSIM_V2_MAX_ENDPOINTS ||
+            ct2d->memsim_v2.host_endpoint ==
+                ct2d->memsim_v2.device_endpoint) {
+            error_setg(errp,
+                       "coherence-v2 host/device endpoints must be distinct values below 64");
+            return;
+        }
+        if (ct2d->memsim_v2.cache_capacity <
+                CXL_MEMSIM_V2_LINE_SIZE ||
+            ct2d->memsim_v2.cache_capacity %
+                CXL_MEMSIM_V2_LINE_SIZE ||
+            !ct2d->memsim_v2.cache_ways ||
+            cache_lines % ct2d->memsim_v2.cache_ways ||
+            !ct2d->memsim_v2.timeout_ms) {
+            error_setg(errp,
+                       "invalid coherence-v2 cache geometry or timeout");
+            return;
+        }
     }
     if (ct2d->cache_size < MiB ||
         ct2d->cache_size > 255 * MiB ||
@@ -3758,15 +4065,23 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate,
                                       TYPE_CXL_TYPE2);
 
+    ct2d->cxl_dstate.static_mem_size = ct2d->device_mem_size;
+    ct2d->cxl_dstate.vmem_size = ct2d->device_mem_size;
+    ct2d->cxl_dstate.pmem_size = 0;
+    cxl_device_register_block_init(OBJECT(pci_dev), &ct2d->cxl_dstate,
+                                   &ct2d->cci);
+
     /* BAR0: Component registers */
     memory_region_init(&ct2d->bar0, OBJECT(ct2d), "cxl-type2-bar0",
-                      CXL2_COMPONENT_BLOCK_SIZE);
+                       CXL_TYPE2_BAR0_SIZE);
 
     memory_region_init_io(&ct2d->component_registers, OBJECT(ct2d),
                          &cxl_type2_component_reg_ops, cxl_cstate,
                          "cxl-type2-component",
                          CXL2_COMPONENT_CM_REGION_SIZE);
     memory_region_add_subregion(&ct2d->bar0, 0, &ct2d->component_registers);
+    memory_region_add_subregion(&ct2d->bar0, CXL_TYPE2_DEVICE_REG_OFFSET,
+                                &ct2d->cxl_dstate.device_registers);
 
     pci_register_bar(pci_dev, 0,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -3946,8 +4261,12 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
         }
     }
 
-    /* Connect to CXLMemSim. Synchronous mode owns every response inline. */
-    if (ct2d->slugarch.enabled) {
+    /* Protocol v2 owns two duplex sessions; v1 remains the legacy path. */
+    if (ct2d->memsim_v2.enabled) {
+        if (!cxl_type2_memsim_v2_connect(ct2d, errp)) {
+            return;
+        }
+    } else if (ct2d->slugarch.enabled) {
         if (!cxl_type2_slugarch_handshake(ct2d, errp)) {
             return;
         }
@@ -3979,6 +4298,7 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
         qemu_mutex_unlock(&ct2d->memsim.lock);
     }
     /* Disconnect from CXLMemSim */
+    cxl_type2_memsim_v2_disconnect(ct2d);
     cxlmemsim_disconnect(ct2d);
     if (ct2d->memsim.recv_thread.thread) {
         qemu_thread_join(&ct2d->memsim.recv_thread);
@@ -4000,6 +4320,10 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 
     /* Cleanup P2P DMA engine */
     cxl_p2p_dma_cleanup(&ct2d->p2p_engine);
+
+    if (ct2d->cci.initialized) {
+        cxl_destroy_cci(&ct2d->cci);
+    }
 
     /* Cleanup coherent pool */
     if (ct2d->coherent_pool.allocations) {
@@ -4045,6 +4369,22 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType2State, memsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType2State, memsim.server_port, 9999),
+    DEFINE_PROP_BOOL("coherence-v2", CXLType2State,
+                     memsim_v2.enabled, false),
+    DEFINE_PROP_UINT16("coherence-v2-host-endpoint", CXLType2State,
+                       memsim_v2.host_endpoint,
+                       CXL_MEMSIM_V2_HOST_ENDPOINT),
+    DEFINE_PROP_UINT16("coherence-v2-device-endpoint", CXLType2State,
+                       memsim_v2.device_endpoint,
+                       CXL_MEMSIM_V2_DEVICE_ENDPOINT),
+    DEFINE_PROP_UINT32("coherence-v2-cache-capacity", CXLType2State,
+                       memsim_v2.cache_capacity, 256 * KiB),
+    DEFINE_PROP_UINT16("coherence-v2-cache-ways", CXLType2State,
+                       memsim_v2.cache_ways, 4),
+    DEFINE_PROP_UINT32("coherence-v2-timeout-ms", CXLType2State,
+                       memsim_v2.timeout_ms, 2000),
+    DEFINE_PROP_BOOL("coherence-v2-write-through", CXLType2State,
+                     memsim_v2.write_through, false),
     DEFINE_PROP_BOOL("sync-type2-wire", CXLType2State,
                      slugarch.enabled, false),
     DEFINE_PROP_UINT16("type2-wire-version", CXLType2State,

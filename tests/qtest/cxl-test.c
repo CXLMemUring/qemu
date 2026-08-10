@@ -7,7 +7,11 @@
 
 #include "qemu/osdep.h"
 #include "libqtest-single.h"
+#include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_component.h"
+#include "hw/cxl/cxl_device.h"
+#include "hw/cxl/cxl_memsim_v2.h"
+#include "hw/cxl/cxl_pci.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/pci/pci_regs.h"
 #include "qemu/bswap.h"
@@ -52,6 +56,13 @@
     "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
     "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 "
 
+#define QEMU_T2_V2_CFMWS_BASE \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52," \
+    "hdm_for_passthrough=on " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,addr=0.0,chassis=0,slot=0 "
+
 #define QEMU_T2_CFMWS_TWO_TARGETS \
     "-machine q35,cxl=on -m 128M " \
     "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
@@ -80,6 +91,8 @@
 #define Q35_CXL_HB_CACHE_MEM_BASE (Q35_CXL_HOST_REG_BASE + 0x1000)
 #define Q35_CFMWS_BASE UINT64_C(0x110000000)
 #define T2_DVSEC_DEVFN (4U << 3)
+#define T2_DVSEC_BAR0_BASE UINT64_C(0xd2000000)
+#define T2_DEVICE_REG_OFFSET UINT64_C(0x10000)
 #define T2_SENTINEL_DPA (80 * MiB)
 #define T2_SERVER_READ_VALUE UINT64_C(0x1122334455667788)
 #define T2_CLIENT_WRITE_VALUE UINT64_C(0x8877665544332211)
@@ -87,6 +100,9 @@
 #define T2_CFMWS_MAX_LATENCY_NS UINT64_C(1000000)
 #define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
 #define T2_JEXT_BAR2_BASE UINT64_C(0x80000000)
+#define T2_V2_BAR2_BASE UINT64_C(0xd0000000)
+#define T2_V2_HOST_SESSION UINT64_C(0x1001)
+#define T2_V2_DEVICE_SESSION UINT64_C(0x2001)
 #define T2_FAKE_POLICY_DIGEST \
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5" \
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
@@ -446,6 +462,336 @@ static void t2_fake_server_stop(T2FakeServer *server)
     g_thread_join(server->thread);
 }
 
+typedef struct T2V2FakeServer {
+    int listen_fd;
+    int client_fd[2];
+    uint16_t port;
+    GThread *thread;
+    gint stop;
+    int error_code;
+    bool registered[2];
+    uint64_t sessions[2];
+    uint64_t request_sessions[2];
+    unsigned requests[2][CXL_MEMSIM_V2_OP_FENCE + 1];
+    uint64_t line_address;
+    uint64_t epoch;
+    uint8_t line[CXL_MEMSIM_V2_LINE_SIZE];
+} T2V2FakeServer;
+
+static void t2_v2_frame_init(uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE],
+                             uint16_t opcode)
+{
+    memset(frame, 0, CXL_MEMSIM_V2_FRAME_SIZE);
+    stl_le_p(frame, CXL_MEMSIM_V2_MAGIC);
+    stw_le_p(frame + 4, CXL_MEMSIM_V2_VERSION);
+    stw_le_p(frame + 6, opcode);
+}
+
+static bool t2_v2_register_valid(const uint8_t *request,
+                                 uint16_t *endpoint)
+{
+    *endpoint = lduw_le_p(request + 16);
+    return ldl_le_p(request) == CXL_MEMSIM_V2_MAGIC &&
+           lduw_le_p(request + 4) == CXL_MEMSIM_V2_VERSION &&
+           lduw_le_p(request + 6) == CXL_MEMSIM_V2_OP_REGISTER &&
+           ldl_le_p(request + 8) == 0 &&
+           lduw_le_p(request + 12) == CXL_MEMSIM_V2_STATUS_OK &&
+           request[14] == CXL_MEMSIM_V2_ACK_NONE &&
+           request[15] == CXL_MEMSIM_V2_STATE_I &&
+           *endpoint <= CXL_MEMSIM_V2_DEVICE_ENDPOINT &&
+           lduw_le_p(request + 18) == CXL_MEMSIM_V2_SERVER_ENDPOINT &&
+           lduw_le_p(request + 20) == 0 &&
+           ldq_le_p(request + 24) == 0 &&
+           ldq_le_p(request + 32) == 0 &&
+           ldq_le_p(request + 40) == 0 &&
+           ldq_le_p(request + 48) == 0 &&
+           ldq_le_p(request + 56) == 0 &&
+           ldq_le_p(request + 64) == CXL_MEMSIM_V2_CAP_MODEL_SNOOP &&
+           ldq_le_p(request + 72) == 4 &&
+           ldq_le_p(request + 80) == 256 * KiB &&
+           ldq_le_p(request + 88) == 0 &&
+           ldl_le_p(request + 96) == CXL_MEMSIM_V2_LINE_SIZE &&
+           ldl_le_p(request + 100) == 0;
+}
+
+static bool t2_v2_send_register_response(T2V2FakeServer *server,
+                                         int fd, uint16_t endpoint,
+                                         const uint8_t *request)
+{
+    uint8_t response[CXL_MEMSIM_V2_FRAME_SIZE];
+
+    t2_v2_frame_init(response, CXL_MEMSIM_V2_OP_RESPONSE);
+    response[14] = CXL_MEMSIM_V2_ACK_MODEL;
+    stw_le_p(response + 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
+    stw_le_p(response + 18, endpoint);
+    stq_le_p(response + 24, ldq_le_p(request + 24));
+    stq_le_p(response + 40, server->sessions[endpoint]);
+    stq_le_p(response + 64, CXL_MEMSIM_V2_CAP_MODEL_SNOOP);
+    stq_le_p(response + 72, ldq_le_p(request + 72));
+    stq_le_p(response + 80, ldq_le_p(request + 80));
+    stq_le_p(response + 88, 1);
+    stl_le_p(response + 96, CXL_MEMSIM_V2_LINE_SIZE);
+    return t2_write_exact(fd, response, sizeof(response));
+}
+
+static bool t2_v2_request_valid(T2V2FakeServer *server,
+                                uint16_t endpoint,
+                                const uint8_t *request, uint16_t *opcode)
+{
+    *opcode = lduw_le_p(request + 6);
+    return ldl_le_p(request) == CXL_MEMSIM_V2_MAGIC &&
+           lduw_le_p(request + 4) == CXL_MEMSIM_V2_VERSION &&
+           *opcode >= CXL_MEMSIM_V2_OP_GETS &&
+           *opcode <= CXL_MEMSIM_V2_OP_FENCE &&
+           ldl_le_p(request + 8) == 0 &&
+           lduw_le_p(request + 12) == CXL_MEMSIM_V2_STATUS_OK &&
+           request[14] == CXL_MEMSIM_V2_ACK_NONE &&
+           lduw_le_p(request + 16) == endpoint &&
+           lduw_le_p(request + 18) == CXL_MEMSIM_V2_SERVER_ENDPOINT &&
+           ldq_le_p(request + 24) != 0 &&
+           ldq_le_p(request + 32) == 0 &&
+           ldq_le_p(request + 40) == server->sessions[endpoint] &&
+           ldl_le_p(request + 100) == 0;
+}
+
+static bool t2_v2_send_response(T2V2FakeServer *server, uint16_t endpoint,
+                                const uint8_t *request, uint8_t state,
+                                uint64_t epoch, bool include_line,
+                                uint64_t old_value)
+{
+    uint8_t response[CXL_MEMSIM_V2_FRAME_SIZE];
+
+    t2_v2_frame_init(response, CXL_MEMSIM_V2_OP_RESPONSE);
+    response[15] = state;
+    stw_le_p(response + 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
+    stw_le_p(response + 18, endpoint);
+    stq_le_p(response + 24, ldq_le_p(request + 24));
+    stq_le_p(response + 40, server->sessions[endpoint]);
+    stq_le_p(response + 48, ldq_le_p(request + 48));
+    stq_le_p(response + 56, epoch);
+    stq_le_p(response + 88, old_value);
+    if (include_line) {
+        stw_le_p(response + 20, CXL_MEMSIM_V2_LINE_SIZE);
+        memcpy(response + 104, server->line, sizeof(server->line));
+    }
+    return t2_write_exact(server->client_fd[endpoint], response,
+                          sizeof(response));
+}
+
+static bool t2_v2_handle_request(T2V2FakeServer *server,
+                                 uint16_t endpoint,
+                                 const uint8_t *request)
+{
+    uint64_t address = ldq_le_p(request + 48);
+    uint16_t opcode;
+    unsigned line_offset;
+    uint64_t old_value;
+
+    if (!t2_v2_request_valid(server, endpoint, request, &opcode)) {
+        return false;
+    }
+    server->request_sessions[endpoint] = ldq_le_p(request + 40);
+    server->requests[endpoint][opcode]++;
+
+    switch (opcode) {
+    case CXL_MEMSIM_V2_OP_GETS:
+        return address == server->line_address &&
+               t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_E,
+                                   ++server->epoch, true, 0);
+    case CXL_MEMSIM_V2_OP_GETM:
+        return address == server->line_address &&
+               t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_M,
+                                   ++server->epoch, true, 0);
+    case CXL_MEMSIM_V2_OP_PUTS:
+        return address == server->line_address &&
+               lduw_le_p(request + 20) == 0 &&
+               t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_I,
+                                   ++server->epoch, false, 0);
+    case CXL_MEMSIM_V2_OP_PUTM:
+        if (address != server->line_address ||
+            lduw_le_p(request + 20) != CXL_MEMSIM_V2_LINE_SIZE) {
+            return false;
+        }
+        memcpy(server->line, request + 104, sizeof(server->line));
+        return t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_I,
+                                   ++server->epoch, false, 0);
+    case CXL_MEMSIM_V2_OP_ATOMIC_FAA:
+    case CXL_MEMSIM_V2_OP_ATOMIC_CAS:
+        if (address < server->line_address ||
+            address > server->line_address + CXL_MEMSIM_V2_LINE_SIZE - 8 ||
+            address % 8 || ldl_le_p(request + 96) != 8) {
+            return false;
+        }
+        line_offset = address - server->line_address;
+        old_value = ldq_le_p(server->line + line_offset);
+        if (opcode == CXL_MEMSIM_V2_OP_ATOMIC_FAA) {
+            stq_le_p(server->line + line_offset,
+                     old_value + ldq_le_p(request + 80));
+        } else if (old_value == ldq_le_p(request + 72)) {
+            stq_le_p(server->line + line_offset,
+                     ldq_le_p(request + 80));
+        }
+        return t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_M,
+                                   ++server->epoch, true, old_value);
+    case CXL_MEMSIM_V2_OP_FENCE:
+        return address == 0 &&
+               t2_v2_send_response(server, endpoint, request,
+                                   CXL_MEMSIM_V2_STATE_I, 0, false, 0);
+    default:
+        return false;
+    }
+}
+
+static bool t2_v2_accept_endpoint(T2V2FakeServer *server)
+{
+    struct pollfd pollfd = {
+        .fd = server->listen_fd,
+        .events = POLLIN,
+    };
+    uint8_t request[CXL_MEMSIM_V2_FRAME_SIZE];
+    uint16_t endpoint;
+    int fd;
+
+    while (!g_atomic_int_get(&server->stop)) {
+        int ready = poll(&pollfd, 1, 50);
+
+        if (ready == 0) {
+            continue;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        fd = accept(server->listen_fd, NULL, NULL);
+        if (fd < 0) {
+            return false;
+        }
+        if (!t2_read_exact(fd, request, sizeof(request)) ||
+            !t2_v2_register_valid(request, &endpoint) ||
+            server->registered[endpoint] ||
+            !t2_v2_send_register_response(server, fd, endpoint, request)) {
+            close(fd);
+            return false;
+        }
+        server->client_fd[endpoint] = fd;
+        server->registered[endpoint] = true;
+        return true;
+    }
+    return false;
+}
+
+static gpointer t2_v2_fake_server_thread(gpointer opaque)
+{
+    T2V2FakeServer *server = opaque;
+    struct pollfd clients[2];
+    unsigned live = 2;
+    size_t i;
+
+    if (!t2_v2_accept_endpoint(server) ||
+        !t2_v2_accept_endpoint(server)) {
+        if (!g_atomic_int_get(&server->stop)) {
+            server->error_code = EPROTO;
+        }
+        goto out;
+    }
+    for (i = 0; i < G_N_ELEMENTS(clients); i++) {
+        clients[i].fd = server->client_fd[i];
+        clients[i].events = POLLIN;
+    }
+
+    while (!g_atomic_int_get(&server->stop) && live) {
+        int ready = poll(clients, G_N_ELEMENTS(clients), 50);
+
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            server->error_code = errno;
+            break;
+        }
+        if (ready == 0) {
+            continue;
+        }
+        for (i = 0; i < G_N_ELEMENTS(clients); i++) {
+            uint8_t request[CXL_MEMSIM_V2_FRAME_SIZE];
+
+            if (clients[i].fd < 0 || !clients[i].revents) {
+                continue;
+            }
+            if (!(clients[i].revents & POLLIN) ||
+                !t2_read_exact(clients[i].fd, request, sizeof(request))) {
+                close(clients[i].fd);
+                server->client_fd[i] = -1;
+                clients[i].fd = -1;
+                live--;
+                continue;
+            }
+            if (!t2_v2_handle_request(server, i, request)) {
+                server->error_code = EPROTO;
+                goto out;
+            }
+        }
+    }
+
+out:
+    for (i = 0; i < G_N_ELEMENTS(server->client_fd); i++) {
+        if (server->client_fd[i] >= 0) {
+            close(server->client_fd[i]);
+            server->client_fd[i] = -1;
+        }
+    }
+    return NULL;
+}
+
+static T2V2FakeServer *t2_v2_fake_server_start(void)
+{
+    T2V2FakeServer *server = g_new0(T2V2FakeServer, 1);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t address_length = sizeof(address);
+    int reuse = 1;
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(server->client_fd); i++) {
+        server->client_fd[i] = -1;
+    }
+    server->sessions[CXL_MEMSIM_V2_HOST_ENDPOINT] = T2_V2_HOST_SESSION;
+    server->sessions[CXL_MEMSIM_V2_DEVICE_ENDPOINT] = T2_V2_DEVICE_SESSION;
+    server->line_address = T2_SENTINEL_DPA;
+    server->listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    g_assert_cmpint(server->listen_fd, >=, 0);
+    g_assert_cmpint(setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR,
+                              &reuse, sizeof(reuse)), ==, 0);
+    g_assert_cmpint(bind(server->listen_fd, (struct sockaddr *)&address,
+                         sizeof(address)), ==, 0);
+    g_assert_cmpint(getsockname(server->listen_fd,
+                               (struct sockaddr *)&address,
+                               &address_length), ==, 0);
+    server->port = ntohs(address.sin_port);
+    g_assert_cmpuint(server->port, >, 0);
+    g_assert_cmpint(listen(server->listen_fd, 2), ==, 0);
+    server->thread = g_thread_new("cxl-t2-v2-fake-server",
+                                  t2_v2_fake_server_thread, server);
+    return server;
+}
+
+static void t2_v2_fake_server_stop(T2V2FakeServer *server)
+{
+    g_atomic_int_set(&server->stop, 1);
+    shutdown(server->listen_fd, SHUT_RDWR);
+    close(server->listen_fd);
+    g_thread_join(server->thread);
+}
+
 static QDict *t2_device_add_with_jit(
     QTestState *qts, const char *bus, uint16_t port,
     const char *event_path, const char *mode,
@@ -730,6 +1076,30 @@ static void t2_enable_bridge_window(QTestState *qts, uint8_t bus,
                          0xd000d000U);
     t2_pci_config_writew(qts, bus, devfn, PCI_COMMAND,
                          command | PCI_COMMAND_MEMORY);
+}
+
+static void t2_program_direct_endpoint_bar2(QTestState *qts, uint64_t base)
+{
+    t2_pci_config_writel(qts, 52, 0, PCI_PRIMARY_BUS,
+                         52U | (53U << 8) | (53U << 16));
+    g_assert_cmphex(t2_pci_config_readw(qts, 53, 0, PCI_VENDOR_ID),
+                    ==, 0x8086);
+    t2_enable_bridge_window(qts, 52, 0);
+    t2_program_endpoint_bar2_on_bus(qts, 53, 0, base);
+}
+
+static void t2_v2_execute_bar2_command(QTestState *qts, uint64_t bar2,
+                                       uint32_t command, uint64_t param0,
+                                       uint64_t param1, uint64_t param2)
+{
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM0, param0);
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM1, param1);
+    qtest_writeq(qts, bar2 + CXL_GPU_REG_PARAM2, param2);
+    qtest_writel(qts, bar2 + CXL_GPU_REG_CMD, command);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_STATUS),
+                     ==, CXL_GPU_CMD_STATUS_COMPLETE);
+    g_assert_cmpuint(qtest_readl(qts, bar2 + CXL_GPU_REG_CMD_RESULT),
+                     ==, CXL_GPU_SUCCESS);
 }
 
 static void t2_program_switch_decoder(QTestState *qts)
@@ -1869,6 +2239,128 @@ static void cxl_t2_direct_cfmws(void)
     g_free(server);
 }
 
+static void cxl_t2_v2_coherent_domain(void)
+{
+    const uint64_t host_value = UINT64_C(0x10);
+    const uint64_t device_value = UINT64_C(0x20);
+    const uint64_t faa_value = UINT64_C(0x15);
+    const uint64_t cas_value = UINT64_C(0x42);
+    g_autoptr(GString) command = g_string_new(NULL);
+    T2V2FakeServer *server = t2_v2_fake_server_start();
+    QTestState *qts;
+
+    g_string_printf(
+        command,
+        QEMU_T2_V2_CFMWS_BASE
+        "-device cxl-type2,id=t2,bus=rp0,addr=0.0,sn=2,gpu-mode=0,"
+        "coherency-enabled=true,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-addr=127.0.0.1,cxlmemsim-port=%u,coherence-v2=on,"
+        "coherence-v2-host-endpoint=0,coherence-v2-device-endpoint=1,"
+        "coherence-v2-cache-capacity=262144,coherence-v2-cache-ways=4,"
+        "coherence-v2-timeout-ms=2000,coherence-v2-write-through=on",
+        server->port);
+    qts = qtest_init(command->str);
+    t2_program_host_decoder(qts);
+    t2_program_direct_endpoint_bar2(qts, T2_V2_BAR2_BASE);
+
+    qtest_writeq(qts, Q35_CFMWS_BASE + T2_SENTINEL_DPA, host_value);
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_LOAD,
+                               T2_SENTINEL_DPA, sizeof(uint64_t), 0);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT0),
+                    ==, host_value);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT1),
+                     ==, CXL_MEMSIM_V2_DEVICE_ENDPOINT);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT2),
+                    ==, T2_V2_DEVICE_SESSION);
+
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_FAA,
+                               T2_SENTINEL_DPA, 5, 0);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT0),
+                    ==, host_value);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT1),
+                    ==, faa_value);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT2),
+                    ==, T2_V2_DEVICE_SESSION);
+
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_STORE,
+                               T2_SENTINEL_DPA, sizeof(uint64_t),
+                               device_value);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT1),
+                     ==, CXL_MEMSIM_V2_DEVICE_ENDPOINT);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT2),
+                    ==, T2_V2_DEVICE_SESSION);
+
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_CAS,
+                               T2_SENTINEL_DPA, device_value,
+                               cas_value);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT0),
+                    ==, device_value);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT1),
+                    ==, cas_value);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT2),
+                    ==, T2_V2_DEVICE_SESSION);
+
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_COHERENT_FENCE, 0, 0, 0);
+    g_assert_cmpuint(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                     CXL_GPU_REG_RESULT1),
+                     ==, CXL_MEMSIM_V2_DEVICE_ENDPOINT);
+    g_assert_cmphex(qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_RESULT2),
+                    ==, T2_V2_DEVICE_SESSION);
+
+    g_assert_cmphex(qtest_readq(qts,
+                                Q35_CFMWS_BASE + T2_SENTINEL_DPA),
+                    ==, cas_value);
+
+    qtest_quit(qts);
+    t2_v2_fake_server_stop(server);
+    g_assert_cmpint(server->error_code, ==, 0);
+    g_assert_true(server->registered[CXL_MEMSIM_V2_HOST_ENDPOINT]);
+    g_assert_true(server->registered[CXL_MEMSIM_V2_DEVICE_ENDPOINT]);
+    g_assert_cmphex(server->request_sessions[CXL_MEMSIM_V2_HOST_ENDPOINT],
+                    ==, T2_V2_HOST_SESSION);
+    g_assert_cmphex(server->request_sessions[CXL_MEMSIM_V2_DEVICE_ENDPOINT],
+                    ==, T2_V2_DEVICE_SESSION);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETM],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETS],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETS],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETM],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_ATOMIC_FAA],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_ATOMIC_CAS],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_FENCE],
+                     ==, 1);
+    g_free(server);
+}
+
 static void t2_rejected_cfmws_case(const char *command_line,
                                    const char *endpoint_bus,
                                    void (*topology_setup)(QTestState *))
@@ -1928,8 +2420,8 @@ static void cxl_t2_cfmws_reject_switch(void)
                            t2_program_switch_decoder);
 }
 
-static uint16_t t2_find_device_dvsec(QTestState *qts,
-                                     uint64_t config_base)
+static uint16_t t2_find_dvsec(QTestState *qts, uint64_t config_base,
+                              uint16_t dvsec_id)
 {
     uint16_t offset = 0x100;
     unsigned hops;
@@ -1942,13 +2434,26 @@ static uint16_t t2_find_device_dvsec(QTestState *qts,
         }
         if (PCI_EXT_CAP_ID(header) == PCI_EXT_CAP_ID_DVSEC &&
             qtest_readw(qts, config_base + offset + PCI_DVSEC_HEADER2) ==
-            0) {
+            dvsec_id) {
             return offset;
         }
         offset = PCI_EXT_CAP_NEXT(header);
     }
 
     g_assert_not_reached();
+}
+
+static void t2_program_endpoint_bar0(QTestState *qts, uint8_t devfn,
+                                     uint64_t base)
+{
+    uint16_t command;
+
+    g_assert_cmphex(base & ((128 * KiB) - 1), ==, 0);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_1, base >> 32);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_0, base);
+    command = t2_pci_config_readw(qts, 0, devfn, PCI_COMMAND);
+    t2_pci_config_writew(qts, 0, devfn, PCI_COMMAND,
+                         command | PCI_COMMAND_MEMORY);
 }
 
 static void cxl_t2_dvsec(void)
@@ -1961,10 +2466,17 @@ static void cxl_t2_dvsec(void)
     uint64_t config_base =
         Q35_PCIE_MCFG_BASE + ((uint64_t)T2_DVSEC_DEVFN << 12);
     uint16_t dvsec;
+    uint16_t regloc;
     uint16_t cap;
     uint16_t cap2;
+    uint32_t reg1_base_lo;
     uint32_t range1_size_hi;
     uint32_t range1_size_lo;
+    uint64_t device_regs;
+    uint64_t mailbox;
+    uint64_t command;
+    uint64_t status;
+    uint64_t memdev_status;
 
     run_dir = g_dir_make_tmp("cxl-t2-dvsec-XXXXXX", NULL);
     g_assert_nonnull(run_dir);
@@ -1987,7 +2499,7 @@ static void cxl_t2_dvsec(void)
     qtest_outl(qts, 0xcfc, Q35_PCIE_MCFG_BASE | 1);
     g_assert_cmphex(qtest_readw(qts, config_base), ==, 0x8086);
 
-    dvsec = t2_find_device_dvsec(qts, config_base);
+    dvsec = t2_find_dvsec(qts, config_base, PCIE_CXL_DEVICE_DVSEC);
     cap = qtest_readw(qts, config_base + dvsec + 0x0a);
     cap2 = qtest_readw(qts, config_base + dvsec + 0x16);
     range1_size_hi = qtest_readl(qts, config_base + dvsec + 0x18);
@@ -2012,6 +2524,43 @@ static void cxl_t2_dvsec(void)
                     ==, 0);
     g_assert_cmphex(qtest_readl(qts, config_base + dvsec + 0x34),
                     ==, 0);
+
+    regloc = t2_find_dvsec(qts, config_base, REG_LOC_DVSEC);
+    reg1_base_lo = qtest_readl(qts, config_base + regloc + 0x14);
+    g_assert_cmphex(reg1_base_lo & 0x700, ==, RBI_CXL_DEVICE_REG);
+    g_assert_cmphex(reg1_base_lo & 0x7, ==, CXL_COMPONENT_REG_BAR_IDX);
+    g_assert_cmphex(reg1_base_lo & 0xffff0000U,
+                    ==, T2_DEVICE_REG_OFFSET);
+
+    t2_program_endpoint_bar0(qts, T2_DVSEC_DEVFN, T2_DVSEC_BAR0_BASE);
+    device_regs = T2_DVSEC_BAR0_BASE + T2_DEVICE_REG_OFFSET;
+    g_assert_cmpuint((qtest_readq(qts, device_regs) >> 32) & 0xffff,
+                     ==, 3);
+
+    mailbox = device_regs + CXL_MAILBOX_REGISTERS_OFFSET;
+    g_assert_cmpuint(qtest_readl(qts, mailbox) & 0x1f,
+                     ==, CXL_MAILBOX_PAYLOAD_SHIFT);
+    memdev_status = qtest_readq(
+        qts, device_regs + CXL_MEMORY_DEVICE_REGISTERS_OFFSET);
+    g_assert_cmpuint((memdev_status >> 2) & 0x3, ==, 1);
+    g_assert_cmpuint((memdev_status >> 4) & 0x1, ==, 1);
+
+    command = UINT64_C(0x40) << 8;
+    qtest_writeq(qts, mailbox + A_CXL_DEV_MAILBOX_CMD, command);
+    qtest_writel(qts, mailbox + A_CXL_DEV_MAILBOX_CTRL, 1);
+    g_assert_cmpuint(qtest_readl(qts, mailbox + A_CXL_DEV_MAILBOX_CTRL) & 1,
+                     ==, 0);
+    status = qtest_readq(qts, mailbox + A_CXL_DEV_MAILBOX_STS);
+    g_assert_cmpuint(status & 1, ==, 0);
+    g_assert_cmpuint((status >> 32) & 0xffff, ==, CXL_MBOX_SUCCESS);
+    command = qtest_readq(qts, mailbox + A_CXL_DEV_MAILBOX_CMD);
+    g_assert_cmpuint((command >> 16) & 0xfffff, ==, 0x45);
+    g_assert_cmpuint(qtest_readq(qts, mailbox + A_CXL_DEV_CMD_PAYLOAD + 0x10),
+                     ==, 1);
+    g_assert_cmpuint(qtest_readq(qts, mailbox + A_CXL_DEV_CMD_PAYLOAD + 0x18),
+                     ==, 1);
+    g_assert_cmpuint(qtest_readq(qts, mailbox + A_CXL_DEV_CMD_PAYLOAD + 0x20),
+                     ==, 0);
 
     t2_fake_server_stop(server);
     qtest_quit(qts);
@@ -2225,6 +2774,8 @@ int main(int argc, char **argv)
                        cxl_t2_sync_bad_crc);
         qtest_add_func("/pci/cxl/type2_direct_cfmws",
                        cxl_t2_direct_cfmws);
+        qtest_add_func("/pci/cxl/type2_v2_coherent_domain",
+                       cxl_t2_v2_coherent_domain);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_two_targets",
                        cxl_t2_cfmws_reject_two_targets);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_512m",

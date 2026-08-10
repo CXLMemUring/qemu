@@ -31,10 +31,18 @@ static void test_shape_rejections(void)
         1, 1, 0, 256 * MiB, 0, 256 * MiB, UINT64_MAX - 3, 8));
 }
 
+static void test_protocol_gate(void)
+{
+    g_assert_true(cxl_type2_cfmws_protocol_enabled(true, false));
+    g_assert_true(cxl_type2_cfmws_protocol_enabled(false, true));
+    g_assert_false(cxl_type2_cfmws_protocol_enabled(false, false));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/cxl/type2/route/valid", test_shape_valid);
     g_test_add_func("/cxl/type2/route/rejections", test_shape_rejections);
+    g_test_add_func("/cxl/type2/route/protocol-gate", test_protocol_gate);
     return g_test_run();
 }

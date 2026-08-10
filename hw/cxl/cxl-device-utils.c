@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_type2.h"
 
 /*
  * Device registers have no restrictions per the spec, and so fall back to the
@@ -67,6 +68,8 @@ static uint64_t mailbox_reg_read(void *opaque, hwaddr offset, unsigned size)
 
     if (object_dynamic_cast(OBJECT(cci->intf), TYPE_CXL_TYPE3)) {
         cxl_dstate = &CXL_TYPE3(cci->intf)->cxl_dstate;
+    } else if (object_dynamic_cast(OBJECT(cci->intf), TYPE_CXL_TYPE2)) {
+        cxl_dstate = &CXL_TYPE2(cci->intf)->cxl_dstate;
     } else if (object_dynamic_cast(OBJECT(cci->intf),
                                    TYPE_CXL_SWITCH_MAILBOX_CCI)) {
         cxl_dstate = &CXL_SWITCH_MAILBOX_CCI(cci->intf)->cxl_dstate;
@@ -98,7 +101,8 @@ static uint64_t mailbox_reg_read(void *opaque, hwaddr offset, unsigned size)
             int bgop;
 
             qemu_mutex_lock(&cci->bg.lock);
-            bgop = !(cci->bg.complete_pct == 100 || cci->bg.aborted);
+            bgop = cci->bg.runtime > 0 && cci->bg.complete_pct < 100 &&
+                   !cci->bg.aborted;
 
             status_reg = FIELD_DP64(status_reg, CXL_DEV_MAILBOX_STS, BG_OP,
                                     bgop);
@@ -160,6 +164,8 @@ static void mailbox_reg_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (object_dynamic_cast(OBJECT(cci->intf), TYPE_CXL_TYPE3)) {
         cxl_dstate = &CXL_TYPE3(cci->intf)->cxl_dstate;
+    } else if (object_dynamic_cast(OBJECT(cci->intf), TYPE_CXL_TYPE2)) {
+        cxl_dstate = &CXL_TYPE2(cci->intf)->cxl_dstate;
     } else if (object_dynamic_cast(OBJECT(cci->intf),
                                    TYPE_CXL_SWITCH_MAILBOX_CCI)) {
         cxl_dstate = &CXL_SWITCH_MAILBOX_CCI(cci->intf)->cxl_dstate;
@@ -407,6 +413,31 @@ void cxl_device_register_init_t3(CXLType3Dev *ct3d, int msi_n)
     memdev_reg_init_common(cxl_dstate);
 
     cxl_initialize_mailbox_t3(&ct3d->cci, DEVICE(ct3d),
+                              CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+}
+
+void cxl_device_register_init_t2(CXLType2State *ct2d, int msi_n)
+{
+    CXLDeviceState *cxl_dstate = &ct2d->cxl_dstate;
+    uint64_t *cap_h = cxl_dstate->caps_reg_state64;
+    const int cap_count = 3;
+
+    ARRAY_FIELD_DP64(cap_h, CXL_DEV_CAP_ARRAY, CAP_ID, 0);
+    ARRAY_FIELD_DP64(cap_h, CXL_DEV_CAP_ARRAY, CAP_VERSION, 1);
+    ARRAY_FIELD_DP64(cap_h, CXL_DEV_CAP_ARRAY, CAP_COUNT, cap_count);
+
+    cxl_device_cap_init(cxl_dstate, DEVICE_STATUS, 1,
+                        CXL_DEVICE_STATUS_VERSION);
+    device_reg_init_common(cxl_dstate);
+
+    cxl_device_cap_init(cxl_dstate, MAILBOX, 2, CXL_DEV_MAILBOX_VERSION);
+    mailbox_reg_init_common(cxl_dstate, msi_n);
+
+    cxl_device_cap_init(cxl_dstate, MEMORY_DEVICE, 0x4000,
+                        CXL_MEM_DEV_STATUS_VERSION);
+    memdev_reg_init_common(cxl_dstate);
+
+    cxl_initialize_mailbox_t2(&ct2d->cci, DEVICE(ct2d),
                               CXL_MAILBOX_MAX_PAYLOAD_SIZE);
 }
 

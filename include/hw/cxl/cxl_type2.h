@@ -16,6 +16,7 @@
 #include "hw/cxl/cxl_device.h"
 #include "hw/cxl/cxl_component.h"
 #include "hw/cxl/cxl_hetgpu.h"
+#include "hw/cxl/cxl_memsim_v2.h"
 #include "hw/cxl/cxl_type2_coherency.h"
 #include "hw/cxl/cxl_p2p_dma.h"
 #include "hw/cxl/slugarch_jit.h"
@@ -137,6 +138,17 @@ typedef struct CXLType2SlugArchState {
     uint64_t delay_undershoots;
 } CXLType2SlugArchState;
 
+typedef struct CXLType2MemSimV2State {
+    CxlMemsimV2EndpointPair endpoints;
+    bool enabled;
+    uint16_t host_endpoint;
+    uint16_t device_endpoint;
+    uint32_t cache_capacity;
+    uint16_t cache_ways;
+    uint32_t timeout_ms;
+    bool write_through;
+} CXLType2MemSimV2State;
+
 typedef struct CXLType2JitConfig {
     CXLType2JitState runtime;
     char *mode;
@@ -163,6 +175,7 @@ typedef struct CXLType2State {
     /* CXL component and device states */
     CXLComponentState cxl_cstate;
     CXLDeviceState cxl_dstate;
+    CXLCCI cci;
 
     /* Memory regions */
     MemoryRegion bar0;                 /* Component registers */
@@ -213,6 +226,7 @@ typedef struct CXLType2State {
 
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;
+    CXLType2MemSimV2State memsim_v2;
     CXLType2SlugArchState slugarch;
     CXLType2JitConfig jit;
 
@@ -312,6 +326,12 @@ MemTxResult cxl_type2_cfmws_read(PCIDevice *pdev, hwaddr dpa,
 MemTxResult cxl_type2_cfmws_write(PCIDevice *pdev, hwaddr dpa,
                                   uint64_t value, unsigned size,
                                   MemTxAttrs attrs);
+static inline bool cxl_type2_cfmws_protocol_enabled(bool legacy_wire,
+                                                     bool protocol_v2)
+{
+    return legacy_wire || protocol_v2;
+}
+
 static inline bool cxl_type2_cfmws_shape_valid(unsigned total_windows,
                                                unsigned num_targets,
                                                uint8_t encoded_ways,

@@ -293,7 +293,8 @@ static bool cxl_type2_cfmws_dispatch_valid(CXLFixedWindow *fw,
 
     g_slist_free(windows);
     return !route.traversed_switch &&
-           ct2d->slugarch.enabled &&
+           cxl_type2_cfmws_protocol_enabled(ct2d->slugarch.enabled,
+                                            ct2d->memsim_v2.enabled) &&
            cxl_type2_cfmws_shape_valid(
                total_windows, fw->num_targets, fw->enc_int_ways,
                fw->size, 0, ct2d->device_mem_size, addr, size);
