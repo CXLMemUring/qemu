@@ -101,6 +101,7 @@
 #define T2_SWITCH_COMPONENT_BAR UINT64_C(0xd0000000)
 #define T2_JEXT_BAR2_BASE UINT64_C(0x80000000)
 #define T2_V2_BAR2_BASE UINT64_C(0xd0000000)
+#define T2_POOL_TEST_BAR4_BASE UINT64_C(0xe0000000)
 #define T2_V2_HOST_SESSION UINT64_C(0x1001)
 #define T2_V2_DEVICE_SESSION UINT64_C(0x2001)
 #define T2_FAKE_POLICY_DIGEST \
@@ -1066,6 +1067,23 @@ static void t2_program_endpoint_bar2(QTestState *qts, uint8_t devfn,
     t2_program_endpoint_bar2_on_bus(qts, 0, devfn, base);
 }
 
+static void t2_program_endpoint_bar4(QTestState *qts, uint8_t devfn,
+                                     uint64_t base)
+{
+    uint16_t command;
+
+    g_assert_cmphex(base & ((256 * MiB) - 1), ==, 0);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_5, base >> 32);
+    t2_pci_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_4, base);
+    command = t2_pci_config_readw(qts, 0, devfn, PCI_COMMAND);
+    t2_pci_config_writew(qts, 0, devfn, PCI_COMMAND,
+                         command | PCI_COMMAND_MEMORY);
+    g_assert_cmphex(t2_pci_config_readl(
+                        qts, 0, devfn, PCI_BASE_ADDRESS_4) &
+                    PCI_BASE_ADDRESS_MEM_MASK,
+                    ==, base);
+}
+
 static void t2_enable_bridge_window(QTestState *qts, uint8_t bus,
                                     uint8_t devfn)
 {
@@ -1175,6 +1193,101 @@ static uint64_t t2_qom_uint_at(QTestState *qts, const char *id,
 static uint64_t t2_qom_counter(QTestState *qts, const char *property)
 {
     return t2_qom_uint_at(qts, "t2", property);
+}
+
+static void cxl_t2_coherent_pool_traps_guest_access(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=false,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-port=1");
+    uint64_t pool_offset;
+    uint64_t pool_size;
+    uint64_t pool_hpa;
+
+    t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, T2_V2_BAR2_BASE);
+    t2_program_endpoint_bar4(qts, T2_DVSEC_DEVFN,
+                             T2_POOL_TEST_BAR4_BASE);
+    pool_offset = qtest_readq(qts, T2_V2_BAR2_BASE +
+                                      CXL_GPU_REG_COH_POOL_BASE);
+    pool_size = qtest_readq(qts, T2_V2_BAR2_BASE +
+                                    CXL_GPU_REG_COH_POOL_SIZE);
+    g_assert_cmpuint(pool_size, >, 0);
+    g_assert_cmpuint(pool_offset + pool_size, ==, 256 * MiB);
+
+    pool_hpa = T2_POOL_TEST_BAR4_BASE + pool_offset;
+    qtest_writel(qts, pool_hpa, 0x11223344);
+    g_assert_cmphex(qtest_readl(qts, pool_hpa), ==, 0x11223344);
+    g_assert_cmpuint(t2_qom_counter(qts, "slugarch-coherent-pool"),
+                     ==, 2);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-loads"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-stores"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-access-errors"),
+                     ==, 0);
+
+    qtest_quit(qts);
+}
+
+static void cxl_t2_coherent_pool_uses_v2_host_endpoint(void)
+{
+    const uint64_t value = UINT64_C(0x8877665544332211);
+    g_autoptr(GString) command = g_string_new(NULL);
+    T2V2FakeServer *server = t2_v2_fake_server_start();
+    QTestState *qts;
+    uint64_t pool_offset;
+    uint64_t pool_hpa;
+
+    server->line_address = 192 * MiB;
+    g_string_printf(
+        command,
+        "-machine q35,cxl=on -m 128M "
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "coherency-enabled=true,cache-size=128M,mem-size=256M,"
+        "cxlmemsim-addr=127.0.0.1,cxlmemsim-port=%u,coherence-v2=on,"
+        "coherence-v2-host-endpoint=0,coherence-v2-device-endpoint=1,"
+        "coherence-v2-cache-capacity=262144,coherence-v2-cache-ways=4,"
+        "coherence-v2-timeout-ms=2000,coherence-v2-write-through=on",
+        server->port);
+    qts = qtest_init(command->str);
+    t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, T2_V2_BAR2_BASE);
+    t2_program_endpoint_bar4(qts, T2_DVSEC_DEVFN,
+                             T2_POOL_TEST_BAR4_BASE);
+    pool_offset = qtest_readq(qts, T2_V2_BAR2_BASE +
+                                      CXL_GPU_REG_COH_POOL_BASE);
+    g_assert_cmphex(pool_offset, ==, server->line_address);
+    pool_hpa = T2_POOL_TEST_BAR4_BASE + pool_offset;
+
+    qtest_writeq(qts, pool_hpa, value);
+    g_assert_cmphex(qtest_readq(qts, pool_hpa), ==, value);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-loads"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-stores"),
+                     ==, 1);
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-access-errors"),
+                     ==, 0);
+
+    qtest_quit(qts);
+    t2_v2_fake_server_stop(server);
+    g_assert_cmpint(server->error_code, ==, 0);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETM],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_PUTM],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETS],
+                     ==, 1);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETM],
+                     ==, 0);
+    g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_DEVICE_ENDPOINT]
+                                    [CXL_MEMSIM_V2_OP_GETS],
+                     ==, 0);
+    g_free(server);
 }
 
 static bool t2_qom_bool_at(QTestState *qts, const char *id,
@@ -2776,6 +2889,10 @@ int main(int argc, char **argv)
                        cxl_t2_direct_cfmws);
         qtest_add_func("/pci/cxl/type2_v2_coherent_domain",
                        cxl_t2_v2_coherent_domain);
+        qtest_add_func("/pci/cxl/type2_coherent_pool_traps_guest_access",
+                       cxl_t2_coherent_pool_traps_guest_access);
+        qtest_add_func("/pci/cxl/type2_coherent_pool_uses_v2_host_endpoint",
+                       cxl_t2_coherent_pool_uses_v2_host_endpoint);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_two_targets",
                        cxl_t2_cfmws_reject_two_targets);
         qtest_add_func("/pci/cxl/type2_cfmws_reject_512m",

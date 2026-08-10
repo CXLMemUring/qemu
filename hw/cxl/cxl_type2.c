@@ -2046,6 +2046,16 @@ static const MemoryRegionOps cxl_type2_device_mem_ops = {
 static void cxl_type2_slugarch_overlay_complete(CXLType2State *ct2d, bool coherent_pool) {
     Error *local_err = NULL;
 
+    if (!ct2d->slugarch.enabled) {
+        ct2d->slugarch.bar4_overlay_completions++;
+        if (coherent_pool) {
+            ct2d->slugarch.coherent_pool_completions++;
+        } else {
+            ct2d->slugarch.bulk_overlay_completions++;
+        }
+        return;
+    }
+
     qemu_mutex_lock(&ct2d->memsim.lock);
     ct2d->slugarch.bar4_overlay_completions++;
     if (coherent_pool) {
@@ -2099,22 +2109,68 @@ static const MemoryRegionOps cxl_type2_bulk_proxy_ops = {
 
 static uint64_t cxl_type2_coherent_proxy_read(void *opaque, hwaddr addr, unsigned size) {
     CXLType2State *ct2d = opaque;
+    CxlMemsimV2Client *client;
+    Error *local_err = NULL;
     uint64_t value = 0;
 
-    if (ct2d->coherent_pool_ptr && addr <= ct2d->coherent_pool.size && size <= ct2d->coherent_pool.size - addr) {
-        value = ldn_le_p((uint8_t *)ct2d->coherent_pool_ptr + addr, size);
-        cxl_type2_slugarch_overlay_complete(ct2d, true);
+    if (!ct2d->coherent_pool_host_ptr || addr > ct2d->coherent_pool.size ||
+        size > ct2d->coherent_pool.size - addr) {
+        ct2d->coherent_pool_access_errors++;
+        return 0;
     }
+
+    if (ct2d->memsim_v2.enabled) {
+        client = cxl_memsim_v2_path_client(&ct2d->memsim_v2.endpoints,
+                                           CXL_MEMSIM_V2_PATH_CFMWS_HOST);
+        if (!cxl_memsim_v2_load(client, ct2d->coherent_pool.base_offset + addr,
+                                size, &value, ct2d->memsim_v2.timeout_ms,
+                                &local_err)) {
+            ct2d->coherent_pool_access_errors++;
+            if (local_err) {
+                error_prepend(&local_err,
+                              "CXL Type2 coherent-pool host read failed: ");
+                error_report_err(local_err);
+            }
+            return 0;
+        }
+        stn_le_p(ct2d->coherent_pool_host_ptr + addr, size, value);
+    } else {
+        value = ldn_le_p(ct2d->coherent_pool_host_ptr + addr, size);
+    }
+    ct2d->coherent_pool_host_loads++;
+    cxl_type2_slugarch_overlay_complete(ct2d, true);
     return value;
 }
 
 static void cxl_type2_coherent_proxy_write(void *opaque, hwaddr addr, uint64_t value, unsigned size) {
     CXLType2State *ct2d = opaque;
+    CxlMemsimV2Client *client;
+    Error *local_err = NULL;
 
-    if (ct2d->coherent_pool_ptr && addr <= ct2d->coherent_pool.size && size <= ct2d->coherent_pool.size - addr) {
-        stn_le_p((uint8_t *)ct2d->coherent_pool_ptr + addr, size, value);
-        cxl_type2_slugarch_overlay_complete(ct2d, true);
+    if (!ct2d->coherent_pool_host_ptr || addr > ct2d->coherent_pool.size ||
+        size > ct2d->coherent_pool.size - addr) {
+        ct2d->coherent_pool_access_errors++;
+        return;
     }
+
+    if (ct2d->memsim_v2.enabled) {
+        client = cxl_memsim_v2_path_client(&ct2d->memsim_v2.endpoints,
+                                           CXL_MEMSIM_V2_PATH_CFMWS_HOST);
+        if (!cxl_memsim_v2_store(client, ct2d->coherent_pool.base_offset + addr,
+                                 size, value, ct2d->memsim_v2.timeout_ms,
+                                 &local_err)) {
+            ct2d->coherent_pool_access_errors++;
+            if (local_err) {
+                error_prepend(&local_err,
+                              "CXL Type2 coherent-pool host write failed: ");
+                error_report_err(local_err);
+            }
+            return;
+        }
+    }
+    stn_le_p(ct2d->coherent_pool_host_ptr + addr, size, value);
+    ct2d->coherent_pool_host_stores++;
+    cxl_type2_slugarch_overlay_complete(ct2d, true);
 }
 
 static const MemoryRegionOps cxl_type2_coherent_proxy_ops = {
@@ -4410,28 +4466,25 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
         ct2d->coherent_pool.free_list = initial;
         qemu_mutex_init(&ct2d->coherent_pool.lock);
 
-        if (ct2d->slugarch.enabled) {
-            ct2d->coherent_pool_ptr = g_malloc0(coh_pool_size);
-            memory_region_init_io(&ct2d->coherent_pool_region, OBJECT(ct2d), &cxl_type2_coherent_proxy_ops, ct2d,
-                                  "cxl-type2-coh-pool-proxy", coh_pool_size);
-        } else {
-            /*
-             * Legacy mode retains the direct priority-2 RAM subregion.
-             */
-            memory_region_init_ram(&ct2d->coherent_pool_region, OBJECT(ct2d), "cxl-type2-coh-pool-ram", coh_pool_size,
-                                   &local_err);
-            if (local_err) {
-                error_propagate(errp, local_err);
-                return;
-            }
+        memory_region_init_ram(&ct2d->coherent_pool_backing, OBJECT(ct2d),
+                               "cxl-type2-coh-pool-backing", coh_pool_size,
+                               &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
         }
+        ct2d->coherent_pool_host_ptr =
+            memory_region_get_ram_ptr(&ct2d->coherent_pool_backing);
+        memory_region_init_io(&ct2d->coherent_pool_overlay, OBJECT(ct2d),
+                              &cxl_type2_coherent_proxy_ops, ct2d,
+                              "cxl-type2-coh-pool-overlay", coh_pool_size);
         memory_region_add_subregion_overlap(&ct2d->device_mem, ct2d->coherent_pool.base_offset,
-                                            &ct2d->coherent_pool_region, 2);
+                                            &ct2d->coherent_pool_overlay, 2);
 
         qemu_log("CXL Type2: Coherent pool initialized: base=0x%lx "
-                 "size=%lu MB (%s at priority 2)\n",
-                 (unsigned long)ct2d->coherent_pool.base_offset, (unsigned long)(coh_pool_size / MiB),
-                 ct2d->slugarch.enabled ? "observable I/O proxy" : "RAM bypass");
+                 "size=%lu MB (trapping overlay at priority 2)\n",
+                 (unsigned long)ct2d->coherent_pool.base_offset,
+                 (unsigned long)(coh_pool_size / MiB));
     }
 
     qemu_log("CXL Type2: GPU command interface enabled at BAR2 offset 0\n");
@@ -4526,15 +4579,14 @@ static void cxl_type2_exit(PCIDevice *pci_dev) {
         ct2d->gpu_cmd.data = NULL;
     }
 
+    ct2d->coherent_pool_host_ptr = NULL;
     if (ct2d->slugarch.enabled) {
         g_clear_pointer(&ct2d->bulk_transfer_ptr, g_free);
-        g_clear_pointer(&ct2d->coherent_pool_ptr, g_free);
     } else {
         /*
          * Legacy pointers belong to QEMU RAM regions and are not g_malloc().
          */
         ct2d->bulk_transfer_ptr = NULL;
-        ct2d->coherent_pool_ptr = NULL;
     }
 
     cxl_type2_fabric_features_cleanup(ct2d);
@@ -4693,6 +4745,15 @@ static void cxl_type2_instance_init(Object *obj) {
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-coherent-pool", &ct2d->slugarch.coherent_pool_completions,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "coherent-pool-host-loads",
+                                   &ct2d->coherent_pool_host_loads,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "coherent-pool-host-stores",
+                                   &ct2d->coherent_pool_host_stores,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "coherent-pool-access-errors",
+                                   &ct2d->coherent_pool_access_errors,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-local-shadow", &ct2d->slugarch.local_shadow_completions,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-local-cache", &ct2d->slugarch.local_cache_completions,
@@ -4730,7 +4791,6 @@ static void cxl_type2_instance_finalize(Object *obj) {
     }
     if (ct2d->slugarch.enabled) {
         g_clear_pointer(&ct2d->bulk_transfer_ptr, g_free);
-        g_clear_pointer(&ct2d->coherent_pool_ptr, g_free);
     }
     cxl_type2_jit_close(&ct2d->jit.runtime);
     ct2d->jit.advertised = false;

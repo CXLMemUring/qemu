@@ -323,8 +323,12 @@ typedef struct CXLType2State {
         struct CXLCohFreeBlock *free_list;
         QemuMutex lock;
     } coherent_pool;
-    MemoryRegion coherent_pool_region;  /* RAM window bypassing I/O overlay */
-    void *coherent_pool_ptr;
+    MemoryRegion coherent_pool_backing;
+    MemoryRegion coherent_pool_overlay;
+    uint8_t *coherent_pool_host_ptr;
+    uint64_t coherent_pool_host_loads;
+    uint64_t coherent_pool_host_stores;
+    uint64_t coherent_pool_access_errors;
 
     /* Statistics and monitoring */
     struct {
