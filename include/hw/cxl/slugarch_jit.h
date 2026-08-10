@@ -7,7 +7,7 @@
 #ifndef HW_CXL_SLUGARCH_JIT_H
 #define HW_CXL_SLUGARCH_JIT_H
 
-#include "qapi/error.h"
+#include "qemu/typedefs.h"
 
 #define SLUG_JIT_ABI_VERSION 1U
 #define SLUG_JIT_PAYLOAD_BYTES 64U
