@@ -24,11 +24,18 @@ slugarch_jit_fake_missing = shared_module(
   dependencies: [glib],
   install: false,
 )
+hetgpu_cuda_fake = shared_module(
+  'hetgpu-cuda-fake',
+  'hetgpu-cuda-fake.c',
+  name_prefix: '',
+  install: false,
+)
 test_deps += {
   'test-cxl-slugarch-jit': [
     slugarch_jit_fake,
     slugarch_jit_fake_missing,
   ],
+  'test-cxl-hetgpu-registration': [hetgpu_cuda_fake],
 }
 
 tests = {
@@ -91,6 +98,9 @@ tests = {
     io,
   ],
   'test-cxl-type2-route': [],
+  'test-cxl-hetgpu-registration': [
+    meson.project_source_root() / 'hw/cxl/cxl_hetgpu.c',
+  ],
   'test-cxl-slugarch-jit': [
     meson.project_source_root() / 'hw/cxl/slugarch_jit.c',
   ],

@@ -88,6 +88,7 @@ typedef struct HetGPUCoherentRegion {
     uint64_t size;               /* Region size */
     uint32_t flags;              /* HetGPUMemFlags */
     bool is_coherent;            /* True if CXL.cache coherent */
+    bool host_registered;        /* Host pointer registered with GPU driver */
 } HetGPUCoherentRegion;
 
 /* PTX module info */
@@ -314,6 +315,36 @@ HetGPUError hetgpu_memset(HetGPUState *state, HetGPUDevicePtr dev_ptr,
  */
 HetGPUError hetgpu_create_coherent_region(HetGPUState *state, size_t size,
                                           HetGPUCoherentRegion *region);
+
+/**
+ * hetgpu_register_coherent_region - Map an existing host allocation into GPU VA
+ * @state: Initialized real-GPU HetGPUState
+ * @host_ptr: Existing host allocation to register
+ * @size: Size in bytes
+ * @region: Output coherent region info
+ *
+ * The caller retains ownership of @host_ptr. Registration is rolled back if
+ * obtaining the GPU-visible pointer fails. @region must be zero-initialized
+ * and must not describe an active registration.
+ *
+ * Returns: HETGPU_SUCCESS on success
+ */
+HetGPUError hetgpu_register_coherent_region(HetGPUState *state,
+                                            void *host_ptr, size_t size,
+                                            HetGPUCoherentRegion *region);
+
+/**
+ * hetgpu_unregister_coherent_region - Unmap an existing host allocation
+ * @state: Initialized real-GPU HetGPUState
+ * @region: Region previously registered by hetgpu_register_coherent_region()
+ *
+ * The host allocation is not freed. Repeated calls after a successful
+ * unregister are no-ops.
+ *
+ * Returns: HETGPU_SUCCESS on success
+ */
+HetGPUError hetgpu_unregister_coherent_region(HetGPUState *state,
+                                              HetGPUCoherentRegion *region);
 
 /**
  * hetgpu_destroy_coherent_region - Destroy coherent memory region

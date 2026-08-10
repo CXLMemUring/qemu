@@ -722,11 +722,28 @@ int cxl_type2_hetgpu_init(CXLType2State *ct2d, Error **errp) {
 
 void cxl_type2_hetgpu_cleanup(CXLType2State *ct2d) {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
+    HetGPUError err;
 
     if (!hetgpu->initialized) {
         return;
     }
 
+    err = hetgpu_unregister_coherent_region(
+        hetgpu, &ct2d->coherent_pool_gpu_region);
+    if (err != HETGPU_SUCCESS) {
+        qemu_log("CXL Type2: Coherent pool unregister failed; "
+                 "synchronizing and retrying: %s\n",
+                 hetgpu_get_error_string(err));
+        hetgpu_synchronize(hetgpu);
+        err = hetgpu_unregister_coherent_region(
+            hetgpu, &ct2d->coherent_pool_gpu_region);
+        if (err != HETGPU_SUCCESS) {
+            error_report("CXL Type2: refusing to release CUDA-registered "
+                         "coherent pool after unregister failure: %s",
+                         hetgpu_get_error_string(err));
+            abort();
+        }
+    }
     qemu_log("CXL Type2: Cleaning up hetGPU backend\n");
     hetgpu_cleanup(hetgpu);
 }
@@ -877,6 +894,7 @@ int cxl_type2_hetgpu_sync(CXLType2State *ct2d) {
 
 int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp) {
     Error *local_err = NULL;
+    bool auto_mode = ct2d->gpu_info.mode == CXL_TYPE2_GPU_MODE_AUTO;
     int ret;
 
     /* Determine GPU mode if auto */
@@ -896,7 +914,7 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp) {
     case CXL_TYPE2_GPU_MODE_HETGPU:
         fprintf(stderr, "CXL Type2: Initializing hetGPU backend...\n");
         fflush(stderr);
-        ret = cxl_type2_hetgpu_init(ct2d, errp);
+        ret = cxl_type2_hetgpu_init(ct2d, &local_err);
         fprintf(stderr, "CXL Type2: cxl_type2_hetgpu_init returned %d\n", ret);
         fflush(stderr);
         if (ret == 0) {
@@ -904,6 +922,12 @@ int cxl_type2_gpu_init(CXLType2State *ct2d, Error **errp) {
             fflush(stderr);
             return 0;
         }
+        if (!auto_mode) {
+            error_propagate(errp, local_err);
+            return -1;
+        }
+        error_free(local_err);
+        local_err = NULL;
         /* Fall through to VFIO or simulation if hetGPU fails */
         fprintf(stderr, "CXL Type2: hetGPU init failed, trying fallback\n");
         fflush(stderr);
@@ -4503,14 +4527,37 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
             return;
         }
     }
+    if (ct2d->gpu_info.mode == CXL_TYPE2_GPU_MODE_HETGPU &&
+        ct2d->gpu_info.hetgpu_state.initialized) {
+        HetGPUError gpu_err = hetgpu_register_coherent_region(
+            &ct2d->gpu_info.hetgpu_state,
+            ct2d->coherent_pool_host_ptr,
+            ct2d->coherent_pool.size,
+            &ct2d->coherent_pool_gpu_region);
+
+        if (gpu_err != HETGPU_SUCCESS) {
+            cxl_type2_gpu_cleanup(ct2d);
+            error_setg(errp, "failed to register Type-2 coherent pool "
+                       "with real GPU: %s",
+                       hetgpu_get_error_string(gpu_err));
+            return;
+        }
+        qemu_log("CXL Type2: Coherent pool GPU mapping: host=%p "
+                 "device=0x%" PRIx64 " size=%" PRIu64 "\n",
+                 ct2d->coherent_pool_gpu_region.host_ptr,
+                 ct2d->coherent_pool_gpu_region.device_ptr,
+                 ct2d->coherent_pool_gpu_region.size);
+    }
 
     /* Protocol v2 owns two duplex sessions; v1 remains the legacy path. */
     if (ct2d->memsim_v2.enabled) {
         if (!cxl_type2_memsim_v2_connect(ct2d, errp)) {
+            cxl_type2_gpu_cleanup(ct2d);
             return;
         }
     } else if (ct2d->slugarch.enabled) {
         if (!cxl_type2_slugarch_handshake(ct2d, errp)) {
+            cxl_type2_gpu_cleanup(ct2d);
             return;
         }
     } else {
@@ -4716,6 +4763,12 @@ static char *cxl_type2_jit_get_digest(Object *obj, Error **errp) {
 
 static bool cxl_type2_jit_get_advertised(Object *obj, Error **errp) { return CXL_TYPE2(obj)->jit.advertised; }
 
+static bool cxl_type2_coherent_pool_gpu_registered(Object *obj,
+                                                   Error **errp)
+{
+    return CXL_TYPE2(obj)->coherent_pool_gpu_region.host_registered;
+}
+
 static void cxl_type2_instance_init(Object *obj) {
     CXLType2State *ct2d = CXL_TYPE2(obj);
 
@@ -4754,6 +4807,8 @@ static void cxl_type2_instance_init(Object *obj) {
     object_property_add_uint64_ptr(obj, "coherent-pool-access-errors",
                                    &ct2d->coherent_pool_access_errors,
                                    OBJ_PROP_FLAG_READ);
+    object_property_add_bool(obj, "coherent-pool-gpu-registered",
+                             cxl_type2_coherent_pool_gpu_registered, NULL);
     object_property_add_uint64_ptr(obj, "slugarch-local-shadow", &ct2d->slugarch.local_shadow_completions,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-local-cache", &ct2d->slugarch.local_cache_completions,

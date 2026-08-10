@@ -50,6 +50,9 @@ typedef int (*cuCtxDestroy_fn)(void *);
 typedef int (*cuCtxSynchronize_fn)(void);
 typedef int (*cuMemAlloc_fn)(uint64_t *, size_t);
 typedef int (*cuMemFree_fn)(uint64_t);
+typedef int (*cuMemHostRegister_fn)(void *, size_t, unsigned int);
+typedef int (*cuMemHostGetDevicePointer_fn)(uint64_t *, void *, unsigned int);
+typedef int (*cuMemHostUnregister_fn)(void *);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
@@ -75,6 +78,7 @@ typedef int (*cuGetErrorName_fn)(int, const char **);
 #define CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE 38
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
+#define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
 
 /* Loaded function pointers */
 static struct {
@@ -89,6 +93,9 @@ static struct {
     cuCtxSynchronize_fn cuCtxSynchronize;
     cuMemAlloc_fn cuMemAlloc;
     cuMemFree_fn cuMemFree;
+    cuMemHostRegister_fn cuMemHostRegister;
+    cuMemHostGetDevicePointer_fn cuMemHostGetDevicePointer;
+    cuMemHostUnregister_fn cuMemHostUnregister;
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
@@ -192,6 +199,12 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
             g_cuda_funcs.cuCtxSynchronize = dlsym(g_cuda_lib_handle, "cuCtxSynchronize");
             g_cuda_funcs.cuMemAlloc = dlsym(g_cuda_lib_handle, "cuMemAlloc_v2");
             g_cuda_funcs.cuMemFree = dlsym(g_cuda_lib_handle, "cuMemFree_v2");
+            g_cuda_funcs.cuMemHostRegister =
+                dlsym(g_cuda_lib_handle, "cuMemHostRegister_v2");
+            g_cuda_funcs.cuMemHostGetDevicePointer =
+                dlsym(g_cuda_lib_handle, "cuMemHostGetDevicePointer_v2");
+            g_cuda_funcs.cuMemHostUnregister =
+                dlsym(g_cuda_lib_handle, "cuMemHostUnregister");
             g_cuda_funcs.cuMemcpyHtoD = dlsym(g_cuda_lib_handle, "cuMemcpyHtoD_v2");
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
@@ -937,6 +950,98 @@ HetGPUError hetgpu_create_coherent_region(HetGPUState *state, size_t size,
         return err;
     }
 
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_register_coherent_region(HetGPUState *state,
+                                            void *host_ptr, size_t size,
+                                            HetGPUCoherentRegion *region)
+{
+    HetGPUDevicePtr device_ptr = 0;
+    int err;
+
+    if (!state || !host_ptr || !size || !region) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    if (region->host_registered) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    memset(region, 0, sizeof(*region));
+    if (!state->initialized) {
+        return HETGPU_ERROR_NOT_INITIALIZED;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !state->props.supports_coherent_memory ||
+        !g_cuda_funcs.cuMemHostRegister ||
+        !g_cuda_funcs.cuMemHostGetDevicePointer ||
+        !g_cuda_funcs.cuMemHostUnregister) {
+        return HETGPU_ERROR_NOT_SUPPORTED;
+    }
+
+    cuda_lock(state);
+    err = g_cuda_funcs.cuMemHostRegister(host_ptr, size,
+                                         CU_MEMHOSTREGISTER_DEVICEMAP);
+    if (err != 0) {
+        cuda_unlock(state);
+        qemu_log("CXL hetGPU: cuMemHostRegister_v2 failed (%d)\n", err);
+        return HETGPU_ERROR_NOT_SUPPORTED;
+    }
+
+    err = g_cuda_funcs.cuMemHostGetDevicePointer(&device_ptr, host_ptr, 0);
+    if (err != 0) {
+        int unregister_err = g_cuda_funcs.cuMemHostUnregister(host_ptr);
+
+        cuda_unlock(state);
+        if (unregister_err != 0) {
+            region->host_ptr = host_ptr;
+            region->size = size;
+            region->flags = HETGPU_MEM_HOST_MAPPED;
+            region->host_registered = true;
+        }
+        qemu_log("CXL hetGPU: cuMemHostGetDevicePointer_v2 failed (%d); "
+                 "rollback unregister returned %d\n", err, unregister_err);
+        return HETGPU_ERROR_NOT_SUPPORTED;
+    }
+    cuda_unlock(state);
+
+    region->host_ptr = host_ptr;
+    region->device_ptr = device_ptr;
+    region->size = size;
+    region->flags = HETGPU_MEM_HOST_MAPPED;
+    region->is_coherent = true;
+    region->host_registered = true;
+    state->coherency_ops++;
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_unregister_coherent_region(HetGPUState *state,
+                                              HetGPUCoherentRegion *region)
+{
+    int err;
+
+    if (!state || !region) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    if (!region->host_registered) {
+        return HETGPU_SUCCESS;
+    }
+    if (!state->initialized) {
+        return HETGPU_ERROR_NOT_INITIALIZED;
+    }
+    if (state->backend == HETGPU_BACKEND_SIMULATION ||
+        !g_cuda_funcs.cuMemHostUnregister) {
+        return HETGPU_ERROR_NOT_SUPPORTED;
+    }
+
+    cuda_lock(state);
+    err = g_cuda_funcs.cuMemHostUnregister(region->host_ptr);
+    cuda_unlock(state);
+    if (err != 0) {
+        qemu_log("CXL hetGPU: cuMemHostUnregister failed (%d)\n", err);
+        return HETGPU_ERROR_UNKNOWN;
+    }
+
+    memset(region, 0, sizeof(*region));
     return HETGPU_SUCCESS;
 }
 

@@ -459,7 +459,7 @@ foreach dir : target_dirs
 
     current_test_deps = test_deps
     if test == 'cxl-test'
-      current_test_deps += [slugarch_jit_fake]
+      current_test_deps += [slugarch_jit_fake, hetgpu_cuda_fake]
     endif
 
     test('qtest-@0@/@1@'.format(target_base, test),
