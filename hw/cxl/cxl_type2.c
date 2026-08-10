@@ -4706,8 +4706,10 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp) {
             error_setg(errp, "coherence-v2 and sync-type2-wire are mutually exclusive");
             return;
         }
-        if (ct2d->device_mem_size != 256 * MiB) {
-            error_setg(errp, "coherence-v2 requires mem-size=268435456");
+        if (ct2d->device_mem_size != 256 * MiB &&
+            ct2d->device_mem_size != 512 * MiB) {
+            error_setg(errp, "coherence-v2 requires mem-size=268435456 "
+                       "or 536870912");
             return;
         }
         if (ct2d->memsim_v2.host_endpoint >= CXL_MEMSIM_V2_MAX_ENDPOINTS ||
@@ -5214,6 +5216,12 @@ static void cxl_type2_instance_init(Object *obj) {
                                    OBJ_PROP_FLAG_READ);
     object_property_add_bool(obj, "coherent-pool-gpu-registered",
                              cxl_type2_coherent_pool_gpu_registered, NULL);
+    object_property_add_uint64_ptr(obj, "coherent-pool-size",
+                                   &ct2d->coherent_pool.size,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "coherent-pool-gpu-size",
+                                   &ct2d->coherent_pool_gpu_region.size,
+                                   OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-local-shadow", &ct2d->slugarch.local_shadow_completions,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "slugarch-local-cache", &ct2d->slugarch.local_cache_completions,

@@ -63,6 +63,13 @@
     "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M " \
     "-device cxl-rp,id=rp0,bus=cxl.0,addr=0.0,chassis=0,slot=0 "
 
+#define QEMU_T2_V2_CFMWS_512M_BASE \
+    "-machine q35,cxl=on -m 128M " \
+    "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52," \
+    "hdm_for_passthrough=on " \
+    "-M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=512M " \
+    "-device cxl-rp,id=rp0,bus=cxl.0,addr=0.0,chassis=0,slot=0 "
+
 #define QEMU_T2_CFMWS_TWO_TARGETS \
     "-machine q35,cxl=on -m 128M " \
     "-device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 " \
@@ -1588,6 +1595,66 @@ static void cxl_t2_coherent_pool_registers_with_hetgpu(void)
     unlink(trace);
 }
 
+static void cxl_t2_v2_512m_registers_256m_pool_with_hetgpu(void)
+{
+    g_autofree char *library = t2_hetgpu_fake_path();
+    g_autofree char *trace = NULL;
+    g_autofree char *trace_contents = NULL;
+    T2V2FakeServer *server = t2_v2_fake_server_start();
+    QDict *arguments = qdict_new();
+    QTestState *qts;
+    QDict *response;
+    int trace_fd;
+
+    trace_fd = g_file_open_tmp("cxl-t2-v2-512m-hetgpu-XXXXXX",
+                               &trace, NULL);
+    g_assert_cmpint(trace_fd, >=, 0);
+    close(trace_fd);
+    g_setenv("HETGPU_CUDA_FAKE_TRACE", trace, true);
+    qts = qtest_init(QEMU_T2_V2_CFMWS_512M_BASE);
+    g_unsetenv("HETGPU_CUDA_FAKE_TRACE");
+
+    qdict_put_str(arguments, "driver", "cxl-type2");
+    qdict_put_str(arguments, "id", "t2");
+    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_int(arguments, "gpu-mode", 2);
+    qdict_put_int(arguments, "hetgpu-backend", 3);
+    qdict_put_str(arguments, "hetgpu-lib", library);
+    qdict_put_bool(arguments, "coherency-enabled", true);
+    qdict_put_int(arguments, "cache-size", 128 * MiB);
+    qdict_put_int(arguments, "mem-size", 512 * MiB);
+    qdict_put_str(arguments, "cxlmemsim-addr", "127.0.0.1");
+    qdict_put_int(arguments, "cxlmemsim-port", server->port);
+    qdict_put_bool(arguments, "coherence-v2", true);
+    qdict_put_int(arguments, "coherence-v2-host-endpoint", 0);
+    qdict_put_int(arguments, "coherence-v2-device-endpoint", 1);
+    qdict_put_int(arguments, "coherence-v2-cache-capacity", 256 * KiB);
+    qdict_put_int(arguments, "coherence-v2-cache-ways", 4);
+    qdict_put_int(arguments, "coherence-v2-timeout-ms", 2000);
+    qdict_put_bool(arguments, "coherence-v2-write-through", false);
+    response = qtest_qmp(qts,
+                         "{'execute':'device_add','arguments':%p}",
+                         arguments);
+    g_assert_false(qdict_haskey(response, "error"));
+    qobject_unref(response);
+
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-size"),
+                     ==, 256 * MiB);
+    g_assert_true(t2_qom_bool(qts, "coherent-pool-gpu-registered"));
+    g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-gpu-size"),
+                     ==, 256 * MiB);
+
+    t2_v2_fake_server_stop(server);
+    t2_wait_for_device_deleted(qts, "t2");
+    qtest_quit(qts);
+    g_assert_cmpint(server->error_code, ==, 0);
+    g_assert_true(g_file_get_contents(trace, &trace_contents, NULL, NULL));
+    g_assert_cmpstr(trace_contents, ==, "register\nunregister\n");
+
+    unlink(trace);
+    g_free(server);
+}
+
 static QDict *t2_jext_hotplug(QTestState *qts, const char *id,
                               const char *mode, const char *library,
                               const char *policy)
@@ -1620,6 +1687,31 @@ static void t2_assert_qmp_error_contains(QDict *response,
     description = qdict_get_str(qdict_get_qdict(response, "error"), "desc");
     g_test_message("QMP error: %s", description);
     g_assert_nonnull(strstr(description, expected));
+}
+
+static void cxl_t2_v2_rejects_unsupported_mem_size(void)
+{
+    QDict *arguments = qdict_new();
+    QTestState *qts = qtest_init(QEMU_T2_SYNC_BASE "-m 128M");
+    QDict *response;
+
+    qdict_put_str(arguments, "driver", "cxl-type2");
+    qdict_put_str(arguments, "id", "t2");
+    qdict_put_str(arguments, "bus", "rp0");
+    qdict_put_int(arguments, "gpu-mode", 0);
+    qdict_put_bool(arguments, "coherency-enabled", true);
+    qdict_put_int(arguments, "cache-size", 128 * MiB);
+    qdict_put_int(arguments, "mem-size", 384 * MiB);
+    qdict_put_int(arguments, "cxlmemsim-port", 1);
+    qdict_put_bool(arguments, "coherence-v2", true);
+    response = qtest_qmp(qts,
+                         "{'execute':'device_add','arguments':%p}",
+                         arguments);
+    t2_assert_qmp_error_contains(
+        response,
+        "coherence-v2 requires mem-size=268435456 or 536870912");
+    qobject_unref(response);
+    qtest_quit(qts);
 }
 
 static void cxl_t2_coherent_pool_gpu_registration_is_required(void)
@@ -3533,6 +3625,11 @@ int main(int argc, char **argv)
                        cxl_t2_coherent_pool_uses_v2_host_endpoint);
         qtest_add_func("/pci/cxl/type2_coherent_pool_registers_with_hetgpu",
                        cxl_t2_coherent_pool_registers_with_hetgpu);
+        qtest_add_func("/pci/cxl/"
+                       "type2_v2_512m_registers_256m_pool_with_hetgpu",
+                       cxl_t2_v2_512m_registers_256m_pool_with_hetgpu);
+        qtest_add_func("/pci/cxl/type2_v2_rejects_unsupported_mem_size",
+                       cxl_t2_v2_rejects_unsupported_mem_size);
         qtest_add_func("/pci/cxl/"
                        "type2_coherent_pool_gpu_registration_is_required",
                        cxl_t2_coherent_pool_gpu_registration_is_required);
