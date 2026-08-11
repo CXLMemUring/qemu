@@ -198,6 +198,24 @@ int cuMemHostUnregister(void *pointer)
     return host_unregister_result;
 }
 
+int cuMemcpyHtoD_v2(uint64_t destination, const void *source, size_t size)
+{
+    const char *check = getenv("HETGPU_CUDA_FAKE_EXPECT_HTOD");
+    uint64_t value;
+
+    if (!source) {
+        return 1;
+    }
+    if (!check) {
+        return 0;
+    }
+    if (destination != UINT64_C(0x12345678) || size != sizeof(value)) {
+        return 1;
+    }
+    memcpy(&value, source, sizeof(value));
+    return value == UINT64_C(0x8877665544332211) ? 0 : 1;
+}
+
 int cuModuleLoadData(void **module, const void *image)
 {
     if (!module || !image) {

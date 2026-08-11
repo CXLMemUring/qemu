@@ -116,6 +116,8 @@
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5" \
     "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
 
+static char *t2_hetgpu_fake_path(void);
+
 /* Dual ports on first pxb */
 #define QEMU_2RP \
     "-device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 " \
@@ -1391,6 +1393,7 @@ static void cxl_t2_coherent_pool_traps_guest_access(void)
 static void cxl_t2_coherent_pool_uses_v2_host_endpoint(void)
 {
     const uint64_t value = UINT64_C(0x8877665544332211);
+    g_autofree char *library = t2_hetgpu_fake_path();
     g_autoptr(GString) command = g_string_new(NULL);
     T2V2FakeServer *server = t2_v2_fake_server_start();
     QTestState *qts;
@@ -1401,13 +1404,15 @@ static void cxl_t2_coherent_pool_uses_v2_host_endpoint(void)
     g_string_printf(
         command,
         "-machine q35,cxl=on -m 128M "
-        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=0,"
+        "-device cxl-type2,id=t2,bus=pcie.0,addr=4.0,gpu-mode=2,"
+        "hetgpu-backend=3,hetgpu-lib=%s,"
         "coherency-enabled=true,cache-size=128M,mem-size=256M,"
         "cxlmemsim-addr=127.0.0.1,cxlmemsim-port=%u,coherence-v2=on,"
         "coherence-v2-host-endpoint=0,coherence-v2-device-endpoint=1,"
         "coherence-v2-cache-capacity=262144,coherence-v2-cache-ways=4,"
         "coherence-v2-timeout-ms=2000,coherence-v2-write-through=on",
-        server->port);
+        library, server->port);
+    g_setenv("HETGPU_CUDA_FAKE_EXPECT_HTOD", "1", true);
     qts = qtest_init(command->str);
     t2_program_endpoint_bar2(qts, T2_DVSEC_DEVFN, T2_V2_BAR2_BASE);
     t2_program_endpoint_bar4(qts, T2_DVSEC_DEVFN,
@@ -1419,6 +1424,9 @@ static void cxl_t2_coherent_pool_uses_v2_host_endpoint(void)
 
     qtest_writeq(qts, pool_hpa, value);
     g_assert_cmphex(qtest_readq(qts, pool_hpa), ==, value);
+    t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
+                               CXL_GPU_CMD_BULK_HTOD, pool_offset,
+                               UINT64_C(0x12345678), sizeof(value));
     g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-loads"),
                      ==, 1);
     g_assert_cmpuint(t2_qom_counter(qts, "coherent-pool-host-stores"),
@@ -1427,6 +1435,7 @@ static void cxl_t2_coherent_pool_uses_v2_host_endpoint(void)
                      ==, 0);
 
     qtest_quit(qts);
+    g_unsetenv("HETGPU_CUDA_FAKE_EXPECT_HTOD");
     t2_v2_fake_server_stop(server);
     g_assert_cmpint(server->error_code, ==, 0);
     g_assert_cmpuint(server->requests[CXL_MEMSIM_V2_HOST_ENDPOINT]

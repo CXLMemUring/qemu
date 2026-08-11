@@ -3475,14 +3475,28 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
             uint64_t bar4_offset = ct2d->gpu_cmd.params[0]; /* Offset in staging */
             uint64_t dst_dev_ptr = ct2d->gpu_cmd.params[1]; /* Device destination */
             size_t xfer_size = ct2d->gpu_cmd.params[2]; /* Transfer size */
+            const uint8_t *source = NULL;
 
             if (hetgpu->initialized) {
-                /* Guest wrote data into the bulk staging RAM subregion
-                 * (priority 2 window, no vmexits).  Read from staging ptr. */
-                if (ct2d->bulk_transfer_ptr && bar4_offset <= ct2d->bulk_transfer_size &&
-                    xfer_size <= ct2d->bulk_transfer_size - bar4_offset && xfer_size <= CXL_GPU_BULK_TRANSFER_SIZE &&
-                    cxl_type2_fabric_access_allowed(ct2d, bar4_offset, xfer_size, false, false)) {
-                    err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr, (uint8_t *)ct2d->bulk_transfer_ptr + bar4_offset,
+                if (ct2d->bulk_transfer_ptr &&
+                    bar4_offset <= ct2d->bulk_transfer_size &&
+                    xfer_size <= ct2d->bulk_transfer_size - bar4_offset) {
+                    source = (uint8_t *)ct2d->bulk_transfer_ptr +
+                             bar4_offset;
+                } else if (ct2d->coherent_pool_host_ptr &&
+                           bar4_offset >= ct2d->coherent_pool.base_offset) {
+                    uint64_t pool_offset =
+                        bar4_offset - ct2d->coherent_pool.base_offset;
+
+                    if (pool_offset <= ct2d->coherent_pool.size &&
+                        xfer_size <= ct2d->coherent_pool.size - pool_offset) {
+                        source = ct2d->coherent_pool_host_ptr + pool_offset;
+                    }
+                }
+                if (source && xfer_size <= CXL_GPU_BULK_TRANSFER_SIZE &&
+                    cxl_type2_fabric_access_allowed(
+                        ct2d, bar4_offset, xfer_size, false, false)) {
+                    err = hetgpu_memcpy_htod(hetgpu, dst_dev_ptr, source,
                                              xfer_size);
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
