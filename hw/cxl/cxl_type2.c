@@ -3433,13 +3433,31 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd) {
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
                 config.stream = NULL;
 
-                /* Kernel args are in data buffer as array of pointers */
+                uint64_t arg_values[64];
+                void *args[ARRAY_SIZE(arg_values)];
                 uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
-                void **args = (void **)ct2d->gpu_cmd.data;
 
-                err = hetgpu_launch_kernel(hetgpu, ct2d->gpu_cmd.functions[func_id], &config, args, num_args);
-                if (err != HETGPU_SUCCESS) {
-                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_LAUNCH_FAILED;
+                if (num_args > ARRAY_SIZE(args)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                } else {
+                    /*
+                     * The guest sends values in fixed-width slots. CUDA's
+                     * launch API requires pointers to host-side argument
+                     * storage, not the values reinterpreted as pointers.
+                     */
+                    for (uint32_t i = 0; i < num_args; i++) {
+                        memcpy(&arg_values[i],
+                               ct2d->gpu_cmd.data + i * sizeof(arg_values[i]),
+                               sizeof(arg_values[i]));
+                        args[i] = &arg_values[i];
+                    }
+                    err = hetgpu_launch_kernel(
+                        hetgpu, ct2d->gpu_cmd.functions[func_id], &config,
+                        args, num_args);
+                    if (err != HETGPU_SUCCESS) {
+                        ct2d->gpu_cmd.cmd_result =
+                            CXL_GPU_ERROR_LAUNCH_FAILED;
+                    }
                 }
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;

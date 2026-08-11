@@ -238,6 +238,7 @@ int cuLaunchKernel(void *function, unsigned int grid_x,
 {
     const char *entered = getenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED");
     const char *release = getenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE");
+    const char *expected_args = getenv("HETGPU_CUDA_FAKE_EXPECT_ARGS");
     unsigned int attempt;
 
     (void)grid_x;
@@ -248,10 +249,27 @@ int cuLaunchKernel(void *function, unsigned int grid_x,
     (void)block_z;
     (void)shared_mem;
     (void)stream;
-    (void)args;
     (void)extra;
     if (!function) {
         return 1;
+    }
+    if (expected_args) {
+        static const uint64_t expected[] = {
+            UINT64_C(0x1122334455667788),
+            UINT64_C(0x99aabbccddeeff00),
+        };
+        uint64_t actual[2];
+
+        if (!args || !args[0] || !args[1] ||
+            (uintptr_t)args[0] == expected[0] ||
+            (uintptr_t)args[1] == expected[1]) {
+            return 1;
+        }
+        memcpy(&actual[0], args[0], sizeof(actual[0]));
+        memcpy(&actual[1], args[1], sizeof(actual[1]));
+        if (actual[0] != expected[0] || actual[1] != expected[1]) {
+            return 1;
+        }
     }
     create_marker(entered);
     if (!release) {

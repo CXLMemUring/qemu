@@ -1269,7 +1269,8 @@ static gpointer t2_v2_launch_thread(gpointer opaque)
     T2V2LaunchThread *launch = opaque;
 
     qtest_writeq(launch->qts, T2_V2_BAR2_BASE + CXL_GPU_REG_PARAM3, 0);
-    qtest_writeq(launch->qts, T2_V2_BAR2_BASE + CXL_GPU_REG_PARAM4, 0);
+    qtest_writeq(launch->qts, T2_V2_BAR2_BASE + CXL_GPU_REG_PARAM4,
+                 UINT64_C(2) << 32);
     launch->result = t2_v2_issue_bar2_command(
         launch->qts, T2_V2_BAR2_BASE, CXL_GPU_CMD_LAUNCH_KERNEL,
         1, 1, UINT64_C(1) << 32);
@@ -2989,6 +2990,10 @@ static void cxl_t2_v2_coherent_domain(void)
 
 static void cxl_t2_v2_coherent_gpu_range_commands(void)
 {
+    static const uint64_t kernel_args[] = {
+        UINT64_C(0x1122334455667788),
+        UINT64_C(0x99aabbccddeeff00),
+    };
     g_autofree char *library = t2_hetgpu_fake_path();
     g_autofree char *launch_entered = NULL;
     g_autofree char *launch_release = NULL;
@@ -3015,6 +3020,7 @@ static void cxl_t2_v2_coherent_gpu_range_commands(void)
     unlink(launch_release);
     g_setenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED", launch_entered, true);
     g_setenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE", launch_release, true);
+    g_setenv("HETGPU_CUDA_FAKE_EXPECT_ARGS", "1", true);
     server = t2_v2_fake_server_start();
 
     server->line_address = 192 * MiB;
@@ -3125,6 +3131,8 @@ static void cxl_t2_v2_coherent_gpu_range_commands(void)
                    "fake_kernel", sizeof("fake_kernel"));
     t2_v2_execute_bar2_command(qts, T2_V2_BAR2_BASE,
                                CXL_GPU_CMD_FUNC_GET, 1, 0, 0);
+    qtest_memwrite(qts, T2_V2_BAR2_BASE + CXL_GPU_DATA_OFFSET,
+                   kernel_args, sizeof(kernel_args));
 
     launch.qts = qts;
     launch_thread = g_thread_new("cxl-t2-v2-launch",
@@ -3197,6 +3205,7 @@ static void cxl_t2_v2_coherent_gpu_range_commands(void)
     g_assert_cmpint(server->error_code, ==, 0);
     g_unsetenv("HETGPU_CUDA_FAKE_LAUNCH_ENTERED");
     g_unsetenv("HETGPU_CUDA_FAKE_LAUNCH_RELEASE");
+    g_unsetenv("HETGPU_CUDA_FAKE_EXPECT_ARGS");
     unlink(launch_entered);
     unlink(launch_release);
     g_free(server);
