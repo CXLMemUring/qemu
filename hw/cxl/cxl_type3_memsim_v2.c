@@ -126,8 +126,11 @@ MemTxResult cxl_type3_memsim_v2_read(CxlType3MemsimV2 *state,
     Error *local_err = NULL;
 
     if (!state || !state->enabled || !state->client || !value ||
-        !cxl_memsim_v2_load(state->client, dpa, size, value,
-                            state->config.timeout_ms, &local_err)) {
+        !(state->config.read_exclusive ?
+          cxl_memsim_v2_load_exclusive(state->client, dpa, size, value,
+                                       state->config.timeout_ms, &local_err) :
+          cxl_memsim_v2_load(state->client, dpa, size, value,
+                             state->config.timeout_ms, &local_err))) {
         if (local_err) {
             error_report_err(local_err);
         }

@@ -2626,6 +2626,8 @@ static const Property ct3_props[] = {
                        memsim_v2.config.timeout_ms, 5000),
     DEFINE_PROP_BOOL("coherence-v2-write-through", CXLType3Dev,
                      memsim_v2.config.write_through, false),
+    DEFINE_PROP_BOOL("coherence-v2-read-exclusive", CXLType3Dev,
+                     memsim_v2.config.read_exclusive, false),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType3Dev,
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev,

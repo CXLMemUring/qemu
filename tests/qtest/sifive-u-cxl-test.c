@@ -154,6 +154,7 @@ static void test_type3_coherence_v2_properties(void)
         "coherence-v2-cache-ways",
         "coherence-v2-timeout-ms",
         "coherence-v2-write-through",
+        "coherence-v2-read-exclusive",
     };
     QTestState *qts = qtest_init("-machine none");
     size_t i;

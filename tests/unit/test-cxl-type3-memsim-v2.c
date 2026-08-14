@@ -9,6 +9,7 @@ static void test_default_config_is_disabled_and_valid(void)
     Error *err = NULL;
 
     g_assert_false(config.enabled);
+    g_assert_false(config.read_exclusive);
     g_assert_true(cxl_type3_memsim_v2_validate(&config, &err));
     g_assert_null(err);
 }

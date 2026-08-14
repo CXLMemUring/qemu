@@ -24,6 +24,7 @@ typedef enum CachePeerScript {
     CACHE_PEER_FREE_FLUSH_FAILURE,
     CACHE_PEER_FREE_FENCE_FAILURE,
     CACHE_PEER_IMMEDIATE_SNOOP,
+    CACHE_PEER_EXCLUSIVE_LOAD,
 } CachePeerScript;
 
 typedef struct CachePeer {
@@ -328,6 +329,21 @@ static bool run_wb_retain_script(CachePeer *peer, uint8_t *frame) {
            expect_clean_teardown(peer, frame);
 }
 
+static bool run_exclusive_load_script(CachePeer *peer, uint8_t *frame)
+{
+    uint8_t line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
+
+    put_le64(line, 0, TEST_VALUE_A);
+    if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GETM, frame) ||
+        get_le64(frame, 48) != TEST_LINE_A ||
+        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_M, 1, line, 0)) {
+        return false;
+    }
+    set_phase(peer, 1);
+    return expect_putm(peer, frame, TEST_LINE_A, TEST_VALUE_A, 2) &&
+           expect_clean_teardown(peer, frame);
+}
+
 static bool send_dirty_downgrade(CachePeer *peer) {
     uint8_t snoop[CXL_MEMSIM_V2_FRAME_SIZE];
 
@@ -549,6 +565,9 @@ static gpointer cache_peer_thread(gpointer opaque) {
     case CACHE_PEER_IMMEDIATE_SNOOP:
         success = run_immediate_snoop_script(peer, frame);
         break;
+    case CACHE_PEER_EXCLUSIVE_LOAD:
+        success = run_exclusive_load_script(peer, frame);
+        break;
     }
     if (!success && !peer->error_code) {
         peer->error_code = EPROTO;
@@ -647,6 +666,28 @@ static void test_dirty_owner_snoop_downgrade_returns_full_line(void) {
     finish_cache_test(&peer, peer_thread, client);
     g_assert_cmpuint(peer.snoop_acks, ==, 1);
     g_assert_cmpuint(peer.putm, ==, 0);
+}
+
+static void test_exclusive_load_uses_getm(void)
+{
+    CachePeer peer = {
+        .script = CACHE_PEER_EXCLUSIVE_LOAD,
+    };
+    GThread *peer_thread;
+    CxlMemsimV2Client *client = start_cache_client(
+        &peer, CXL_MEMSIM_V2_LINE_SIZE, 1, &peer_thread);
+    Error *err = NULL;
+    uint64_t value = 0;
+
+    g_assert_true(cxl_memsim_v2_load_exclusive(
+        client, TEST_LINE_A, 8, &value, TEST_TIMEOUT_MS, &err));
+    g_assert_null(err);
+    g_assert_cmphex(value, ==, TEST_VALUE_A);
+    g_assert_true(wait_phase(&peer, 1));
+
+    finish_cache_test(&peer, peer_thread, client);
+    g_assert_cmpuint(peer.gets, ==, 0);
+    g_assert_cmpuint(peer.getm, ==, 1);
 }
 
 static void test_dirty_lru_eviction_is_only_early_putm(void) {
@@ -809,6 +850,7 @@ int main(int argc, char **argv) {
 
     g_test_add_func("/cxl/type2/memsim-v2-cache/wb-retain", test_wb_store_and_m_hit_do_not_putm_until_fence);
     g_test_add_func("/cxl/type2/memsim-v2-cache/dirty-downgrade", test_dirty_owner_snoop_downgrade_returns_full_line);
+    g_test_add_func("/cxl/type2/memsim-v2-cache/exclusive-load", test_exclusive_load_uses_getm);
     g_test_add_func("/cxl/type2/memsim-v2-cache/dirty-eviction", test_dirty_lru_eviction_is_only_early_putm);
     g_test_add_func("/cxl/type2/memsim-v2-cache/upgrade-hits", test_e_and_s_store_hits_use_explicit_upgrade);
     g_test_add_func("/cxl/type2/memsim-v2-cache/write-through", test_write_through_policy_putm_after_store);

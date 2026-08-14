@@ -1041,8 +1041,10 @@ static bool cxl_memsim_v2_access_size_valid(uint64_t address, unsigned size) {
     return (size == 1 || size == 2 || size == 4 || size == 8) && address <= UINT64_MAX - size;
 }
 
-bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address, unsigned size, uint64_t *value, int timeout_ms,
-                        Error **errp) {
+static bool cxl_memsim_v2_load_policy(CxlMemsimV2Client *client,
+                                      uint64_t address, unsigned size,
+                                      uint64_t *value, int timeout_ms,
+                                      bool exclusive, Error **errp) {
     uint8_t bytes[sizeof(*value)] = {0};
     uint64_t cursor = address;
     unsigned copied = 0;
@@ -1059,7 +1061,8 @@ bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address, unsigned si
         unsigned line_offset = cursor & (CXL_MEMSIM_V2_LINE_SIZE - 1);
         unsigned chunk = MIN(size - copied, CXL_MEMSIM_V2_LINE_SIZE - line_offset);
 
-        if (!cxl_memsim_v2_cache_ensure(client, line_address, false, timeout_ms, errp)) {
+        if (!cxl_memsim_v2_cache_ensure(client, line_address, exclusive,
+                                        timeout_ms, errp)) {
             goto out;
         }
         qemu_mutex_lock(&client->state_lock);
@@ -1089,6 +1092,23 @@ bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address, unsigned si
 out:
     qemu_mutex_unlock(&client->operation_lock);
     return success;
+}
+
+bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address,
+                        unsigned size, uint64_t *value, int timeout_ms,
+                        Error **errp)
+{
+    return cxl_memsim_v2_load_policy(client, address, size, value,
+                                     timeout_ms, false, errp);
+}
+
+bool cxl_memsim_v2_load_exclusive(CxlMemsimV2Client *client,
+                                  uint64_t address, unsigned size,
+                                  uint64_t *value, int timeout_ms,
+                                  Error **errp)
+{
+    return cxl_memsim_v2_load_policy(client, address, size, value,
+                                     timeout_ms, true, errp);
 }
 
 bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address, unsigned size, uint64_t value, int timeout_ms,

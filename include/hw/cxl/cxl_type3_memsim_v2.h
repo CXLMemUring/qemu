@@ -20,6 +20,7 @@ typedef struct CxlType3MemsimV2Config {
     uint16_t cache_ways;
     uint32_t timeout_ms;
     bool write_through;
+    bool read_exclusive;
 } CxlType3MemsimV2Config;
 
 typedef struct CxlType3MemsimV2 {

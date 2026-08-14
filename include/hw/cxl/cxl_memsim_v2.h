@@ -159,6 +159,10 @@ bool cxl_memsim_v2_client_transact(CxlMemsimV2Client *client,
 bool cxl_memsim_v2_load(CxlMemsimV2Client *client, uint64_t address,
                         unsigned size, uint64_t *value, int timeout_ms,
                         Error **errp);
+bool cxl_memsim_v2_load_exclusive(CxlMemsimV2Client *client,
+                                  uint64_t address, unsigned size,
+                                  uint64_t *value, int timeout_ms,
+                                  Error **errp);
 bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address,
                          unsigned size, uint64_t value, int timeout_ms,
                          Error **errp);
