@@ -894,7 +894,7 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
     }
-    if (cxl_memsim_boot_enabled(ct3d)) {
+    if (!ct3d->memsim_v2.config.enabled && cxl_memsim_boot_enabled(ct3d)) {
         cxl_memsim_init(ct3d);
     }
 
@@ -978,8 +978,22 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         ct3d->ecs_attrs.fru_attrs[count].ecs_flags = 0;
     }
 
+    if (ct3d->memsim_v2.config.enabled) {
+        if (ct3d->memsim_v2_server_host) {
+            ct3d->memsim_v2.config.server_host =
+                ct3d->memsim_v2_server_host;
+        } else {
+            ct3d->memsim_v2.config.server_host = "127.0.0.1";
+        }
+    }
+    if (!cxl_type3_memsim_v2_realize(&ct3d->memsim_v2, errp)) {
+        goto err_aer_exit;
+    }
+
     return;
 
+err_aer_exit:
+    pcie_aer_exit(pci_dev);
 err_release_cdat:
     cxl_doe_cdat_release(cxl_cstate);
 err_msix_uninit:
@@ -1004,6 +1018,7 @@ static void ct3_exit(PCIDevice *pci_dev)
     CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
     ComponentRegisters *regs = &cxl_cstate->crb;
 
+    cxl_type3_memsim_v2_unrealize(&ct3d->memsim_v2);
     pcie_aer_exit(pci_dev);
     cxl_doe_cdat_release(cxl_cstate);
     msix_uninit_exclusive_bar(pci_dev);
@@ -2418,9 +2433,6 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     AddressSpace *as = NULL;
     int res;
     
-    /* Initialize CXLMemSim on first use */
-    cxl_memsim_init(ct3d);
-    
     /* Log all CXL Type3 reads */
     //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
     //           (unsigned long)host_addr, size);
@@ -2435,6 +2447,14 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         qemu_guest_getrandom_nofail(data, size);
         return MEMTX_OK;
     }
+
+    if (ct3d->memsim_v2.enabled) {
+        return cxl_type3_memsim_v2_read(&ct3d->memsim_v2, dpa_offset,
+                                        data, size);
+    }
+
+    /* Initialize the legacy CXLMemSim transport on first use. */
+    cxl_memsim_init(ct3d);
 
     /* Forward to CXLMemSim if enabled */
     if (g_memsim.enabled && g_memsim.connected) {
@@ -2484,9 +2504,6 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     AddressSpace *as = NULL;
     int res;
     
-    /* Initialize CXLMemSim on first use */
-    cxl_memsim_init(ct3d);
-    
     /* Log all CXL Type3 writes */
     // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
     //            (unsigned long)host_addr, size, (unsigned long)data);
@@ -2500,6 +2517,14 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
         return MEMTX_OK;
     }
+
+    if (ct3d->memsim_v2.enabled) {
+        return cxl_type3_memsim_v2_write(&ct3d->memsim_v2, dpa_offset,
+                                         data, size);
+    }
+
+    /* Initialize the legacy CXLMemSim transport on first use. */
+    cxl_memsim_init(ct3d);
 
     /* Forward to CXLMemSim if enabled */
     if (g_memsim.enabled && g_memsim.connected) {
@@ -2585,6 +2610,22 @@ static const Property ct3_props[] = {
     DEFINE_PROP_BOOL("memsim-gfam", CXLType3Dev, memsim_gfam, false),
     DEFINE_PROP_UINT32("memsim-gfam-host-id", CXLType3Dev,
                        memsim_gfam_host_id, 0),
+    DEFINE_PROP_BOOL("coherence-v2", CXLType3Dev,
+                     memsim_v2.config.enabled, false),
+    DEFINE_PROP_STRING("cxlmemsim-addr", CXLType3Dev,
+                       memsim_v2_server_host),
+    DEFINE_PROP_UINT16("cxlmemsim-port", CXLType3Dev,
+                       memsim_v2.config.server_port, 9300),
+    DEFINE_PROP_UINT16("coherence-v2-host-id", CXLType3Dev,
+                       memsim_v2.config.host_id, 0),
+    DEFINE_PROP_UINT32("coherence-v2-cache-capacity", CXLType3Dev,
+                       memsim_v2.config.cache_capacity, 256 * KiB),
+    DEFINE_PROP_UINT16("coherence-v2-cache-ways", CXLType3Dev,
+                       memsim_v2.config.cache_ways, 4),
+    DEFINE_PROP_UINT32("coherence-v2-timeout-ms", CXLType3Dev,
+                       memsim_v2.config.timeout_ms, 5000),
+    DEFINE_PROP_BOOL("coherence-v2-write-through", CXLType3Dev,
+                     memsim_v2.config.write_through, false),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType3Dev,
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev,

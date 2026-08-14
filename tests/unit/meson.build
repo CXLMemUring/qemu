@@ -56,6 +56,11 @@ tests = {
     meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
     io,
   ],
+  'test-cxl-type3-memsim-v2': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    meson.project_source_root() / 'hw/cxl/cxl_type3_memsim_v2.c',
+    io,
+  ],
 }
 
 if have_system or have_tools

@@ -10,6 +10,8 @@
 #include "libqtest.h"
 #include "qemu/bswap.h"
 #include "qemu/units.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
 #include "standard-headers/linux/pci_regs.h"
 
 #define SIFIVE_U_FW_CFG_DATA     0x10100000ULL
@@ -115,6 +117,51 @@ static bool buffer_contains_cxl_mmio64(const uint8_t *buf, size_t len)
         }
     }
     return false;
+}
+
+static bool device_has_property(QTestState *qts, const char *type,
+                                const char *property)
+{
+    QDict *response;
+    QList *properties;
+    QListEntry *entry;
+    bool found = false;
+
+    response = qtest_qmp(qts,
+                         "{'execute': 'device-list-properties',"
+                         " 'arguments': {'typename': %s}}", type);
+    properties = qdict_get_qlist(response, "return");
+    QLIST_FOREACH_ENTRY(properties, entry) {
+        QDict *description = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (!strcmp(qdict_get_str(description, "name"), property)) {
+            found = true;
+            break;
+        }
+    }
+    qobject_unref(response);
+    return found;
+}
+
+static void test_type3_coherence_v2_properties(void)
+{
+    static const char * const expected[] = {
+        "coherence-v2",
+        "cxlmemsim-addr",
+        "cxlmemsim-port",
+        "coherence-v2-host-id",
+        "coherence-v2-cache-capacity",
+        "coherence-v2-cache-ways",
+        "coherence-v2-timeout-ms",
+        "coherence-v2-write-through",
+    };
+    QTestState *qts = qtest_init("-machine none");
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(expected); i++) {
+        g_assert_true(device_has_property(qts, "cxl-type3", expected[i]));
+    }
+    qtest_quit(qts);
 }
 
 static void assert_cedt(const uint8_t *table, size_t length)
@@ -359,6 +406,8 @@ static void test_firmware_files(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/riscv/sifive-u/cxl/type3-coherence-v2-properties",
+                   test_type3_coherence_v2_properties);
     qtest_add_func("/riscv/sifive-u/cxl/firmware-files",
                    test_firmware_files);
     return g_test_run();

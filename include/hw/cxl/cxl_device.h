@@ -11,6 +11,7 @@
 #define CXL_DEVICE_H
 
 #include "hw/cxl/cxl_component.h"
+#include "hw/cxl/cxl_type3_memsim_v2.h"
 #include "hw/pci/pci_device.h"
 #include "hw/register.h"
 #include "hw/cxl/cxl_events.h"
@@ -589,6 +590,8 @@ struct CXLType3Dev {
     HostMemoryBackend *hostpmem;
     HostMemoryBackend *lsa;
     uint64_t sn;
+    char *memsim_v2_server_host;
+    CxlType3MemsimV2 memsim_v2;
 
     /* State */
     AddressSpace hostvmem_as;
