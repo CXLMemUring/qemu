@@ -11,6 +11,7 @@ system_ss.add(when: 'CONFIG_CXL',
                    'cxl_type1.c',
                    'cxl_type2.c',
                    'cxl_type2_coherency.c',
+                   'cxl_memsim_v2.c',
                    'cxl_p2p_dma.c',
                    'cxl_hetgpu.c',
                    'cxl-vcs-switch.c'

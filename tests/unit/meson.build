@@ -48,6 +48,14 @@ tests = {
   'test-qapi-util': [],
   'test-interval-tree': [],
   'test-fifo': [],
+  'test-cxl-memsim-v2': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
+  'test-cxl-memsim-v2-cache': [
+    meson.project_source_root() / 'hw/cxl/cxl_memsim_v2.c',
+    io,
+  ],
 }
 
 if have_system or have_tools
