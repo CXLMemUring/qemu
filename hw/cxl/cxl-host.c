@@ -16,11 +16,26 @@
 #include "qapi/qapi-visit-machine.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_host.h"
+#include "hw/cxl/cxl_type2.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_host.h"
 #include "hw/pci/pcie_port.h"
 #include "hw/pci-bridge/pci_expander_bridge.h"
+
+typedef enum CXLRouteType {
+    CXL_ROUTE_NONE,
+    CXL_ROUTE_TYPE2_DIRECT,
+    CXL_ROUTE_TYPE3,
+} CXLRouteType;
+
+typedef struct CXLRouteResult {
+    PCIDevice *device;
+    CXLRouteType type;
+    bool traversed_switch;
+} CXLRouteResult;
+
+static GSList *cxl_fmws_get_all(void);
 
 static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
                                            int index, Error **errp)
@@ -59,6 +74,12 @@ static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
     } else {
         /* Default to 256 byte interleave */
         fw->enc_int_gran = 0;
+    }
+
+    if (object->has_restrictions) {
+        fw->restrictions = object->restrictions;
+    } else {
+        fw->restrictions = 0x0f;
     }
 
     fw->targets = g_malloc0_n(fw->num_targets, sizeof(*fw->targets));
@@ -156,7 +177,7 @@ static bool cxl_hdm_find_target(uint32_t *cache_mem, hwaddr addr,
     return found;
 }
 
-static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
+static CXLRouteResult cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
 {
     CXLComponentState *hb_cstate, *usp_cstate;
     PCIHostState *hb;
@@ -173,40 +194,49 @@ static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
     rb_index = (addr / cxl_decode_ig(fw->enc_int_gran)) % fw->num_targets;
     hb = PCI_HOST_BRIDGE(fw->target_hbs[rb_index]->cxl_host_bridge);
     if (!hb || !hb->bus || !pci_bus_is_cxl(hb->bus)) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
     if (cxl_get_hb_passthrough(hb)) {
         rp = pcie_find_port_first(hb->bus);
         if (!rp) {
-            return NULL;
+            return (CXLRouteResult) { 0 };
         }
     } else {
         hb_cstate = cxl_get_hb_cstate(hb);
         if (!hb_cstate) {
-            return NULL;
+            return (CXLRouteResult) { 0 };
         }
 
         cache_mem = hb_cstate->crb.cache_mem_registers;
 
         target_found = cxl_hdm_find_target(cache_mem, addr, &target);
         if (!target_found) {
-            return NULL;
+            return (CXLRouteResult) { 0 };
         }
 
         rp = pcie_find_port_by_pn(hb->bus, target);
         if (!rp) {
-            return NULL;
+            return (CXLRouteResult) { 0 };
         }
     }
 
     d = pci_bridge_get_sec_bus(PCI_BRIDGE(rp))->devices[0];
     if (!d) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
     if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
-        return d;
+        return (CXLRouteResult) {
+            .device = d,
+            .type = CXL_ROUTE_TYPE3,
+        };
+    }
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
+        return (CXLRouteResult) {
+            .device = d,
+            .type = CXL_ROUTE_TYPE2_DIRECT,
+        };
     }
 
     /*
@@ -214,53 +244,89 @@ static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
      * supported.
      */
     if (!object_dynamic_cast(OBJECT(d), TYPE_CXL_USP)) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
     usp = CXL_USP(d);
 
     usp_cstate = cxl_usp_to_cstate(usp);
     if (!usp_cstate) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
     cache_mem = usp_cstate->crb.cache_mem_registers;
 
     target_found = cxl_hdm_find_target(cache_mem, addr, &target);
     if (!target_found) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
     d = pcie_find_port_by_pn(&PCI_BRIDGE(d)->sec_bus, target);
     if (!d) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
     d = pci_bridge_get_sec_bus(PCI_BRIDGE(d))->devices[0];
     if (!d) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
+    }
+
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
+        return (CXLRouteResult) {
+            .device = d,
+            .traversed_switch = true,
+        };
     }
 
     if (!object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
-        return NULL;
+        return (CXLRouteResult) { 0 };
     }
 
-    return d;
+    return (CXLRouteResult) {
+        .device = d,
+        .type = CXL_ROUTE_TYPE3,
+        .traversed_switch = true,
+    };
+}
+
+static bool cxl_type2_cfmws_dispatch_valid(CXLFixedWindow *fw,
+                                           CXLRouteResult route,
+                                           hwaddr addr,
+                                           unsigned size)
+{
+    CXLType2State *ct2d = CXL_TYPE2(route.device);
+    GSList *windows = cxl_fmws_get_all();
+    unsigned total_windows = g_slist_length(windows);
+
+    g_slist_free(windows);
+    return !route.traversed_switch &&
+           cxl_type2_cfmws_protocol_enabled(ct2d->slugarch.enabled,
+                                            ct2d->memsim_v2.enabled) &&
+           cxl_type2_cfmws_shape_valid(
+               total_windows, fw->num_targets, fw->enc_int_ways,
+               fw->size, 0, ct2d->device_mem_size, addr, size);
 }
 
 static MemTxResult cxl_read_cfmws(void *opaque, hwaddr addr, uint64_t *data,
                                   unsigned size, MemTxAttrs attrs)
 {
     CXLFixedWindow *fw = opaque;
-    PCIDevice *d;
+    CXLRouteResult route;
 
-    d = cxl_cfmws_find_device(fw, addr);
-    if (d == NULL) {
+    route = cxl_cfmws_find_device(fw, addr);
+    if (route.type == CXL_ROUTE_TYPE2_DIRECT) {
+        if (!cxl_type2_cfmws_dispatch_valid(fw, route, addr, size)) {
+            *data = 0;
+            return MEMTX_ERROR;
+        }
+        return cxl_type2_cfmws_read(route.device, addr, data, size, attrs);
+    }
+    if (route.type != CXL_ROUTE_TYPE3) {
         *data = 0;
         /* Reads to invalid address return poison */
         return MEMTX_ERROR;
     }
 
-    return cxl_type3_read(d, addr + fw->base, data, size, attrs);
+    return cxl_type3_read(route.device, addr + fw->base, data, size, attrs);
 }
 
 static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
@@ -268,15 +334,25 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
                                    MemTxAttrs attrs)
 {
     CXLFixedWindow *fw = opaque;
-    PCIDevice *d;
+    CXLRouteResult route;
 
-    d = cxl_cfmws_find_device(fw, addr);
-    if (d == NULL) {
+    route = cxl_cfmws_find_device(fw, addr);
+    if (route.type == CXL_ROUTE_TYPE2_DIRECT) {
+        if (!cxl_type2_cfmws_dispatch_valid(fw, route, addr, size)) {
+            return MEMTX_ERROR;
+        }
+        return cxl_type2_cfmws_write(route.device, addr, data, size, attrs);
+    }
+    if (route.type != CXL_ROUTE_TYPE3) {
+        if (route.device &&
+            object_dynamic_cast(OBJECT(route.device), TYPE_CXL_TYPE2)) {
+            return MEMTX_ERROR;
+        }
         /* Writes to invalid address are silent */
         return MEMTX_OK;
     }
 
-    return cxl_type3_write(d, addr + fw->base, data, size, attrs);
+    return cxl_type3_write(route.device, addr + fw->base, data, size, attrs);
 }
 
 const MemoryRegionOps cfmws_ops = {

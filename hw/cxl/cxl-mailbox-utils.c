@@ -15,6 +15,7 @@
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_events.h"
 #include "hw/cxl/cxl_mailbox.h"
+#include "hw/cxl/cxl_type2.h"
 #include "hw/pci/pci.h"
 #include "hw/pci-bridge/cxl_upstream_port.h"
 #include "qemu/cutils.h"
@@ -25,6 +26,7 @@
 #include "system/hostmem.h"
 #include "qemu/range.h"
 #include "qapi/qapi-types-cxl.h"
+#include "hw/cxl/cxl_vcs_switch.h"
 
 #define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
 #define CXL_DC_EVENT_LOG_SIZE 8
@@ -116,6 +118,10 @@ enum {
     PHYSICAL_SWITCH = 0x51,
         #define IDENTIFY_SWITCH_DEVICE      0x0
         #define GET_PHYSICAL_PORT_STATE     0x1
+    VIRTUAL_SWITCH = 0x52,
+        #define GET_VIRTUAL_SWITCH_INFO     0x0
+        #define BIND_VPPB                   0x1
+        #define UNBIND_VPPB                 0x2
     TUNNEL = 0x53,
         #define MANAGEMENT_COMMAND     0x0
     FMAPI_DCD_MGMT = 0x56,
@@ -673,6 +679,153 @@ static CXLRetCode cmd_get_physical_port_state(const struct cxl_cmd *cmd,
     *len_out = pl_size;
 
     return CXL_MBOX_SUCCESS;
+}
+
+/* CXL r3.2 Section 7.6.7.2.1: Get Virtual CXL Switch Info */
+static CXLRetCode cmd_get_virtual_switch_info(const struct cxl_cmd *cmd,
+                                              uint8_t *payload_in,
+                                              size_t len_in,
+                                              uint8_t *payload_out,
+                                              size_t *len_out,
+                                              CXLCCI *cci)
+{
+    struct cxl_fmapi_get_virtual_switch_info_req_pl {
+        uint8_t start_vppb;
+        uint8_t vppb_list_limit;
+        uint8_t number_of_vcs;
+        uint8_t vcs_id_list[];
+    } QEMU_PACKED *in = (void *)payload_in;
+    struct cxl_fmapi_get_virtual_switch_info_rsp_pl {
+        uint8_t num_vcs;
+        uint8_t rsvd[3];
+        uint8_t vcs_info_list[];
+    } QEMU_PACKED *out = (void *)payload_out;
+    uint8_t *ptr = out->vcs_info_list;
+    uint8_t *end = payload_out + cci->payload_max;
+    uint8_t limit;
+
+    if (!cci->vcs) {
+        return CXL_MBOX_UNSUPPORTED;
+    }
+    if (len_in < sizeof(*in)) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+    if (in->number_of_vcs &&
+        len_in < sizeof(*in) + in->number_of_vcs) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+
+    memset(out, 0, sizeof(*out));
+    limit = in->vppb_list_limit ? in->vppb_list_limit :
+                                  CXL_VPPB_LIST_LIMIT;
+    limit = MIN(limit, (uint8_t)CXL_VPPB_LIST_LIMIT);
+
+    for (int i = 0; i < CXL_MAX_USP_PPBS; i++) {
+        uint8_t vcs_id = i;
+        CXLUpstreamPPB *vcs;
+        uint8_t num_vppbs;
+        uint8_t vppb_count;
+
+        if (in->number_of_vcs) {
+            if (i >= in->number_of_vcs) {
+                break;
+            }
+            vcs_id = in->vcs_id_list[i];
+        } else if (i >= cci->vcs->num_usp_ppbs) {
+            break;
+        }
+
+        if (vcs_id >= cci->vcs->num_usp_ppbs ||
+            !cci->vcs->usp_ppbs[vcs_id]) {
+            return CXL_MBOX_INVALID_INPUT;
+        }
+
+        vcs = cci->vcs->usp_ppbs[vcs_id];
+        num_vppbs = vcs->info->num_vppbs;
+        vppb_count = in->start_vppb >= num_vppbs ? 0 :
+            MIN((uint8_t)(num_vppbs - in->start_vppb), limit);
+
+        if (ptr + 4 + vppb_count * 4 > end) {
+            return CXL_MBOX_INVALID_INPUT;
+        }
+
+        *ptr++ = vcs->info->vcs_id;
+        *ptr++ = vcs->info->vcs_state;
+        *ptr++ = vcs->info->usp_id;
+        *ptr++ = num_vppbs;
+
+        for (int j = in->start_vppb; j < in->start_vppb + vppb_count; j++) {
+            CXLVPPBInfo *vppb = vcs->info->vppbs[j];
+
+            *ptr++ = vppb ? vppb->binding_status :
+                            CXL_VPPB_BINDING_STATUS_UNBOUND;
+            *ptr++ = vppb ? vppb->bound_port_id : 0;
+            *ptr++ = vppb ? vppb->bound_ld_id : CXL_INVALID_BOUND_LD_ID;
+            *ptr++ = 0;
+        }
+        out->num_vcs++;
+    }
+
+    *len_out = ptr - payload_out;
+    return CXL_MBOX_SUCCESS;
+}
+
+/* CXL r3.2 Section 7.6.7.2.2: Bind vPPB */
+static CXLRetCode cmd_bind_vppb(const struct cxl_cmd *cmd,
+                                uint8_t *payload_in,
+                                size_t len_in,
+                                uint8_t *payload_out,
+                                size_t *len_out,
+                                CXLCCI *cci)
+{
+    struct cxl_fmapi_bind_vppb_req_pl {
+        uint8_t vcs_id;
+        uint8_t vppb_id;
+        uint8_t physical_port_id;
+        uint8_t rsvd;
+        uint16_t ld_id;
+    } QEMU_PACKED *in = (void *)payload_in;
+    uint16_t ld_id;
+
+    if (!cci->vcs) {
+        return CXL_MBOX_UNSUPPORTED;
+    }
+    if (len_in < sizeof(*in)) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+
+    ld_id = lduw_le_p(&in->ld_id);
+    if (ld_id != CXL_UNSUPPORTED_LD_ID) {
+        return CXL_MBOX_INVALID_INPUT;
+    }
+
+    return cxl_vcs_bind_vppb(cci->vcs, in->vcs_id, in->vppb_id,
+                             in->physical_port_id, ld_id);
+}
+
+/* CXL r3.2 Section 7.6.7.2.3: Unbind vPPB */
+static CXLRetCode cmd_unbind_vppb(const struct cxl_cmd *cmd,
+                                  uint8_t *payload_in,
+                                  size_t len_in,
+                                  uint8_t *payload_out,
+                                  size_t *len_out,
+                                  CXLCCI *cci)
+{
+    struct cxl_fmapi_unbind_vppb_req_pl {
+        uint8_t vcs_id;
+        uint8_t vppb_id;
+        uint16_t option;
+    } QEMU_PACKED *in = (void *)payload_in;
+
+    if (!cci->vcs) {
+        return CXL_MBOX_UNSUPPORTED;
+    }
+    if (len_in < sizeof(*in)) {
+        return CXL_MBOX_INVALID_PAYLOAD_LENGTH;
+    }
+
+    return cxl_vcs_unbind_vppb(cci->vcs, in->vcs_id, in->vppb_id,
+                               lduw_le_p(&in->option));
 }
 
 /* CXL r3.1 Section 8.2.9.1.2: Background Operation Status (Opcode 0002h) */
@@ -1522,6 +1675,53 @@ static CXLRetCode cmd_identify_memory_device(const struct cxl_cmd *cmd,
     stw_le_p(&id->inject_poison_limit, 0);
     stw_le_p(&id->dc_event_log_size, CXL_DC_EVENT_LOG_SIZE);
 
+    *len_out = sizeof(*id);
+    return CXL_MBOX_SUCCESS;
+}
+
+static CXLRetCode cmd_identify_type2_memory_device(const struct cxl_cmd *cmd,
+                                                   uint8_t *payload_in,
+                                                   size_t len_in,
+                                                   uint8_t *payload_out,
+                                                   size_t *len_out,
+                                                   CXLCCI *cci)
+{
+    struct {
+        char fw_revision[0x10];
+        uint64_t total_capacity;
+        uint64_t volatile_capacity;
+        uint64_t persistent_capacity;
+        uint64_t partition_align;
+        uint16_t info_event_log_size;
+        uint16_t warning_event_log_size;
+        uint16_t failure_event_log_size;
+        uint16_t fatal_event_log_size;
+        uint32_t lsa_size;
+        uint8_t poison_list_max_mer[3];
+        uint16_t inject_poison_limit;
+        uint8_t poison_caps;
+        uint8_t qos_telemetry_caps;
+        uint16_t dc_event_log_size;
+    } QEMU_PACKED *id = (void *)payload_out;
+    CXLType2State *ct2d = CXL_TYPE2(cci->d);
+    CXLDeviceState *cxl_dstate = &ct2d->cxl_dstate;
+
+    QEMU_BUILD_BUG_ON(sizeof(*id) != 0x45);
+    if (!QEMU_IS_ALIGNED(cxl_dstate->vmem_size,
+                         CXL_CAPACITY_MULTIPLIER) ||
+        !QEMU_IS_ALIGNED(cxl_dstate->pmem_size,
+                         CXL_CAPACITY_MULTIPLIER)) {
+        return CXL_MBOX_INTERNAL_ERROR;
+    }
+
+    memset(id, 0, sizeof(*id));
+    snprintf(id->fw_revision, sizeof(id->fw_revision), "T2EMU V%02d", 2);
+    stq_le_p(&id->total_capacity,
+             cxl_dstate->static_mem_size / CXL_CAPACITY_MULTIPLIER);
+    stq_le_p(&id->volatile_capacity,
+             cxl_dstate->vmem_size / CXL_CAPACITY_MULTIPLIER);
+    stq_le_p(&id->persistent_capacity,
+             cxl_dstate->pmem_size / CXL_CAPACITY_MULTIPLIER);
     *len_out = sizeof(*id);
     return CXL_MBOX_SUCCESS;
 }
@@ -2646,6 +2846,8 @@ static CXLRetCode cmd_media_get_scan_media_results(const struct cxl_cmd *cmd,
     return CXL_MBOX_SUCCESS;
 }
 
+static uint32_t cxl_dcd_num_extents_available(CXLType3Dev *ct3d);
+
 /*
  * CXL r3.1 section 8.2.9.9.9.1: Get Dynamic Capacity Configuration
  * (Opcode: 4800h)
@@ -2720,8 +2922,8 @@ static CXLRetCode cmd_dcd_get_dyn_cap_config(const struct cxl_cmd *cmd,
      * to use.
      */
     stl_le_p(&extra_out->num_extents_supported, CXL_NUM_EXTENTS_SUPPORTED);
-    stl_le_p(&extra_out->num_extents_available, CXL_NUM_EXTENTS_SUPPORTED -
-             ct3d->dc.total_extent_count);
+    stl_le_p(&extra_out->num_extents_available,
+             cxl_dcd_num_extents_available(ct3d));
     stl_le_p(&extra_out->num_tags_supported, CXL_NUM_TAGS_SUPPORTED);
     stl_le_p(&extra_out->num_tags_available, CXL_NUM_TAGS_SUPPORTED);
 
@@ -2923,6 +3125,18 @@ typedef struct CXLUpdateDCExtentListInPl {
     } QEMU_PACKED updated_entries[];
 } QEMU_PACKED CXLUpdateDCExtentListInPl;
 
+static uint32_t cxl_dcd_num_extents_available(CXLType3Dev *ct3d)
+{
+    uint64_t used = ct3d->dc.total_extent_count;
+
+    if (ct3d->memsim_dcd_report_valid) {
+        used = MAX(used, ct3d->memsim_dcd_active_extents);
+    }
+    used = MIN(used, (uint64_t)CXL_NUM_EXTENTS_SUPPORTED);
+
+    return CXL_NUM_EXTENTS_SUPPORTED - used;
+}
+
 /*
  * For the extents in the extent list to operate, check whether they are valid
  * 1. The extent should be in the range of a valid DC region;
@@ -3023,8 +3237,10 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
     CXLUpdateDCExtentListInPl *in = (void *)payload_in;
     CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
     CXLDCExtentList *extent_list = &ct3d->dc.extents;
+    CXLDCExtentGroup *pending_group;
     uint32_t i, num;
     uint64_t dpa, len;
+    uint16_t host_id;
     CXLRetCode ret;
 
     if (len_in < sizeof(*in)) {
@@ -3058,9 +3274,24 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
         return ret;
     }
 
+    pending_group = QTAILQ_FIRST(&ct3d->dc.extents_pending);
+    host_id = pending_group ? pending_group->host_id :
+                              ct3d->memsim_gfam_host_id;
+
     for (i = 0; i < in->num_entries_updated; i++) {
         dpa = in->updated_entries[i].start_dpa;
         len = in->updated_entries[i].len;
+
+        ret = cxl_type3_memsim_sync_dcd_add(ct3d, host_id, dpa, len);
+        if (ret != CXL_MBOX_SUCCESS) {
+            while (i > 0) {
+                i--;
+                cxl_type3_memsim_sync_dcd_release(
+                    ct3d, host_id, in->updated_entries[i].start_dpa,
+                    in->updated_entries[i].len);
+            }
+            return ret;
+        }
 
         cxl_insert_extent_to_extent_list(extent_list, dpa, len, NULL, 0);
         ct3d->dc.total_extent_count += 1;
@@ -3222,6 +3453,26 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
         return ret;
     }
 
+    for (uint32_t i = 0; i < in->num_entries_updated; i++) {
+        ret = cxl_type3_memsim_sync_dcd_release(ct3d,
+                                                ct3d->memsim_gfam_host_id,
+                                                in->updated_entries[i].start_dpa,
+                                                in->updated_entries[i].len);
+        if (ret != CXL_MBOX_SUCCESS) {
+            QTAILQ_FOREACH_SAFE(ent, &updated_list, node, ent_next) {
+                cxl_remove_extent_from_extent_list(&updated_list, ent);
+            }
+            while (i > 0) {
+                i--;
+                cxl_type3_memsim_sync_dcd_add(
+                    ct3d, ct3d->memsim_gfam_host_id,
+                    in->updated_entries[i].start_dpa,
+                    in->updated_entries[i].len);
+            }
+            return ret;
+        }
+    }
+
     /*
      * If the dry run release passes, the returned updated_list will
      * be the updated extent list and we just need to clear the extents
@@ -3267,9 +3518,11 @@ static CXLRetCode cmd_fm_get_dcd_info(const struct cxl_cmd *cmd,
     } QEMU_PACKED *out = (void *)payload_out;
     CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
     CXLDCRegion *region;
+    uint64_t total_capacity = ct3d->dc.total_capacity;
     int i;
 
-    out->num_hosts = 1;
+    out->num_hosts = ct3d->memsim_gfam_report_valid ?
+                     MIN(ct3d->memsim_gfam_hosts, (uint64_t)UINT8_MAX) : 1;
     out->num_regions_supported = ct3d->dc.num_regions;
     stw_le_p(&out->supported_add_sel_policy_bitmask,
              BIT(CXL_EXTENT_SELECTION_POLICY_PRESCRIPTIVE));
@@ -3277,8 +3530,12 @@ static CXLRetCode cmd_fm_get_dcd_info(const struct cxl_cmd *cmd,
              BIT(CXL_EXTENT_REMOVAL_POLICY_PRESCRIPTIVE));
     out->sanitize_on_release_bitmask = 0;
 
+    if (ct3d->memsim_dcd_report_valid &&
+        ct3d->memsim_dcd_total_capacity != 0) {
+        total_capacity = ct3d->memsim_dcd_total_capacity;
+    }
     stq_le_p(&out->total_dynamic_capacity,
-             ct3d->dc.total_capacity / CXL_CAPACITY_MULTIPLIER);
+             total_capacity / CXL_CAPACITY_MULTIPLIER);
 
     for (i = 0; i < ct3d->dc.num_regions; i++) {
         region = &ct3d->dc.regions[i];
@@ -3363,7 +3620,7 @@ static CXLRetCode cmd_fm_get_host_dc_region_config(const struct cxl_cmd *cmd,
 
     assert(out_pl_len <= CXL_MAILBOX_MAX_PAYLOAD_SIZE);
 
-    stw_le_p(&out->host_id, 0);
+    stw_le_p(&out->host_id, in->host_id);
     out->num_regions = ct3d->dc.num_regions;
     out->regions_returned = record_count;
 
@@ -3385,8 +3642,8 @@ static CXLRetCode cmd_fm_get_host_dc_region_config(const struct cxl_cmd *cmd,
     }
 
     stl_le_p(&extra_out->num_extents_supported, CXL_NUM_EXTENTS_SUPPORTED);
-    stl_le_p(&extra_out->num_extents_available, CXL_NUM_EXTENTS_SUPPORTED -
-             ct3d->dc.total_extent_count);
+    stl_le_p(&extra_out->num_extents_available,
+             cxl_dcd_num_extents_available(ct3d));
     stl_le_p(&extra_out->num_tags_supported, CXL_NUM_TAGS_SUPPORTED);
     stl_le_p(&extra_out->num_tags_available, CXL_NUM_TAGS_SUPPORTED);
 
@@ -3629,6 +3886,9 @@ static CXLRetCode cmd_fm_initiate_dc_add(const struct cxl_cmd *cmd,
                                                           ext->shared_seq);
             }
 
+            if (group) {
+                group->host_id = in->host_id;
+            }
             cxl_extent_group_list_insert_tail(&ct3d->dc.extents_pending, group);
             ct3d->dc.total_extent_count += in->ext_count;
             cxl_create_dc_event_records_for_extents(ct3d,
@@ -3805,6 +4065,11 @@ static const struct cxl_cmd cxl_cmd_set[256][256] = {
         cmd_media_get_scan_media_results, 0, 0 },
 };
 
+static const struct cxl_cmd cxl_cmd_set_t2[256][256] = {
+    [IDENTIFY][MEMORY_DEVICE] = { "IDENTIFY_MEMORY_DEVICE",
+        cmd_identify_type2_memory_device, 0, 0 },
+};
+
 static const struct cxl_cmd cxl_cmd_set_dcd[256][256] = {
     [DCD_CONFIG][GET_DC_CONFIG] = { "DCD_GET_DC_CONFIG",
         cmd_dcd_get_dyn_cap_config, 2, 0 },
@@ -3837,6 +4102,17 @@ static const struct cxl_cmd cxl_cmd_set_sw[256][256] = {
         cmd_get_physical_port_state, ~0, 0 },
     [TUNNEL][MANAGEMENT_COMMAND] = { "TUNNEL_MANAGEMENT_COMMAND",
                                      cmd_tunnel_management_cmd, ~0, 0 },
+};
+
+static const struct cxl_cmd cxl_cmd_set_vcs[256][256] = {
+    [VIRTUAL_SWITCH][GET_VIRTUAL_SWITCH_INFO] = {
+        "GET_VIRTUAL_SWITCH_INFO", cmd_get_virtual_switch_info, ~0, 0 },
+    [VIRTUAL_SWITCH][BIND_VPPB] = {
+        "BIND_VPPB", cmd_bind_vppb, sizeof(uint8_t) * 4 + sizeof(uint16_t),
+        0 },
+    [VIRTUAL_SWITCH][UNBIND_VPPB] = {
+        "UNBIND_VPPB", cmd_unbind_vppb, sizeof(uint8_t) * 2 +
+        sizeof(uint16_t), 0 },
 };
 
 static const struct cxl_cmd cxl_cmd_set_fm_dcd[256][256] = {
@@ -4077,6 +4353,19 @@ static void cxl_copy_cci_commands(CXLCCI *cci, const struct cxl_cmd (*cxl_cmds)[
     }
 }
 
+static void cxl_disable_feature_commands(CXLCCI *cci)
+{
+    /*
+     * Linux 6.18 initializes optional CXL Features when the CEL advertises
+     * Get Supported Features and Get Feature. The simulator does not require
+     * patrol-scrub/ECS feature support for DCD operation, and advertising the
+     * optional feature path currently trips CONFIG_FORTIFY_SOURCE in the guest
+     * during hotplug probe. Keep DCD endpoints focused on the DCD mailbox
+     * command set until the feature payload path is fully version-aligned.
+     */
+    memset(cci->cxl_cmd_set[FEATURES], 0, sizeof(cci->cxl_cmd_set[FEATURES]));
+}
+
 void cxl_add_cci_commands(CXLCCI *cci, const struct cxl_cmd (*cxl_cmd_set)[256],
                                  size_t payload_max)
 {
@@ -4094,6 +4383,18 @@ void cxl_initialize_mailbox_swcci(CXLCCI *cci, DeviceState *intf,
     cxl_init_cci(cci, payload_max);
 }
 
+void cxl_initialize_vcs_swcci(CXLCCI *cci, CXLVCSSwitch *vcs,
+                              DeviceState *intf, DeviceState *d,
+                              size_t payload_max)
+{
+    cxl_copy_cci_commands(cci, cxl_cmd_set_sw);
+    cxl_copy_cci_commands(cci, cxl_cmd_set_vcs);
+    cci->vcs = vcs;
+    cci->d = d;
+    cci->intf = intf;
+    cxl_init_cci(cci, payload_max);
+}
+
 void cxl_initialize_mailbox_t3(CXLCCI *cci, DeviceState *d, size_t payload_max)
 {
     CXLType3Dev *ct3d = CXL_TYPE3(d);
@@ -4101,10 +4402,19 @@ void cxl_initialize_mailbox_t3(CXLCCI *cci, DeviceState *d, size_t payload_max)
     cxl_copy_cci_commands(cci, cxl_cmd_set);
     if (ct3d->dc.num_regions) {
         cxl_copy_cci_commands(cci, cxl_cmd_set_dcd);
+        cxl_disable_feature_commands(cci);
     }
     cci->d = d;
 
     /* No separation for PCI MB as protocol handled in PCI device */
+    cci->intf = d;
+    cxl_init_cci(cci, payload_max);
+}
+
+void cxl_initialize_mailbox_t2(CXLCCI *cci, DeviceState *d, size_t payload_max)
+{
+    cxl_copy_cci_commands(cci, cxl_cmd_set_t2);
+    cci->d = d;
     cci->intf = d;
     cxl_init_cci(cci, payload_max);
 }

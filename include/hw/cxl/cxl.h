@@ -37,6 +37,7 @@ typedef struct CXLFixedWindow {
     uint8_t enc_int_ways;
     uint8_t enc_int_gran;
     /* Todo: XOR based interleaving */
+    uint16_t restrictions;
     MemoryRegion mr;
     hwaddr base;
 } CXLFixedWindow;

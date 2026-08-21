@@ -552,12 +552,20 @@
 # @targets: Target root bridge IDs from -device ...,id=<ID> for each
 #     root bridge.
 #
+# @restrictions: CFMWS restriction bitmask.  BIT(0) - Device memory,
+#     BIT(1) - Host-only memory, BIT(2) - Volatile, BIT(3) - Persistent,
+#     BIT(4) - Fixed Device Config, BIT(5) - BI.  Default is 0x0f.
+#     For HDM-DB/BI experiments with the Linux BI enablement, use 0x2d
+#     (device memory + volatile + persistent + BI); do not combine
+#     host-only memory and BI in one CFMWS.
+#
 # Since: 7.1
 ##
 { 'struct': 'CXLFixedMemoryWindowOptions',
   'data': {
       'size': 'size',
       '*interleave-granularity': 'size',
+      '*restrictions': 'uint16',
       'targets': ['str'] }}
 
 ##
