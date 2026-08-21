@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qapi/qapi-commands-cxl.h"
 #include "hw/mem/memory-device.h"
@@ -23,6 +24,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/pmem.h"
+#include "qemu/processor.h"
 #include "qemu/range.h"
 #include "qemu/rcu.h"
 #include "qemu/guest-random.h"
@@ -33,6 +35,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_memsim_wait.h"
 #include "hw/pci/msix.h"
 
 /* type3 device private */
@@ -1207,6 +1210,10 @@ static int cxl_type3_hpa_to_as_and_dpa(CXLType3Dev *ct3d,
 /* CXLMemSim Integration */
 #define CXL_MEMSIM_DEFAULT_HOST "127.0.0.1"
 #define CXL_MEMSIM_DEFAULT_PORT 9999
+#define CXL_MEMSIM_SHM_TIMEOUT_NS (100ULL * 1000 * 1000)
+#define CXL_MEMSIM_DEFAULT_SPIN_US 50
+#define CXL_MEMSIM_DEFAULT_SLEEP_US 10
+#define CXL_MEMSIM_MAX_WAIT_US 100000
 
 /* Operation type constants - matching server */
 #define CXL_OP_READ         0
@@ -1363,6 +1370,11 @@ static struct {
     uint64_t latency_inject_min;  /* Minimum latency to bother injecting (ns) */
     uint64_t stats_injected_ns;   /* Total injected delay (ns) */
     uint64_t stats_inject_count;  /* Number of times delay was injected */
+    uint64_t pgas_client_spin_ns;
+    uint64_t pgas_client_sleep_us;
+    uint64_t stats_shm_wait_ns;
+    uint64_t stats_shm_wait_count;
+    uint64_t stats_shm_wait_max_ns;
 } g_memsim = {
     .enabled = false,
     .initialized = false,
@@ -1376,7 +1388,29 @@ static struct {
     .latency_inject_min = 0,
     .stats_injected_ns = 0,
     .stats_inject_count = 0,
+    .pgas_client_spin_ns = CXL_MEMSIM_DEFAULT_SPIN_US * 1000,
+    .pgas_client_sleep_us = CXL_MEMSIM_DEFAULT_SLEEP_US,
 };
+
+static uint64_t cxl_memsim_parse_wait_us(const char *name,
+                                         uint64_t default_us)
+{
+    const char *value = getenv(name);
+    uint64_t parsed;
+
+    if (!value || !value[0]) {
+        return default_us;
+    }
+
+    if (qemu_strtou64(value, NULL, 10, &parsed) < 0 ||
+        parsed > CXL_MEMSIM_MAX_WAIT_US) {
+        warn_report("CXL Type3: invalid %s=%s; using %lu us", name, value,
+                    (unsigned long)default_us);
+        return default_us;
+    }
+
+    return parsed;
+}
 
 /*
  * Active latency enforcement: spin-wait until the target latency has elapsed.
@@ -1463,6 +1497,12 @@ static void cxl_memsim_init(void) {
     }
     const char *rdma_server = getenv("CXL_MEMSIM_RDMA_SERVER");
     const char *rdma_port = getenv("CXL_MEMSIM_RDMA_PORT");
+    uint64_t pgas_client_spin_us = cxl_memsim_parse_wait_us(
+        "CXL_PGAS_CLIENT_SPIN_US", CXL_MEMSIM_DEFAULT_SPIN_US);
+
+    g_memsim.pgas_client_spin_ns = pgas_client_spin_us * 1000;
+    g_memsim.pgas_client_sleep_us = cxl_memsim_parse_wait_us(
+        "CXL_PGAS_CLIENT_SLEEP_US", CXL_MEMSIM_DEFAULT_SLEEP_US);
 
     if (!host || !host[0]) {
         host = CXL_MEMSIM_DEFAULT_HOST;
@@ -1540,6 +1580,13 @@ static void cxl_memsim_init(void) {
     } else {
         info_report("CXL Type3: Active latency injection disabled "
                     "(set CXL_LATENCY_INJECT=1 to enable)");
+    }
+
+    if (g_memsim.transport_mode == CXL_TRANSPORT_SHM) {
+        info_report("CXL Type3: PGAS wait policy - spin=%lu us, "
+                    "cold sleep=%lu us",
+                    (unsigned long)(g_memsim.pgas_client_spin_ns / 1000),
+                    (unsigned long)g_memsim.pgas_client_sleep_us);
     }
 
     pthread_mutex_unlock(&g_memsim.lock);
@@ -1712,6 +1759,62 @@ static int cxl_memsim_connect_locked(void) {
     return 0;
 }
 
+/* PGAS slot fields are volatile because another process updates them. */
+static bool cxl_memsim_wait_u32(volatile uint32_t *address, uint32_t value,
+                                bool wait_until_equal,
+                                uint64_t *elapsed_ns)
+{
+    uint64_t start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    for (;;) {
+        uint32_t current = __atomic_load_n(address, __ATOMIC_ACQUIRE);
+        bool ready = wait_until_equal ? current == value : current != value;
+        uint64_t now_ns;
+        uint64_t wait_ns;
+
+        if (ready) {
+            if (elapsed_ns) {
+                *elapsed_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start_ns;
+            }
+            return true;
+        }
+
+        now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        wait_ns = now_ns - start_ns;
+        if (wait_ns >= CXL_MEMSIM_SHM_TIMEOUT_NS) {
+            if (elapsed_ns) {
+                *elapsed_ns = wait_ns;
+            }
+            return false;
+        }
+
+        if (cxl_memsim_wait_action(wait_ns,
+                                   g_memsim.pgas_client_spin_ns) ==
+            CXL_MEMSIM_WAIT_SPIN) {
+            cpu_relax();
+        } else {
+            g_usleep(g_memsim.pgas_client_sleep_us);
+        }
+    }
+}
+
+static void cxl_memsim_record_shm_wait(uint64_t wait_ns)
+{
+    g_memsim.stats_shm_wait_ns += wait_ns;
+    g_memsim.stats_shm_wait_count++;
+    g_memsim.stats_shm_wait_max_ns = MAX(g_memsim.stats_shm_wait_max_ns,
+                                         wait_ns);
+
+    if ((g_memsim.stats_shm_wait_count % 100000) == 0) {
+        info_report("CXL Type3: PGAS response waits @ %lu ops: "
+                    "avg=%.1f ns, max=%lu ns",
+                    (unsigned long)g_memsim.stats_shm_wait_count,
+                    (double)g_memsim.stats_shm_wait_ns /
+                        g_memsim.stats_shm_wait_count,
+                    (unsigned long)g_memsim.stats_shm_wait_max_ns);
+    }
+}
+
 /* SHM request function - assumes lock is held */
 static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
                                   void *data, uint64_t value, uint64_t expected,
@@ -1723,13 +1826,8 @@ static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
     CXLShmSlot *slot = &g_memsim.shm_header->slots[g_memsim.shm_slot_id];
 
     /* Wait for slot to be free */
-    int retries = 1000;
-    while (__atomic_load_n(&slot->req_type, __ATOMIC_ACQUIRE) != CXL_SHM_REQ_NONE && retries > 0) {
-        usleep(100);
-        retries--;
-    }
-
-    if (retries == 0) {
+    if (!cxl_memsim_wait_u32(&slot->req_type, CXL_SHM_REQ_NONE, true,
+                             NULL)) {
         error_report("CXL Type3: SHM slot busy timeout");
         return -1;
     }
@@ -1761,16 +1859,13 @@ static int cxl_memsim_shm_request(uint8_t op, uint64_t addr, uint64_t size,
     __atomic_store_n(&slot->req_type, shm_req_type, __ATOMIC_RELEASE);
 
     /* Wait for response */
-    retries = 10000;
-    while (__atomic_load_n(&slot->resp_status, __ATOMIC_ACQUIRE) == CXL_SHM_RESP_NONE && retries > 0) {
-        usleep(10);
-        retries--;
-    }
-
-    if (retries == 0) {
+    uint64_t response_wait_ns;
+    if (!cxl_memsim_wait_u32(&slot->resp_status, CXL_SHM_RESP_NONE, false,
+                             &response_wait_ns)) {
         error_report("CXL Type3: SHM response timeout");
         return -1;
     }
+    cxl_memsim_record_shm_wait(response_wait_ns);
 
     /* Memory barrier before reading response */
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
