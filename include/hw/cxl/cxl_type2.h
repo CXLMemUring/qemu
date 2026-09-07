@@ -219,6 +219,7 @@ typedef struct CXLType2State {
     /* Device configuration */
     uint64_t cache_size;
     uint64_t device_mem_size;
+    bool direct_shared_mem;              /* Map memdev directly into BAR4 */
     uint64_t sn;                       /* Serial number */
 
     PCIExpLinkSpeed speed;

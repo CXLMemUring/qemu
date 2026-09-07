@@ -34,6 +34,7 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
+#include "system/hostmem.h"
 #include "system/memory.h"
 #include "io/channel-socket.h"
 #include <sys/mman.h>
@@ -1402,18 +1403,14 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
 static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size);
 static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr, uint64_t value, unsigned size);
 
-static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
+                                            unsigned size)
 {
     CXLType2State *ct2d = opaque;
     CXLCacheLine *line;
     uint64_t value = 0;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
-
-    /* Check if this is a GPU command register access */
-    if (addr < CXL_GPU_CMD_REG_SIZE) {
-        return cxl_type2_gpu_cmd_read(opaque, addr, size);
-    }
 
     ct2d->stats.cpu_accesses++;
 
@@ -1456,21 +1453,39 @@ static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
     return value;
 }
 
-static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* BAR2 reserves its low range for the GPU command interface. */
+    if (addr < CXL_GPU_CMD_REG_SIZE) {
+        return cxl_type2_gpu_cmd_read(opaque, addr, size);
+    }
+
+    return cxl_type2_coherent_mem_read(opaque, addr, size);
+}
+
+static void cxl_type2_coherent_mem_write(void *opaque, hwaddr addr,
+                                         uint64_t value, unsigned size)
 {
     CXLType2State *ct2d = opaque;
     CXLCacheLine *line;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
 
-    /* Check if this is a GPU command register access */
-    if (addr < CXL_GPU_CMD_REG_SIZE) {
-        cxl_type2_gpu_cmd_write(opaque, addr, value, size);
-        return;
-    }
-
     ct2d->stats.cpu_accesses++;
     ct2d->stats.write_ops++;
+
+    /*
+     * When a simulator connection is active, its response is the commit
+     * decision for the BAR write.  In particular, a fenced client must not
+     * update QEMU's local mirror after the server rejects the request.
+     */
+    if (ct2d->memsim.connected &&
+        !cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, addr, size,
+                                  (const uint8_t *)&value, NULL)) {
+        qemu_log_mask(LOG_TRACE,
+                      "CXL Type2: rejected BAR write at 0x%lx\n", addr);
+        return;
+    }
 
     /* Track with enhanced BAR coherency - write requires exclusive access */
     if (ct2d->bar_coherency.enabled) {
@@ -1509,12 +1524,22 @@ static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value, uns
             memcpy(mem_ptr + addr, &value, size);
         }
 
-        cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, addr, size,
-                                 (const uint8_t *)&value, NULL);
     }
 
     qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
                  addr, value);
+}
+
+static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned size)
+{
+    /* BAR2 reserves its low range for the GPU command interface. */
+    if (addr < CXL_GPU_CMD_REG_SIZE) {
+        cxl_type2_gpu_cmd_write(opaque, addr, value, size);
+        return;
+    }
+
+    cxl_type2_coherent_mem_write(opaque, addr, value, size);
 }
 
 static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
@@ -1529,8 +1554,8 @@ static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned si
         return 0;
     }
 
-    /* Forward all device memory reads through the cache coherency layer */
-    return cxl_type2_cache_read(opaque, addr, size);
+    /* BAR4 is device memory at every offset, including offset zero. */
+    return cxl_type2_coherent_mem_read(opaque, addr, size);
 }
 
 static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
@@ -1541,8 +1566,8 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value
         return;
     }
 
-    /* Forward all device memory writes through the cache coherency layer */
-    cxl_type2_cache_write(opaque, addr, value, size);
+    /* BAR4 is device memory at every offset, including offset zero. */
+    cxl_type2_coherent_mem_write(opaque, addr, value, size);
 }
 
 static const MemoryRegionOps cxl_type2_cache_ops = {
@@ -3649,19 +3674,47 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
                     PCI_BASE_ADDRESS_MEM_PREFETCH,
                     &ct2d->cache_mem);
 
-    /* BAR4: Device-attached memory (Type 3 feature) */
-    memory_region_init_ram(&ct2d->device_mem, OBJECT(ct2d),
-                          "cxl-type2-device-mem", ct2d->device_mem_size, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        return;
+    /*
+     * BAR4: Device-attached memory (Type 3 feature).
+     *
+     * direct-shared-mem is an explicitly separate same-host multikernel
+     * mode.  A shared host backend is mapped as RAM so locked guest atomics
+     * operate on the same host cache lines across independent KVM guests.
+     * It intentionally bypasses the per-access CXLMemSim TCP interceptor;
+     * server-mediated fencing must be evaluated in the default mode.
+     */
+    if (ct2d->direct_shared_mem) {
+        MemoryRegion *backend;
+
+        if (!ct2d->hostmem) {
+            error_setg(errp, "direct-shared-mem requires memdev");
+            return;
+        }
+        backend = host_memory_backend_get_memory(ct2d->hostmem);
+        if (memory_region_size(backend) < ct2d->device_mem_size) {
+            error_setg(errp,
+                       "memdev is smaller than requested Type2 mem-size");
+            return;
+        }
+        memory_region_init_alias(&ct2d->device_mem, OBJECT(ct2d),
+                                 "cxl-type2-device-mem", backend, 0,
+                                 ct2d->device_mem_size);
+    } else {
+        memory_region_init_ram(&ct2d->device_mem, OBJECT(ct2d),
+                              "cxl-type2-device-mem",
+                              ct2d->device_mem_size, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            return;
+        }
+
+        memory_region_init_io(&ct2d->device_mem_io, OBJECT(ct2d),
+                             &cxl_type2_device_mem_ops, ct2d,
+                             "cxl-type2-device-mem-io",
+                             ct2d->device_mem_size);
+        memory_region_add_subregion_overlap(&ct2d->device_mem, 0,
+                                            &ct2d->device_mem_io, 1);
     }
-
-    memory_region_init_io(&ct2d->device_mem_io, OBJECT(ct2d),
-                         &cxl_type2_device_mem_ops, ct2d,
-                         "cxl-type2-device-mem-io", ct2d->device_mem_size);
-
-    memory_region_add_subregion_overlap(&ct2d->device_mem, 0, &ct2d->device_mem_io, 1);
 
     pci_register_bar(pci_dev, 4,
                     PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -3817,6 +3870,10 @@ static const Property cxl_type2_props[] = {
                      CXL_TYPE2_DEFAULT_CACHE_SIZE),
     DEFINE_PROP_SIZE("mem-size", CXLType2State, device_mem_size,
                      CXL_TYPE2_DEFAULT_MEM_SIZE),
+    DEFINE_PROP_LINK("memdev", CXLType2State, hostmem, TYPE_MEMORY_BACKEND,
+                     HostMemoryBackend *),
+    DEFINE_PROP_BOOL("direct-shared-mem", CXLType2State,
+                     direct_shared_mem, false),
     DEFINE_PROP_UINT64("sn", CXLType2State, sn, 0),
     DEFINE_PROP_PCIE_LINK_SPEED("x-speed", CXLType2State,
                                 speed, PCIE_LINK_SPEED_64),
